@@ -1,0 +1,79 @@
+# ============================================================================
+# 付録: 常駐 SRE エージェントを GKE Sandbox (microVM) 上で稼働させる代替 Deployment
+# 本番運用の推奨:
+#   監視対象アプリと同じ GKE クラスタに同居させるとクラスタ全面障害時に共倒れするため、
+#   管理用の別 GKE Standard クラスタへデプロイすることを推奨します。
+# ============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sre-agent-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sre-agent-ksa
+  namespace: sre-agent-system
+  annotations:
+    iam.gke.io/gcp-service-account: "SRE_AGENT_SA_EMAIL"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sre-autonomous-agent
+  namespace: sre-agent-system
+  labels:
+    app: sre-autonomous-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sre-autonomous-agent
+  template:
+    metadata:
+      labels:
+        app: sre-autonomous-agent
+    spec:
+      serviceAccountName: sre-agent-ksa
+      nodeSelector:
+        cloud.google.com/compute-class: sandbox-microvm-class
+      runtimeClassName: microvm
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sre-agent
+          image: SRE_AGENT_IMAGE_URI:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          # microVM は Pod あたり約 250m CPU / 130MiB メモリの固定オーバーヘッドを伴うため余裕を持って設定
+          resources:
+            requests:
+              cpu: "750m"
+              memory: "1Gi"
+            limits:
+              cpu: "1500m"
+              memory: "2Gi"
+          env:
+            - name: GOOGLE_CLOUD_PROJECT
+              value: "YOUR_PROJECT_ID"
+            - name: GOOGLE_CLOUD_REGION
+              value: "asia-northeast1"
+            - name: GOOGLE_CLOUD_LOCATION
+              value: "global"
+            - name: GOOGLE_GENAI_USE_VERTEXAI
+              value: "True"
+            - name: GOOGLE_GENAI_USE_ENTERPRISE
+              value: "True"
+            - name: SRE_TRIAGE_MODEL
+              value: "gemini-3.8-flash"
+            - name: SRE_EMBEDDING_MODEL
+              value: "gemini-embedding-2"
+            - name: SANDBOX_MODE
+              value: "local_subprocess"
+            - name: ALLOWED_K8S_NAMESPACES
+              value: "sre-demo-app"

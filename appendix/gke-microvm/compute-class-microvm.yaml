@@ -1,0 +1,24 @@
+# ============================================================================
+# 付録: GKE Standard + GKE Sandbox (microVM) 用 ComputeClass 定義
+# 公式仕様:
+#   - microVM は各 Pod に専用のゲスト Linux カーネル（Cloud Hypervisor + Kata Containers）を割り当て、
+#     フル Linux システムコール互換性を提供します。
+#   - GKE Standard クラスタかつ Nested Virtualization 対応の x86 マシンシリーズ（n4 / c4 / n2 等）が必要です
+#     （GKE Autopilot、e2 マシンシリーズ、Arm ノードは非対応）。
+# ============================================================================
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: sandbox-microvm-class
+spec:
+  priorities:
+    - machineFamily: n4
+    - machineFamily: n2
+  nodePoolConfig:
+    sandbox:
+      type: microvm
+  priorityDefaults:
+    enableNestedVirtualization: true
+  nodePoolAutoCreation:
+    enabled: true
+  whenUnsatisfiable: DoNotScaleUp

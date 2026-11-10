@@ -1,0 +1,39 @@
+# 監視対象アプリケーション用の専用 Namespace と、
+# Cloud Run instance 上の常駐 SRE エージェントに付与する最小権限 Kubernetes RBAC
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sre-demo-app
+  labels:
+    app.kubernetes.io/part-of: agentic-sre-handson
+---
+# SRE エージェントの Google Cloud サービスアカウントに対して、
+# sre-demo-app Namespace 内の Deployment 更新（ロールバック・再起動）と状態参照のみを許可する Role
+# 注意: Pod の削除・Namespace 削除・Secret 読み取り・他 Namespace の変更は一切許可しない
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sre-agent-remediator-role
+  namespace: sre-demo-app
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods", "events", "services"]
+    verbs: ["get", "list", "watch"]
+---
+# デプロイ手順（Module 0）で SRE_AGENT_SA_EMAIL を実際のサービスアカウントメールに置換して apply します
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sre-agent-remediator-binding
+  namespace: sre-demo-app
+subjects:
+  - kind: User
+    name: "SRE_AGENT_SA_EMAIL"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: sre-agent-remediator-role
+  apiGroup: rbac.authorization.k8s.io

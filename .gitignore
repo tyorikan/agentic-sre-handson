@@ -1,0 +1,32 @@
+# ignore secrets and local env
+.env
+.env.*
+!.env.example
+
+# Python & virtual environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local runtime state & ADK caches
+*.db
+*.sqlite
+*.sqlite3
+.adk/
+*.tar
+
+# Internal agent planning logs (not for public repo)
+.gemini/
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/

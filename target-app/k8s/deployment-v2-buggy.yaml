@@ -1,0 +1,56 @@
+# シナリオ 2（既知バグによる自動ロールバック訓練）用マニフェスト
+# v2.0.0-buggy では必須環境変数 PAYMENT_CURRENCY_PRECISION が設定漏れとなっており、
+# 注文リクエスト時に HTTP 500 (CONFIG_KEY_ERROR_500) が急増します。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: sre-demo-app
+  labels:
+    app: order-service
+  annotations:
+    kubernetes.io/change-cause: "Release v2.0.0-buggy (missing PAYMENT_CURRENCY_PRECISION)"
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+        version: v2.0.0-buggy
+    spec:
+      containers:
+        - name: order-service
+          image: TARGET_APP_IMAGE_URI:v1.0.0
+          ports:
+            - containerPort: 8080
+          env:
+            - name: APP_VERSION
+              value: "v2.0.0-buggy"
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # 意図的な設定欠落: PAYMENT_CURRENCY_PRECISION が定義されていない
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10

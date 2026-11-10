@@ -1,0 +1,71 @@
+# ============================================================================
+# Cloud Run instances マニフェスト (sre-agent/instance.yaml)
+# 特徴:
+#   - sandboxLauncher: true によりコンテナ内から /usr/local/gcp/bin/sandbox を起動可能
+#   - run.googleapis.com/ingress: internal と default-url-disabled: 'true' の併用により
+#     外部からの着信エンドポイントを完全に遮断（攻撃対象面ゼロ）
+#   - Pub/Sub StreamingPull と Slack Socket Mode はどちらも外向き TLS 接続のためそのまま動作
+# 注意:
+#   Cloud Run instances は us-central1 / us-east1 / europe-west1 では非対応のため、
+#   asia-northeast1（東京）等の対応リージョンへデプロイしてください。
+# ============================================================================
+apiVersion: run.googleapis.com/v1
+kind: Instance
+metadata:
+  name: sre-autonomous-agent
+  annotations:
+    run.googleapis.com/launch-stage: BETA
+    run.googleapis.com/ingress: internal
+    run.googleapis.com/default-url-disabled: 'true'
+spec:
+  restartPolicy: always
+  serviceAccountName: SRE_AGENT_SA_EMAIL
+  containers:
+    - name: sre-agent
+      image: SRE_AGENT_IMAGE_URI:latest
+      sandboxLauncher: true
+      resources:
+        limits:
+          cpu: "2"
+          memory: "2Gi"
+      env:
+        - name: GOOGLE_CLOUD_PROJECT
+          value: "YOUR_PROJECT_ID"
+        - name: GOOGLE_CLOUD_REGION
+          value: "asia-northeast1"
+        - name: GOOGLE_CLOUD_LOCATION
+          value: "global"
+        - name: GOOGLE_GENAI_USE_VERTEXAI
+          value: "True"
+        - name: GOOGLE_GENAI_USE_ENTERPRISE
+          value: "True"
+        - name: SRE_TRIAGE_MODEL
+          value: "gemini-3.8-flash"
+        - name: SRE_EMBEDDING_MODEL
+          value: "gemini-embedding-2"
+        - name: ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS
+          value: "false"
+        - name: ALERT_PUBSUB_SUBSCRIPTION
+          value: "sre-alert-stream-sub"
+        - name: BQ_DATASET
+          value: "sre_agent_ops"
+        - name: GKE_CLUSTER_NAME
+          value: "sre-demo-cluster"
+        - name: GKE_CLUSTER_LOCATION
+          value: "asia-northeast1"
+        - name: ALLOWED_K8S_NAMESPACES
+          value: "sre-demo-app"
+        - name: SANDBOX_MODE
+          value: "cloud_run"
+        - name: SLACK_ALERT_CHANNEL_ID
+          value: "YOUR_SLACK_CHANNEL_ID"
+        - name: SLACK_BOT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: sre-slack-bot-token
+              key: latest
+        - name: SLACK_APP_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: sre-slack-app-token
+              key: latest

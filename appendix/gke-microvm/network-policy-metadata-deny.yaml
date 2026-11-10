@@ -1,0 +1,45 @@
+# ============================================================================
+# 付録: GKE Sandbox (microVM) 用の NetworkPolicy（着信完全遮断 + メタデータ保護）
+# 公式セキュリティ推奨事項:
+#   gVisor と異なり microVM ではノードレベルのメタデータエンドポイントへの到達が既定で開いているため、
+#   未信頼のサブプロセスを実行する分離ワーカー Pod 等では 169.254.169.254 / 169.254.169.252 を遮断します。
+#   また、SRE エージェントは外向き（Pub/Sub Pull & Slack Socket Mode）のみで動作するため、
+#   Ingress（着信）は全面拒否とします。
+# ============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sre-agent-microvm-netpol
+  namespace: sre-agent-system
+spec:
+  podSelector:
+    matchLabels:
+      app: sre-autonomous-agent
+  policyTypes:
+    - Ingress
+    - Egress
+  # 着信通信は一切許可しない（空配列 = Default Deny Ingress）
+  ingress: []
+  egress:
+    # クラスタ内部 DNS (kube-dns / NodeLocal DNSCache) への名前解決を許可
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Workload Identity 用 GKE メタデータサーバー (169.254.169.252:988) と HTTPS (443) 通信のみ許可し、
+    # 生の GCE メタデータ IP (169.254.169.254) や不要な内部ポートへの到達を制限
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.252/32
+      ports:
+        - protocol: TCP
+          port: 988
