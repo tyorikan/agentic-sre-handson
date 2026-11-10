@@ -46,18 +46,18 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    S(["START"]) --> P1["@node: analyze_metrics_in_sandbox<br/>隔離空間で時系列スロープ計算"]
-    S --> P2["@node: search_similar_incidents<br/>BigQuery VECTOR_SEARCH 上位3件"]
+    S(["START"]) --> P1["@node:<br/>analyze_metrics_in_sandbox<br/>隔離空間でスロープ計算"]
+    S --> P2["@node:<br/>search_similar_incidents<br/>BigQuery VECTOR_SEARCH<br/>上位3件を類似照合"]
     P1 & P2 --> J["JoinNode: join_diagnostics<br/>両方の診断完了を待機・合流"]
-    J --> LLM["@node: correlate_and_decide<br/>gemini-3.8-flash + 公式リモート MCP<br/>TriageDecision 構造化出力"]
-    LLM --> Router["@node: enforce_guardrails_and_route<br/>決定論的ガードレール検査 & route 設定"]
+    J --> LLM["@node: correlate_and_decide<br/>gemini-3.8-flash + 公式 MCP<br/>TriageDecision 構造化出力"]
+    LLM --> Router["@node:<br/>enforce_guardrails_and_route<br/>ガードレール検査・分岐"]
 
     Router -->|"route = OBSERVE"| N1["@node: observe_node<br/>変更操作なし・静観記録"]
-    Router -->|"route = AUTO_REMEDIATE"| N2["@node: auto_remediate_node<br/>即時 Rollback / Restart + 回復確認"]
-    Router -->|"route = REQUIRE_APPROVAL"| N3["@node: approved_remediate_node<br/>(require_confirmation=True)<br/>実行前に自動一時停止"]
+    Router -->|"route = AUTO_REMEDIATE"| N2["@node: auto_remediate_node<br/>即時 Rollback / Restart<br/>＋ 事後回復確認"]
+    Router -->|"route = REQUIRE_APPROVAL"| N3["@node:<br/>approved_remediate_node<br/>require_confirmation=True<br/>実行前に自動一時停止"]
 
     N3 -.->|"Slack で Approve 押下"| Exec["本体再開・処置実行"]
-    N3 -.->|"Slack で Reject 押下"| Cancel["実行スキップ・手動引き継ぎ記録"]
+    N3 -.->|"Slack で Reject 押下"| Cancel["実行スキップ・手動引き継ぎ"]
 ```
 
 ### 安全ガードレールによる自動降格（サーキットブレーカー）

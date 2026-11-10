@@ -10,17 +10,16 @@
 ついにすべての部品を結合し、**Cloud Run instances 上の完全閉域・常駐エージェント** を本稼働させます。
 
 ```mermaid
-flowchart LR
-    Internet["🌐 外部インターネット<br/>攻撃者 / 未認証アクセス"] -.->|"❌ 完全遮断<br/>ingress: internal<br/>default-url-disabled: true"| Instance
+flowchart TB
+    Internet["🌐 外部インターネット<br/>攻撃者 / 未認証アクセス"] -.->|"❌ 完全遮断<br/>ingress: internal / default-url-disabled"| Instance
 
     subgraph Instance["🔵 本章でデプロイ: Cloud Run instance (asia-northeast1)"]
-        Daemon["agent_app.main (常駐プロセス)<br/>restartPolicy: always"]
-        SubSB["Cloud Run sandbox<br/>(sandboxLauncher: true)"]
-        Daemon <--> SubSB
+        direction LR
+        SubSB["Cloud Run sandbox<br/>(sandboxLauncher: true)"] <--> Daemon["agent_app.main (常駐プロセス)<br/>restartPolicy: always"]
     end
 
     Daemon -->|"① 外向き TLS: StreamingPull"| PS["Cloud Pub/Sub<br/>(sre-alert-stream-sub)"]
-    Daemon -->|"② 外向き TLS: MCP & 推論"| GCP["Monitoring / Logging / GKE MCP<br/>& BigQuery / Gemini 3.8 Flash"]
+    Daemon -->|"② 外向き TLS: MCP・KB・LLM"| GCP["Monitoring / Logging / GKE MCP<br/>& BigQuery / Gemini 3.8 Flash"]
     Daemon -->|"③ 外向き TLS: AppsV1 Patch"| GKE["監視対象 GKE<br/>(sre-demo-app/order-service)"]
     Daemon <-->|"④ 外向き WSS: Socket Mode"| Slack["Slack ワークスペース"]
 
