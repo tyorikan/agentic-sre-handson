@@ -69,7 +69,9 @@ stateDiagram-v2
     state "AUTO_REMEDIATE 提案  " as ProposedAuto
     state "承認待機へ降格  " as DowngradedApproval
     state "自動復旧を実行  " as ExecuteAuto
-    state "回復を事後検証  " as PostVerify
+    state "事後エラー率を検証  " as PostVerify
+    state "自動復旧完了  " as Resolved
+    state "要オンコール対応  " as EscalateOnCall
 
     [*] --> ProposedAuto: LLM が AUTO_REMEDIATE を提案
     ProposedAuto --> DowngradedApproval: 対象が許可<br/>Namespace 外
@@ -77,9 +79,20 @@ stateDiagram-v2
     ProposedAuto --> DowngradedApproval: 1時間以内に<br/>既に復旧実施済み
     ProposedAuto --> ExecuteAuto: 全安全条件を満たす
     ExecuteAuto --> PostVerify: AppsV1 で Rollback / Restart
-    PostVerify --> [*]: 事後エラー率 < 1.0% 検証
+    PostVerify --> Resolved: エラー率 < 1.0%<br/>(回復確認)
+    PostVerify --> EscalateOnCall: エラー率 >= 1.0%<br/>(未回復・連鎖停止)
+    Resolved --> [*]: 復旧完了を Slack 通知
+    EscalateOnCall --> [*]: 要対応通知 & 1回/h 制限で以降停止
     DowngradedApproval --> [*]: Slack 承認ボタン待ちへ移行
 ```
+
+### 事後検証でエラー率が 1.0% 未満に回復しなかった場合（フェイルセーフ）
+
+直前リビジョンへのロールバック後もエラー率が `1.0%` 未満へ下がらない場合、原因はアプリ直近変更ではなく **DB 状態・外部依存・データ不整合** である可能性が高いため、エージェントは追加の連鎖ロールバックや再起動ループを行わず人間へ引き継ぎます。
+
+1. **連鎖操作を行わない**: `verification_passed=False` として 1 回の変更で終了し、さらなる過去リビジョンへの自動巻き戻しによる二次障害を防ぎます。
+2. **Slack 警告エスカレーションと監査記録**: ヘッダを `🚨 自動復旧未回復・要オンコール対応 (事後検証 NG)` に切り替え、BigQuery `incident_events` へ `verification_passed=false` を追記します。
+3. **サーキットブレーカーによる再試行遮断**: 当該実行が「直近 1 時間に 1 回の上限」にカウントされるため、障害継続で後続アラートが届いても強制的に `REQUIRE_APPROVAL` へ降格して停止します。
 
 ---
 
@@ -205,7 +218,7 @@ tests/test_slack_hitl_resume.py::test_pass_hat_k_blocks_flaky_agent PASSED
 
 ```markdown
 `AGENTS.md` を読み込み、第4章（`docs/04-auto-remediation-and-slack-hitl.md`）のテスト検証を実行してください。
-- `.venv` 環境で `pytest -v` を実行し、全 10 件のテスト（重複排除、サンドボックス隔離、100件検索、Workflow 3分岐、非対称回復検証、Slack 承認者検証と Resume）が PASS することを確認して報告すること。
+- `.venv` 環境で `pytest -v` を実行し、全 11 件のテスト（重複排除、サンドボックス隔離、100件検索、Workflow 3分岐、事後検証未回復時通知、Slack 承認者検証と Resume）が PASS することを確認して報告すること。
 - Secret Manager への Slack トークン登録は私が手元でトークンを入力して行うため、実行用コマンドのみ案内すること。
 ```
 

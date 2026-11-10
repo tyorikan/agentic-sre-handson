@@ -39,11 +39,14 @@ def build_report_blocks(result: WorkflowRunResult) -> list[dict[str, Any]]:
     """静観または自動復旧完了時の Slack Block Kit ペイロードを組み立てる。"""
     dec = result.decision
     out = result.outcome
-    badge = {
-        "OBSERVE": "🟢 静観 (OBSERVE - 一過性エラーのため変更なし)",
-        "AUTO_REMEDIATE": "🛠️ 自動復旧完了 (AUTO_REMEDIATE)",
-        "REQUIRE_APPROVAL": "🟠 承認待機 (REQUIRE_APPROVAL)",
-    }[dec.decision]
+    if dec.decision == "AUTO_REMEDIATE" and out and not out.verification_passed:
+        badge = "🚨 自動復旧未回復・要オンコール対応 (事後検証 NG)"
+    else:
+        badge = {
+            "OBSERVE": "🟢 静観 (OBSERVE - 一過性エラーのため変更なし)",
+            "AUTO_REMEDIATE": "🛠️ 自動復旧完了 (AUTO_REMEDIATE)",
+            "REQUIRE_APPROVAL": "🟠 承認待機 (REQUIRE_APPROVAL)",
+        }[dec.decision]
 
     blocks: list[dict[str, Any]] = [
         {

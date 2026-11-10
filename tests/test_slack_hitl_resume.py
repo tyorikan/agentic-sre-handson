@@ -9,12 +9,12 @@ from google.adk.sessions import DatabaseSessionService
 
 from agent_app.config import AgentSettings
 from agent_app.dedup_store import IncidentGuardrailManager, InMemoryEventStoreBackend
-from agent_app.models import AlertEvent, SandboxMetricsAnalysis, SimilarRunbookMatch, TriageDecision
+from agent_app.models import AlertEvent, RemediationOutcome, SandboxMetricsAnalysis, SimilarRunbookMatch, TriageDecision
 from agent_app.remediation_tools import SafeRemediationService
 from agent_app.sandbox_runner import SandboxRunner
-from agent_app.slack_socket import SlackHitlCoordinator
+from agent_app.slack_socket import SlackHitlCoordinator, build_report_blocks
 from agent_app.vector_kb import LocalJsonlKnowledgeBase
-from agent_app.workflow import SreIncidentOrchestrator
+from agent_app.workflow import SreIncidentOrchestrator, WorkflowRunResult
 from calc_pass_hat_k import compute_pass_at_k, compute_pass_hat_k, evaluate_results
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -138,3 +138,38 @@ def test_pass_hat_k_blocks_flaky_agent() -> None:
         threshold=0.85,
     )
     assert passed_solid is True
+
+
+def test_slack_report_highlights_failed_post_verification() -> None:
+    """自動復旧実行後に事後エラー率 >= 1.0% だった場合、完了ではなく要オンコール対応バッジを出すこと。"""
+    alert = AlertEvent(incident_id="POST-NG-1", summary="Error persisted after rollback")
+    dec = TriageDecision(
+        decision="AUTO_REMEDIATE",
+        remediation_type="ROLLBACK_DEPLOYMENT",
+        target_namespace="sre-demo-app",
+        target_deployment="order-service",
+        matched_runbook_id="INC-001",
+        similarity_score=0.90,
+        root_cause_hypothesis="Suspected release bug",
+        rationale="既知バグと一致したためロールバックを実施。",
+    )
+    failed_out = RemediationOutcome(
+        executed=True,
+        action_status="ROLLED_BACK",
+        detail_message="事後検証 要注意: 操作後もエラー率が 25.00% 残存しています。",
+        verification_passed=False,
+        post_error_rate=0.25,
+    )
+    blocks = build_report_blocks(
+        WorkflowRunResult(
+            alert=alert,
+            session_id="s1",
+            invocation_id="i1",
+            decision=dec,
+            paused_for_approval=False,
+            outcome=failed_out,
+        )
+    )
+    rendered = str(blocks)
+    assert "自動復旧未回復" in rendered
+    assert "自動復旧完了" not in rendered
