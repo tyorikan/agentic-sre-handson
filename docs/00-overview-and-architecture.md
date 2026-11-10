@@ -62,9 +62,9 @@ source .env
 gcloud config set project "${GOOGLE_CLOUD_PROJECT}"
 ```
 
-### Step 2.2 必要な Google Cloud API の有効化
+### Step 2.2 必要な Google Cloud API の有効化と Firestore 作成
 
-GKE、Cloud Run、BigQuery、Pub/Sub、Observability、Artifact Registry、Secret Manager、および Gemini Enterprise Agent Platform（`aiplatform.googleapis.com`）を有効化します。
+GKE、Cloud Run、BigQuery、Firestore、Pub/Sub、Observability、Artifact Registry、Secret Manager、および Gemini Enterprise Agent Platform（`aiplatform.googleapis.com`）を有効化し、ADK セッション・承認待ちチケット用の Firestore Native データベース（`(default)`）を作成します。
 
 ```bash
 gcloud services enable \
@@ -72,6 +72,7 @@ gcloud services enable \
   run.googleapis.com \
   bigquery.googleapis.com \
   bigqueryconnection.googleapis.com \
+  firestore.googleapis.com \
   pubsub.googleapis.com \
   monitoring.googleapis.com \
   logging.googleapis.com \
@@ -80,11 +81,19 @@ gcloud services enable \
   cloudbuild.googleapis.com \
   secretmanager.googleapis.com \
   --project="${GOOGLE_CLOUD_PROJECT}"
+
+# (default) データベースが未作成の場合のみ作成（既存プロジェクトでは既定 DB が既に存在する場合があります）
+if ! gcloud firestore databases describe --database="(default)" --project="${GOOGLE_CLOUD_PROJECT}" >/dev/null 2>&1; then
+  gcloud firestore databases create \
+    --location="${GOOGLE_CLOUD_REGION}" \
+    --type=firestore-native \
+    --project="${GOOGLE_CLOUD_PROJECT}"
+fi
 ```
 
 ### Step 2.3 常駐 SRE エージェント専用のサービスアカウント作成
 
-プロジェクト Owner のような過剰な権限は付与せず、ログ・メトリクス閲覧、リモート MCP 呼び出し（`roles/mcp.toolUser`）、BigQuery 読み書き、Pub/Sub 購読、モデル推論、および GKE API 到達に必要な最小ロールのみを付与します（GKE 内の具体的な操作範囲は次の第 1 章で Kubernetes RBAC により `sre-demo-app` Namespace のみに絞り込みます）。
+プロジェクト Owner のような過剰な権限は付与せず、ログ・メトリクス閲覧、リモート MCP 呼び出し（`roles/mcp.toolUser`）、BigQuery 読み書き、Firestore 読み書き（`roles/datastore.user`）、Pub/Sub 購読、モデル推論、および GKE API 到達に必要な最小ロールのみを付与します（GKE 内の具体的な操作範囲は次の第 1 章で Kubernetes RBAC により `sre-demo-app` Namespace のみに絞り込みます）。
 
 ```bash
 export SRE_AGENT_SA_NAME="sre-autonomous-agent-sa"
@@ -102,6 +111,7 @@ for ROLE in \
   roles/bigquery.dataEditor \
   roles/bigquery.jobUser \
   roles/bigquery.connectionUser \
+  roles/datastore.user \
   roles/pubsub.subscriber \
   roles/aiplatform.user \
   roles/container.clusterViewer \

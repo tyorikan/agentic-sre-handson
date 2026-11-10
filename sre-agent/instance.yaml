@@ -61,6 +61,14 @@ spec:
           value: "cloud_run"
         - name: INITIAL_STABILIZATION_SECONDS
           value: "30"
+        - name: SESSION_BACKEND
+          value: "firestore"
+        - name: FIRESTORE_DATABASE
+          value: "(default)"
+        - name: FIRESTORE_SESSIONS_COLLECTION
+          value: "adk-session"
+        - name: FIRESTORE_TICKETS_COLLECTION
+          value: "sre_pending_approval_tickets"
         - name: SLACK_ALERT_CHANNEL_ID
           value: "YOUR_SLACK_CHANNEL_ID"
         - name: SLACK_BOT_TOKEN

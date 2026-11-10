@@ -67,7 +67,16 @@ class AgentSettings:
         default_factory=lambda: _split_csv(os.getenv("SLACK_ALLOWED_APPROVER_IDS", ""))
     )
 
-    # ADK セッション永続化 URL（承認一時停止と再開で使用）
+    # ADK セッション・承認待ちチケット永続化（Human-in-the-Loop 一時停止と再開で使用）
+    # 本番は "firestore"（インスタンス再起動耐性）、ローカル開発・単体テスト時は "sqlite" を選択
+    session_backend: str = field(default_factory=lambda: os.getenv("SESSION_BACKEND", "sqlite"))
+    firestore_database: str = field(default_factory=lambda: os.getenv("FIRESTORE_DATABASE", "(default)"))
+    firestore_sessions_collection: str = field(
+        default_factory=lambda: os.getenv("FIRESTORE_SESSIONS_COLLECTION", "adk-session")
+    )
+    firestore_tickets_collection: str = field(
+        default_factory=lambda: os.getenv("FIRESTORE_TICKETS_COLLECTION", "sre_pending_approval_tickets")
+    )
     session_db_url: str = field(
         default_factory=lambda: os.getenv("SESSION_DB_URL", "sqlite+aiosqlite:////tmp/sre_agent_sessions.db")
     )

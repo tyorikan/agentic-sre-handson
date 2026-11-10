@@ -189,7 +189,13 @@ async def run_daemon(settings: AgentSettings) -> None:
         callback=_callback,
         flow_control=pubsub_v1.types.FlowControl(max_messages=5),
     )
-    _log_json("INFO", "常駐自律型 SRE エージェントが稼働開始しました。", subscription=sub_path, region=settings.region)
+    _log_json(
+        "INFO",
+        "常駐自律型 SRE エージェントが稼働開始しました。",
+        subscription=sub_path,
+        region=settings.region,
+        session_backend=settings.session_backend,
+    )
 
     try:
         await stop_event.wait()

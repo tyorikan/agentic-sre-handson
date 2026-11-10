@@ -20,6 +20,12 @@ from slack_bolt.async_app import AsyncApp
 
 from .config import AgentSettings
 from .models import RemediationOutcome
+from .ticket_store import (
+    ApprovalTicketStore,
+    FirestoreApprovalTicketStore,
+    InMemoryApprovalTicketStore,
+    StoredApprovalTicket,
+)
 from .workflow import SreIncidentOrchestrator, WorkflowRunResult
 
 ACTION_APPROVE_ID = "sre_approve_remediation"
@@ -117,9 +123,21 @@ def build_approval_request_blocks(result: WorkflowRunResult) -> list[dict[str, A
 class SlackHitlCoordinator:
     """Slack 通知および Interactive 承認ボタンによる ADK ワークフロー再開コーディネーター。"""
 
-    def __init__(self, settings: AgentSettings, orchestrator: SreIncidentOrchestrator) -> None:
+    def __init__(
+        self,
+        settings: AgentSettings,
+        orchestrator: SreIncidentOrchestrator,
+        *,
+        ticket_store: ApprovalTicketStore | None = None,
+    ) -> None:
         self._settings = settings
         self._orchestrator = orchestrator
+        if ticket_store is not None:
+            self._ticket_store: ApprovalTicketStore = ticket_store
+        elif settings.session_backend.strip().lower() == "firestore":
+            self._ticket_store = FirestoreApprovalTicketStore(settings)
+        else:
+            self._ticket_store = InMemoryApprovalTicketStore()
         self._pending: dict[str, PendingApprovalTicket] = {}
         self._bolt_app: AsyncApp | None = None
         self._socket_handler: AsyncSocketModeHandler | None = None
@@ -140,7 +158,7 @@ class SlackHitlCoordinator:
         return slack_user_id in self._settings.slack_allowed_approvers
 
     async def notify_workflow_result(self, result: WorkflowRunResult) -> None:
-        """ワークフロー結果を Slack へ通知する（承認待ちの場合はチケット登録してボタン送信）。"""
+        """ワークフロー結果を Slack へ通知する（承認待ちの場合は永続チケット保存後にボタン送信）。"""
         blocks = (
             build_approval_request_blocks(result)
             if result.paused_for_approval
@@ -148,7 +166,18 @@ class SlackHitlCoordinator:
         )
         fallback_text = f"[{result.alert.incident_id}] SRE Agent Decision: {result.decision.decision}"
 
-        if result.paused_for_approval:
+        stored_ticket: StoredApprovalTicket | None = None
+        if result.paused_for_approval and result.confirmation_call_id:
+            # Slack ボタン押下と保存のレースを防ぐため、メッセージ送信前に永続化しておく
+            stored_ticket = StoredApprovalTicket(
+                incident_id=result.alert.incident_id,
+                alert=result.alert,
+                decision=result.decision,
+                session_id=result.session_id,
+                invocation_id=result.invocation_id,
+                confirmation_call_id=result.confirmation_call_id,
+            )
+            await self._ticket_store.save_ticket(stored_ticket)
             self._pending[result.alert.incident_id] = PendingApprovalTicket(run_result=result)
 
         if self._bolt_app and self._settings.slack_channel_id:
@@ -157,10 +186,16 @@ class SlackHitlCoordinator:
                 text=fallback_text,
                 blocks=blocks,
             )
-            if result.paused_for_approval and result.alert.incident_id in self._pending:
-                ticket = self._pending[result.alert.incident_id]
-                ticket.channel_id = str(resp["channel"])
-                ticket.message_ts = str(resp["ts"])
+            if stored_ticket is not None:
+                channel_id = str(resp["channel"])
+                message_ts = str(resp["ts"])
+                updated_ticket = stored_ticket.model_copy(
+                    update={"channel_id": channel_id, "message_ts": message_ts}
+                )
+                await self._ticket_store.save_ticket(updated_ticket)
+                if result.alert.incident_id in self._pending:
+                    self._pending[result.alert.incident_id].channel_id = channel_id
+                    self._pending[result.alert.incident_id].message_ts = message_ts
         else:
             # Slack 未設定環境（ローカル検証等）では構造化ログとして出力
             sys.stdout.write(
@@ -186,26 +221,33 @@ class SlackHitlCoordinator:
         slack_user_id: str,
         approved: bool,
     ) -> RemediationOutcome:
-        """ボタン押下イベントを検証し、中断中の ADK ワークフローを再開させる。"""
+        """ボタン押下イベントを検証し、永続チケットと中断 ADK セッションから処理を再開する。"""
         if not self.is_user_authorized(slack_user_id):
             raise PermissionError(
                 f"Slack ユーザー '{slack_user_id}' は承認許可リストに含まれていないため操作を拒否しました。"
             )
 
-        ticket = self._pending.pop(incident_id, None)
-        if ticket is None or not ticket.run_result.confirmation_call_id:
+        ticket = await self._ticket_store.claim_ticket(incident_id)
+        if ticket is None or not ticket.confirmation_call_id:
             raise KeyError(f"incident_id='{incident_id}' の承認待ちセッションが存在しないか、既に処理済みです。")
 
-        res = ticket.run_result
-        outcome = await self._orchestrator.resume_from_approval(
-            alert=res.alert,
-            decision=res.decision,
-            session_id=res.session_id,
-            invocation_id=res.invocation_id,
-            confirmation_call_id=res.confirmation_call_id,
-            approved=approved,
-            approver_id=slack_user_id,
-        )
+        self._pending.pop(incident_id, None)
+
+        try:
+            outcome = await self._orchestrator.resume_from_approval(
+                alert=ticket.alert,
+                decision=ticket.decision,
+                session_id=ticket.session_id,
+                invocation_id=ticket.invocation_id,
+                confirmation_call_id=ticket.confirmation_call_id,
+                approved=approved,
+                approver_id=slack_user_id,
+            )
+        except Exception:
+            await self._ticket_store.release_ticket(incident_id)
+            raise
+
+        await self._ticket_store.delete_ticket(incident_id)
 
         if self._bolt_app and ticket.channel_id and ticket.message_ts:
             action_label = "✅ 承認・実行完了" if approved else "🛑 却下・手動対応へ移行"
@@ -220,7 +262,7 @@ class SlackHitlCoordinator:
                             "type": "mrkdwn",
                             "text": (
                                 f"*{action_label}* (操作者: <@{slack_user_id}>)\n"
-                                f"*対象:* `{res.decision.target_namespace}/{res.decision.target_deployment}`\n"
+                                f"*対象:* `{ticket.decision.target_namespace}/{ticket.decision.target_deployment}`\n"
                                 f"*結果:* {outcome.detail_message}"
                             ),
                         },

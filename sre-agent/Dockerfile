@@ -20,6 +20,7 @@ RUN pip install --no-cache-dir --upgrade pip \
        "google-cloud-monitoring>=2.22.0" \
        "google-cloud-logging>=3.11.0" \
        "google-cloud-container>=2.50.0" \
+       "google-cloud-firestore>=2.16.0" \
        "kubernetes>=30.1.0" \
        "slack-bolt>=1.20.0" \
        "aiohttp>=3.10.0" \

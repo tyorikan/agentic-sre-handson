@@ -31,9 +31,10 @@ flowchart TB
         Orch --> Guard
     end
 
-    subgraph KnowledgeAndTools["知識ベース・観測ツール群"]
+    subgraph KnowledgeAndTools["知識ベース・状態管理・観測ツール群"]
         RemoteMCP["Google Cloud 公式リモート MCP<br/>Monitoring / Logging / GKE (Read-Only)"]
         BQ["BigQuery (sre_agent_ops)<br/>・過去インシデント 100 件 (VECTOR_SEARCH)<br/>・gemini-embedding-2<br/>・追記型監査テーブル (incident_events)"]
+        FS["Cloud Firestore (Native)<br/>・ADK セッション中断状態<br/>・Slack 承認待ちチケット永続化"]
     end
 
     subgraph ActionsAndSlack["3分岐アクション & Slack Socket Mode"]
@@ -47,6 +48,7 @@ flowchart TB
     PubSub -->|"外向き StreamingPull"| Dedup
     Orch <-->|"tool_filter 厳選"| RemoteMCP
     Orch <-->|"類似事例照合"| BQ
+    Orch <-->|"セッション・承認状態"| FS
     Dedup <-->|"クールダウン確認・記録"| BQ
     Guard --> R1 & R2 & R3
     R2 -->|"AppsV1 API 最小権限"| OrderApp
@@ -62,7 +64,7 @@ flowchart TB
 | **常時監視コスト** | 毎分 LLM に生ログを送りトークン費用が破綻する | Cloud Monitoring / Log Sink で異常時のみ Pub/Sub 発火し、コード側のクールダウン判定で重複呼び出しを排除 |
 | **一過性エラー対応** | 通信瞬断でも毎回 Pod を再起動し、再接続ストームで悪化させる | 隔離サンドボックスでエラー率の減衰傾きを計算し、過去履歴と照合して**「何もしない（静観）」**を自律選択 |
 | **変更操作の安全性** | LLM に自由な `kubectl` シェルコマンドを生成させクラスタ破壊リスクがある | 読取は公式リモート MCP（Read-Only）、変更は許可 Namespace 固定・1 時間 1 回上限・事後回復確認付きの型付き関数に分離 |
-| **承認コールバック** | Slack Webhook 受信用に未認証の公開 URL を開ける必要がある | 常駐 Cloud Run instance から **Slack Socket Mode** で外向き接続し、公開 URL ゼロで双方向ボタン承認と ADK 再開を実現 |
+| **承認コールバック & 再開耐性** | Slack Webhook 受信用に未認証公開 URL が必要、また承認待ち中のコンテナ再起動で状態が消える | 常駐 instance から **Slack Socket Mode** で外向き接続し、ADK セッション＋承認チケットを **Firestore** へ永続化して再起動後も再開可能 |
 
 ---
 

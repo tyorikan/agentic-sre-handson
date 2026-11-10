@@ -127,6 +127,9 @@ gcloud artifacts repositories delete sre-handson \
   --project="${GOOGLE_CLOUD_PROJECT}" \
   --quiet
 
+# （任意）Firestore 上の検証データ（adk-session / sre_pending_approval_tickets コレクション）を削除する場合:
+# 既定データベース `(default)` 自体の削除が不要な場合は、Cloud コンソールまたは gcloud firestore bulk-delete で不要ドキュメントのみ整理できます。
+
 # （任意）Secret Manager シークレットとエージェント専用 SA を削除する場合
 gcloud secrets delete sre-slack-bot-token --project="${GOOGLE_CLOUD_PROJECT}" --quiet || true
 gcloud secrets delete sre-slack-app-token --project="${GOOGLE_CLOUD_PROJECT}" --quiet || true

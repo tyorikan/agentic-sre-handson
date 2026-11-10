@@ -13,8 +13,9 @@ from agent_app.models import AlertEvent, RemediationOutcome, SandboxMetricsAnaly
 from agent_app.remediation_tools import SafeRemediationService
 from agent_app.sandbox_runner import SandboxRunner
 from agent_app.slack_socket import SlackHitlCoordinator, build_report_blocks
+from agent_app.ticket_store import FirestoreApprovalTicketStore
 from agent_app.vector_kb import LocalJsonlKnowledgeBase
-from agent_app.workflow import SreIncidentOrchestrator, WorkflowRunResult
+from agent_app.workflow import SreIncidentOrchestrator, WorkflowRunResult, build_session_service
 from calc_pass_hat_k import compute_pass_at_k, compute_pass_hat_k, evaluate_results
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -173,3 +174,164 @@ def test_slack_report_highlights_failed_post_verification() -> None:
     rendered = str(blocks)
     assert "自動復旧未回復" in rendered
     assert "自動復旧完了" not in rendered
+
+
+class _FakeSnap:
+    def __init__(self, data: dict[str, object] | None) -> None:
+        self._data = data
+
+    @property
+    def exists(self) -> bool:
+        return self._data is not None
+
+    def to_dict(self) -> dict[str, object] | None:
+        return dict(self._data) if self._data is not None else None
+
+
+class _FakeDocRef:
+    def __init__(self, store: dict[str, dict[str, object]], doc_id: str) -> None:
+        self._store = store
+        self._doc_id = doc_id
+
+    async def set(self, data: dict[str, object]) -> None:
+        self._store[self._doc_id] = dict(data)
+
+    async def get(self) -> _FakeSnap:
+        return _FakeSnap(self._store.get(self._doc_id))
+
+    async def update(self, fields: dict[str, object]) -> None:
+        self._store[self._doc_id].update(fields)
+
+    async def delete(self) -> None:
+        self._store.pop(self._doc_id, None)
+
+
+class _FakeCollectionRef:
+    def __init__(self, store: dict[str, dict[str, object]]) -> None:
+        self._store = store
+
+    def document(self, doc_id: str) -> _FakeDocRef:
+        return _FakeDocRef(self._store, doc_id)
+
+
+class _FakeFirestoreClient:
+    """テスト用の軽量非同期 Firestore フェイククライアント。"""
+
+    def __init__(self) -> None:
+        self.collections: dict[str, dict[str, dict[str, object]]] = {}
+
+    def collection(self, name: str) -> _FakeCollectionRef:
+        return _FakeCollectionRef(self.collections.setdefault(name, {}))
+
+
+@pytest.mark.asyncio
+async def test_resume_survives_instance_restart_via_persistent_ticket_and_session(tmp_path: Path) -> None:
+    """承認待ち中にプロセス/インスタンスが再起動しても、永続化されたセッションとチケットから再開できること。"""
+    db_file = tmp_path / "shared_sessions.db"
+    fake_fs = _FakeFirestoreClient()
+    settings = AgentSettings(
+        sandbox_mode="local_subprocess",
+        session_backend="sqlite",
+        session_db_url=f"sqlite+aiosqlite:///{db_file}",
+        slack_allowed_approvers=("U_SRE_LEAD",),
+    )
+    event_store = InMemoryEventStoreBackend()
+    guardrails = IncidentGuardrailManager(settings, event_store)
+    k8s = FakeK8sExecutor()
+    remediation = SafeRemediationService(settings, k8s, post_error_rate_probe=lambda _ns, _svc: 0.0)
+    kb = LocalJsonlKnowledgeBase(REPO_ROOT / "bigquery" / "seed_runbooks_100.jsonl")
+
+    # 1 回目の起動プロセス: 異常検知 -> 承認待ち停止 -> チケットとセッションを永続化
+    orch1 = SreIncidentOrchestrator(
+        settings=settings,
+        sandbox_runner=SandboxRunner(settings),
+        knowledge_base=kb,
+        guardrail_manager=guardrails,
+        remediation_service=remediation,
+        decision_analyzer=_approval_required_restart_analyzer,
+        session_service=build_session_service(settings),
+    )
+    coord1 = SlackHitlCoordinator(
+        settings,
+        orch1,
+        ticket_store=FirestoreApprovalTicketStore(settings, client=fake_fs),
+    )
+
+    alert = AlertEvent(incident_id="HITL-RESTART-1", summary="DB connection stall", error_rate_series=[0.4, 0.5])
+    paused_result = await orch1.handle_alert(alert)
+    await coord1.notify_workflow_result(paused_result)
+    assert len(k8s.restarts) == 0
+    assert "HITL-RESTART-1" in fake_fs.collections[settings.firestore_tickets_collection]
+
+    # 旧プロセスのインスタンスオブジェクトは破棄（インメモリ辞書の消失を模擬）
+    del orch1, coord1
+
+    # 2 回目の起動プロセス（新規空メモリ状態で立ち上がった新インスタンス）
+    orch2 = SreIncidentOrchestrator(
+        settings=settings,
+        sandbox_runner=SandboxRunner(settings),
+        knowledge_base=kb,
+        guardrail_manager=guardrails,
+        remediation_service=remediation,
+        decision_analyzer=_approval_required_restart_analyzer,
+        session_service=build_session_service(settings),
+    )
+    coord2 = SlackHitlCoordinator(
+        settings,
+        orch2,
+        ticket_store=FirestoreApprovalTicketStore(settings, client=fake_fs),
+    )
+    assert coord2.pending_tickets == {}  # 新プロセスのローカルメモリは空
+
+    outcome = await coord2.process_approval_decision(
+        incident_id="HITL-RESTART-1",
+        slack_user_id="U_SRE_LEAD",
+        approved=True,
+    )
+    assert outcome.executed is True
+    assert outcome.action_status == "RESTARTED"
+    assert k8s.restarts == [("sre-demo-app", "order-service")]
+    assert "HITL-RESTART-1" not in fake_fs.collections[settings.firestore_tickets_collection]
+
+    # 二重クリック時は既に消費済みのため KeyError で拒否されること
+    with pytest.raises(KeyError):
+        await coord2.process_approval_decision(
+            incident_id="HITL-RESTART-1",
+            slack_user_id="U_SRE_LEAD",
+            approved=True,
+        )
+
+
+def test_build_session_service_rejects_unknown_backend() -> None:
+    """未知の session_backend 指定時に明示エラーを送出すること。"""
+    with pytest.raises(ValueError, match="未対応の session_backend"):
+        build_session_service(AgentSettings(session_backend="invalid_backend"))
+
+
+def test_build_session_service_firestore_returns_adk_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    """実 google-cloud-firestore SDK と FirestoreSessionService で初期化できること。"""
+    import google.cloud.firestore as fs_mod
+    from google.adk.integrations.firestore import FirestoreSessionService
+    from google.auth.credentials import AnonymousCredentials
+
+    orig_async_client = fs_mod.AsyncClient
+    monkeypatch.setattr(
+        fs_mod,
+        "AsyncClient",
+        lambda project=None, database=None, **kw: orig_async_client(
+            project=project or "demo-test",
+            database=database or "(default)",
+            credentials=AnonymousCredentials(),
+        ),
+    )
+
+    svc = build_session_service(
+        AgentSettings(
+            session_backend="firestore",
+            project_id="demo-test",
+            firestore_database="(default)",
+            firestore_sessions_collection="adk-session-test",
+        )
+    )
+    assert isinstance(svc, FirestoreSessionService)
+

@@ -144,6 +144,26 @@ def build_llm_decision_analyzer(
     return _analyze
 
 
+def build_session_service(settings: AgentSettings) -> BaseSessionService:
+    """設定に応じて ADK 2.x セッション永続化バックエンド（Firestore または SQLite）を生成する。"""
+    backend = settings.session_backend.strip().lower()
+    if backend == "firestore":
+        from google.adk.integrations.firestore import FirestoreSessionService
+        from google.cloud import firestore
+
+        client = firestore.AsyncClient(
+            project=settings.project_id,
+            database=settings.firestore_database,
+        )
+        return FirestoreSessionService(
+            client=client,
+            root_collection=settings.firestore_sessions_collection,
+        )
+    if backend == "sqlite":
+        return DatabaseSessionService(db_url=settings.session_db_url)
+    raise ValueError(f"未対応の session_backend です: {settings.session_backend!r}")
+
+
 class SreIncidentOrchestrator:
     """ADK 2.x `Workflow` を用いたインシデント調査・自動復旧・HITL 再開オーケストレーター。"""
 
@@ -169,7 +189,7 @@ class SreIncidentOrchestrator:
         self._remediation = remediation_service
         self._analyzer = decision_analyzer or build_llm_decision_analyzer(settings)
         self._enricher = telemetry_enricher
-        self._sessions = session_service or DatabaseSessionService(db_url=settings.session_db_url)
+        self._sessions = session_service or build_session_service(settings)
         self._app = self._build_adk_app()
         self._runner = Runner(app=self._app, session_service=self._sessions)
 

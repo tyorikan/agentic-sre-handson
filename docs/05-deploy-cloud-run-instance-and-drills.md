@@ -11,7 +11,7 @@
 
 ```mermaid
 flowchart TB
-    Internet["🌐 外部インターネット<br/>攻撃者 / 未認証アクセス"] -.->|"❌ 完全遮断<br/>ingress: internal / default-url-disabled"| Instance
+    Internet["🌐 外部インターネット<br/>攻撃者 / 未認証アクセス"] -.->|"❌ 完全遮断<br/>ingress: internal<br/>default-url-disabled"| Instance
 
     subgraph Instance["🔵 本章でデプロイ: Cloud Run instance (asia-northeast1)"]
         direction LR
@@ -19,7 +19,7 @@ flowchart TB
     end
 
     Daemon -->|"① 外向き TLS: StreamingPull"| PS["Cloud Pub/Sub<br/>(sre-alert-stream-sub)"]
-    Daemon -->|"② 外向き TLS: MCP・KB・LLM"| GCP["Monitoring / Logging / GKE MCP<br/>& BigQuery / Gemini 3.8 Flash"]
+    Daemon -->|"② 外向き TLS: MCP・KB・LLM"| GCP["Monitoring / Logging / GKE MCP<br/>BigQuery / Firestore<br/>Gemini 3.8 Flash"]
     Daemon -->|"③ 外向き TLS: AppsV1 Patch"| GKE["監視対象 GKE<br/>(sre-demo-app/order-service)"]
     Daemon <-->|"④ 外向き WSS: Socket Mode"| Slack["Slack ワークスペース"]
 
@@ -81,7 +81,7 @@ gcloud beta run instances deploy sre-autonomous-agent \
   --sandbox-launcher \
   --ingress=internal \
   --no-default-url \
-  --set-env-vars="GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT},GOOGLE_CLOUD_REGION=${GOOGLE_CLOUD_REGION},GOOGLE_CLOUD_LOCATION=global,GOOGLE_GENAI_USE_VERTEXAI=True,GOOGLE_GENAI_USE_ENTERPRISE=True,SRE_TRIAGE_MODEL=${SRE_TRIAGE_MODEL},SRE_EMBEDDING_MODEL=${SRE_EMBEDDING_MODEL},ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false,ALERT_PUBSUB_SUBSCRIPTION=${ALERT_PUBSUB_SUBSCRIPTION},BQ_DATASET=${BQ_DATASET},GKE_CLUSTER_NAME=${GKE_CLUSTER_NAME},GKE_CLUSTER_LOCATION=${GKE_CLUSTER_LOCATION},ALLOWED_K8S_NAMESPACES=${ALLOWED_K8S_NAMESPACES},SANDBOX_MODE=cloud_run,INITIAL_STABILIZATION_SECONDS=30,SLACK_ALERT_CHANNEL_ID=${SLACK_ALERT_CHANNEL_ID},SLACK_ALLOWED_APPROVER_IDS=${SLACK_ALLOWED_APPROVER_IDS:-}" \
+  --set-env-vars="GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT},GOOGLE_CLOUD_REGION=${GOOGLE_CLOUD_REGION},GOOGLE_CLOUD_LOCATION=global,GOOGLE_GENAI_USE_VERTEXAI=True,GOOGLE_GENAI_USE_ENTERPRISE=True,SRE_TRIAGE_MODEL=${SRE_TRIAGE_MODEL},SRE_EMBEDDING_MODEL=${SRE_EMBEDDING_MODEL},ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false,ALERT_PUBSUB_SUBSCRIPTION=${ALERT_PUBSUB_SUBSCRIPTION},BQ_DATASET=${BQ_DATASET},GKE_CLUSTER_NAME=${GKE_CLUSTER_NAME},GKE_CLUSTER_LOCATION=${GKE_CLUSTER_LOCATION},ALLOWED_K8S_NAMESPACES=${ALLOWED_K8S_NAMESPACES},SANDBOX_MODE=cloud_run,INITIAL_STABILIZATION_SECONDS=30,SESSION_BACKEND=firestore,FIRESTORE_DATABASE=(default),SLACK_ALERT_CHANNEL_ID=${SLACK_ALERT_CHANNEL_ID},SLACK_ALLOWED_APPROVER_IDS=${SLACK_ALLOWED_APPROVER_IDS:-}" \
   ${SLACK_SECRET_FLAGS[@]+"${SLACK_SECRET_FLAGS[@]}"} \
   --project="${GOOGLE_CLOUD_PROJECT}"
 ```
@@ -206,7 +206,7 @@ sequenceDiagram
 ```
 
 **確認ポイント**:
-* エージェントが勝手に Deployment を変更せず一時停止すること。
+* エージェントが勝手に Deployment を変更せず一時停止し、Firestore の `adk-session` と `sre_pending_approval_tickets` へ中断状態が永続化されること（待機中にインスタンスを再起動しても途中再開可能）。
 * Slack 上に `[Approve & Execute]` と `[Reject (Manual Triage)]` ボタンが届き、許可されたユーザー ID がボタンを押すと即座に ADK セッションが再開されてメッセージが `✅ 承認・実行完了` へ更新されること。
 * BigQuery `sre_agent_ops.incident_events` に `REQUIRE_APPROVAL` に続いて `APPROVED_EXECUTED` の監査行が追記されること。
 

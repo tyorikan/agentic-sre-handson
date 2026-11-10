@@ -18,8 +18,8 @@ flowchart LR
     subgraph Now["🔵 本章の対象: 意思決定・安全復旧・Slack 双方向 HITL"]
         WF["workflow.py<br/>ADK 2.x Workflow & JoinNode"]
         Rem["remediation_tools.py<br/>型付き Rollback / Restart<br/>＋ 事後エラー率検証"]
-        SlackMod["slack_socket.py<br/>Socket Mode 外向き WSS<br/>Approve / Reject 再開"]
-        DB["SQLite Session DB<br/>中断状態の保持"]
+        SlackMod["slack_socket.py<br/>ticket_store.py<br/>Socket Mode 外向き WSS"]
+        DB["Firestore (本番) / SQLite (単体)<br/>ADKセッション＋<br/>承認チケット永続化"]
         WF <--> DB
         WF --> Rem
         WF <--> SlackMod
@@ -107,31 +107,38 @@ stateDiagram-v2
 
 ---
 
-## 4. Slack Socket Mode による「公開 URL ゼロ」の承認再開シーケンス
+## 4. Slack Socket Mode と Firestore 永続化による「公開 URL ゼロ＆再起動耐性」承認シーケンス
 
 通常の HTTP Webhook で Slack のボタン操作を受け取ろうとすると、Slack サーバーは Google Cloud の IAM トークンを付与できないため、未認証でも到達できる公開 URL を用意する必要が生じます。  
-本設計では常駐型の Cloud Run instance から **Slack Socket Mode（外向き TLS WebSocket）** を張ることで、公開 URL を完全にゼロにしたまま双方向承認を実現します。
+本設計では常駐型の Cloud Run instance から **Slack Socket Mode（外向き TLS WebSocket）** を張ることで公開 URL を完全にゼロにし、さらに中断中の ADK セッション（`FirestoreSessionService`）と承認待ちチケット（[ticket_store.py](../sre-agent/agent_app/ticket_store.py) の `FirestoreApprovalTicketStore`）の両方を **Cloud Firestore** に保存します。
+
+> [!IMPORTANT]
+> **なぜローカルの `/tmp` SQLite ではなく Firestore を使うのか？**  
+> Cloud Run instance のローカルディスク（`/tmp` 等）およびプロセス内メモリはエフェメラルであり、コンテナ再起動・停止・リビジョン更新時に消滅します。承認ボタン押下待ちの間にインスタンスが再起動しても途中から安全に再開（Resume）できるよう、本番デプロイ時（`SESSION_BACKEND=firestore`）は Firestore へ永続化し、ローカル開発やクラウド未接続の `pytest` 実行時のみ `SESSION_BACKEND=sqlite` で完結できるハイブリッド構造にしています。
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant WF as ADK 2.x Workflow<br/>(Cloud Run instance 内)
-    participant DB as SQLite Session DB
+    participant DB as Firestore (ADK Session & Tickets)
     participant Bolt as SlackHitlCoordinator<br/>(Outbound WebSocket)
     participant Slack as Slack Cloud / オンコール担当者
     participant GKE as 監視対象 GKE
 
-    WF->>DB: approved_remediate_node 到達時に<br/>中断状態を保存 (adk_request_input)
+    WF->>DB: approved_remediate_node 到達時に<br/>中断セッションを保存 (adk_request_input)
     WF->>Bolt: WorkflowRunResult (paused_for_approval=True)
+    Bolt->>DB: 承認待ちチケット保存 (ticket_store.py)
     Bolt->>Slack: Block Kit 調査レポート + [Approve] / [Reject] ボタン投稿
-    Note over WF,Slack: Cloud Run 側に公開受信ポートは一切不要
+    Note over WF,Slack: Cloud Run 側に公開受信ポートは一切不要。<br/>待機中に instance が再起動しても Firestore 上の状態は保持される。
 
     Slack-->>Bolt: 担当者が [Approve] をクリック (WebSocket 配信)
     Bolt->>Bolt: 押下者の Slack User ID が許可リスト内か検証
+    Bolt->>DB: トランザクションで承認チケット取得 (二重実行防止)
     Bolt->>WF: resume_from_approval(confirmed=True, invocation_id=...)
-    WF->>DB: 中断箇所からセッション復元
+    WF->>DB: 中断箇所から ADK セッション復元
     WF->>GKE: 型付き復旧関数を実行 + 事後エラー率確認
     WF-->>Bolt: RemediationOutcome 返却
+    Bolt->>DB: 完了済みチケット削除
     Bolt->>Slack: 元メッセージを「✅ 承認・実行完了」へ更新
 ```
 
@@ -218,7 +225,7 @@ tests/test_slack_hitl_resume.py::test_pass_hat_k_blocks_flaky_agent PASSED
 
 ```markdown
 `AGENTS.md` を読み込み、第4章（`docs/04-auto-remediation-and-slack-hitl.md`）のテスト検証を実行してください。
-- `.venv` 環境で `pytest -v` を実行し、全 11 件のテスト（重複排除、サンドボックス隔離、100件検索、Workflow 3分岐、事後検証未回復時通知、Slack 承認者検証と Resume）が PASS することを確認して報告すること。
+- `.venv` 環境で `pytest -v` を実行し、全 13 件以上のテスト（重複排除、サンドボックス隔離、100件検索、Workflow 3分岐、事後検証未回復時通知、Slack 承認者検証、およびインスタンス再起動後の Resume 復旧）が PASS することを確認して報告すること。
 - Secret Manager への Slack トークン登録は私が手元でトークンを入力して行うため、実行用コマンドのみ案内すること。
 ```
 
