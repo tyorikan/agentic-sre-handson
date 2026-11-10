@@ -12,19 +12,26 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import signal
 import sys
 import uuid
 from typing import Any
 
+from aiohttp import web
 from google.cloud import pubsub_v1
 
 from .config import AgentSettings, load_settings
 from .dedup_store import BigQueryEventStoreBackend, IncidentGuardrailManager
 from .models import AlertEvent
-from .remediation_tools import GkeAppsV1RemediationExecutor, SafeRemediationService
+from .remediation_tools import (
+    GkeAppsV1RemediationExecutor,
+    SafeRemediationService,
+    build_live_post_remediation_probe,
+)
 from .sandbox_runner import SandboxRunner
 from .slack_socket import SlackHitlCoordinator
+from .telemetry_enrichment import CloudTelemetryEnricher
 from .vector_kb import BigQueryVectorKnowledgeBase
 from .workflow import SreIncidentOrchestrator
 
@@ -67,7 +74,19 @@ def parse_pubsub_payload(raw_bytes: bytes) -> AlertEvent:
             recent_deployment_within_30m=bool(jp.get("introduced_in")),
         )
 
-    # 3. 標準 AlertEvent JSON 形式
+    # 3. Cloud Logging 汎用テキスト/構造化形式 (textPayload / resource のみの場合)
+    if "insertId" in data and ("textPayload" in data or "resource" in data):
+        res_labels = data.get("resource", {}).get("labels", {})
+        return AlertEvent(
+            incident_id=str(data.get("insertId", f"log-{uuid.uuid4().hex[:8]}")),
+            namespace=res_labels.get("namespace_name", "sre-demo-app"),
+            service_name=res_labels.get("container_name", "order-service"),
+            error_code="GKE_CONTAINER_LOG_ERROR",
+            severity=str(data.get("severity", "ERROR")).upper(),
+            summary=str(data.get("textPayload", "Unhandled GKE container error log"))[:500],
+        )
+
+    # 4. 標準 AlertEvent JSON 形式
     return AlertEvent.model_validate(data)
 
 
@@ -77,32 +96,59 @@ async def process_incoming_alert(
     orchestrator: SreIncidentOrchestrator,
     slack_coordinator: SlackHitlCoordinator,
 ) -> bool:
-    """単一アラートをクールダウン判定の上で処理する（スキップ時は False、実行時は True）。"""
-    in_cooldown, reason = guardrails.is_in_cooldown(alert)
-    if in_cooldown:
+    """単一アラートを重複排除・処理権取得の上で実行する（スキップ時は False、実行時は True）。"""
+    claimed, reason = guardrails.claim_for_processing(alert)
+    if not claimed:
         _log_json("INFO", "クールダウン中のためアラートを重複排除スキップしました。", incident_id=alert.incident_id, reason=reason)
         return False
 
-    _log_json("INFO", "新規インシデントの自律相関調査を開始します。", incident_id=alert.incident_id, error_code=alert.error_code)
-    result = await orchestrator.handle_alert(alert)
-    await slack_coordinator.notify_workflow_result(result)
-    _log_json(
-        "INFO",
-        "インシデントの初期ワークフローが完了しました。",
-        incident_id=alert.incident_id,
-        decision=result.decision.decision,
-        paused_for_approval=result.paused_for_approval,
-    )
-    return True
+    try:
+        _log_json("INFO", "新規インシデントの自律相関調査を開始します。", incident_id=alert.incident_id, error_code=alert.error_code)
+        result = await orchestrator.handle_alert(alert)
+        await slack_coordinator.notify_workflow_result(result)
+        _log_json(
+            "INFO",
+            "インシデントの初期ワークフローが完了しました。",
+            incident_id=alert.incident_id,
+            decision=result.decision.decision,
+            paused_for_approval=result.paused_for_approval,
+        )
+        return True
+    except Exception:
+        guardrails.release_claim(alert)
+        raise
+
+
+async def _start_health_server(port: int) -> web.AppRunner:
+    """Cloud Run instances の起動・死活チェックおよび --ingress=internal 要件用の最小 /healthz 応答サーバー。"""
+
+    async def _healthz(_request: web.Request) -> web.Response:
+        return web.json_response({"status": "ok", "service": "sre-autonomous-agent"})
+
+    app = web.Application()
+    app.router.add_get("/healthz", _healthz)
+    app.router.add_get("/", _healthz)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    return runner
 
 
 async def run_daemon(settings: AgentSettings) -> None:
-    """Pub/Sub StreamingPull と Slack Socket Mode を並行稼働させる常駐メインループ。"""
+    """Pub/Sub StreamingPull・Slack Socket Mode・最小 /healthz 応答を並行稼働させる常駐メインループ。"""
+    health_port = int(os.getenv("PORT", "8080"))
+    health_runner = await _start_health_server(health_port)
+    _log_json("INFO", "ヘルスチェック用内部ポートを起動しました。", port=health_port)
+
     event_store = BigQueryEventStoreBackend(settings)
     guardrails = IncidentGuardrailManager(settings, event_store)
     sandbox_runner = SandboxRunner(settings)
     kb = BigQueryVectorKnowledgeBase(settings)
-    remediation_service = SafeRemediationService(settings, GkeAppsV1RemediationExecutor(settings))
+    gke_executor = GkeAppsV1RemediationExecutor(settings)
+    telemetry_enricher = CloudTelemetryEnricher(settings, deployment_checker=gke_executor)
+    post_probe = build_live_post_remediation_probe(settings, gke_executor)
+    remediation_service = SafeRemediationService(settings, gke_executor, post_error_rate_probe=post_probe)
 
     orchestrator = SreIncidentOrchestrator(
         settings=settings,
@@ -110,6 +156,7 @@ async def run_daemon(settings: AgentSettings) -> None:
         knowledge_base=kb,
         guardrail_manager=guardrails,
         remediation_service=remediation_service,
+        telemetry_enricher=telemetry_enricher.enrich_alert,
     )
     slack_coordinator = SlackHitlCoordinator(settings, orchestrator)
 
@@ -131,7 +178,7 @@ async def run_daemon(settings: AgentSettings) -> None:
                 process_incoming_alert(alert, guardrails, orchestrator, slack_coordinator),
                 loop,
             )
-            fut.result(timeout=120)
+            fut.result(timeout=180)
             message.ack()
         except Exception as exc:  # noqa: BLE001
             _log_json("ERROR", f"アラート処理中に例外が発生しました: {exc}")
@@ -151,6 +198,7 @@ async def run_daemon(settings: AgentSettings) -> None:
         streaming_pull_future.cancel()
         subscriber.close()
         await slack_coordinator.close_socket_mode()
+        await health_runner.cleanup()
 
 
 def main() -> None:

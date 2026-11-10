@@ -50,10 +50,13 @@ class AgentSettings:
         default_factory=lambda: float(os.getenv("AUTO_REMEDIATE_SIMILARITY_THRESHOLD", "0.85"))
     )
 
-    # サンドボックス設定 ("cloud_run" または "local_subprocess")
+    # サンドボックス・観測ウィンドウ設定 ("cloud_run" または "local_subprocess")
     sandbox_mode: str = field(default_factory=lambda: os.getenv("SANDBOX_MODE", "cloud_run"))
     sandbox_binary_path: str = field(
         default_factory=lambda: os.getenv("SANDBOX_BINARY_PATH", "/usr/local/gcp/bin/sandbox")
+    )
+    stabilization_wait_seconds: int = field(
+        default_factory=lambda: int(os.getenv("INITIAL_STABILIZATION_SECONDS", "0"))
     )
 
     # Slack Socket Mode 設定

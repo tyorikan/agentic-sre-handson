@@ -32,6 +32,8 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 ENV PYTHONPATH="/app/sre-agent"
 
+EXPOSE 8080
+
 USER 10001
 
 CMD ["python3", "-m", "agent_app.main"]

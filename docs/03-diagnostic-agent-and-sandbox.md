@@ -18,7 +18,7 @@ flowchart LR
 
     subgraph Now["🔵 本章の対象: Phase 1 読み取り・隔離診断"]
         Dedup["dedup_store.py<br/>Fingerprint 重複排除"]
-        MCP["mcp_tools.py<br/>公式リモート MCP (Read-Only)<br/>tool_filter 厳選 8 ツール"]
+        MCP["mcp_tools.py<br/>公式リモート MCP (Read-Only)<br/>tool_filter 厳選 10 ツール"]
         Sandbox["sandbox_runner.py<br/>/usr/local/gcp/bin/sandbox do<br/>外向き通信遮断・環境変数分離"]
         Vec["vector_kb.py<br/>VECTOR_SEARCH 照合"]
     end
@@ -54,11 +54,11 @@ flowchart LR
 |---|---|---|
 | **Cloud Monitoring** | `https://monitoring.googleapis.com/mcp` | `list_timeseries`, `query_range`, `list_alerts` |
 | **Cloud Logging** | `https://logging.googleapis.com/mcp` | `list_log_entries` |
-| **GKE (Read-Only)** | `https://container.googleapis.com/mcp/read-only` | `get_k8s_resource`, `describe_k8s_resource`, `list_k8s_events`, `get_k8s_rollout_status` |
+| **GKE (Read-Only)** | `https://container.googleapis.com/mcp/read-only` | `get_k8s_resource`, `describe_k8s_resource`, `list_k8s_events`, `get_k8s_rollout_status`, `diagnose_k8s_workload`, `get_k8s_logs` |
 
 ### 設計上の 2 つの急所
 1. **GKE は `/mcp` ではなく必ず `/mcp/read-only` エンドポイントを指定する**: これにより `delete_k8s_resource` や `patch_k8s_resource` といった変更系 MCP ツールがエンドポイントレベルで除外され、調査フェーズでの誤変更を 100% 防止できます。
-2. **`tool_filter` でツール数を 8 個に絞る**: 20〜30 個の汎用ツールをそのままモデルに見せると、どのツールを使うべきか迷ってレイテンシとトークンが増大します。必要なツールだけに絞ることで推論が一発で収束します。
+2. **`tool_filter` でツール数を 10 個に絞る**: 30 個以上の汎用ツールをそのままモデルに見せると、どのツールを使うべきか迷ってレイテンシとトークンが増大します。必要なツールだけに絞ることで推論が一発で収束します。
 
 ---
 

@@ -99,6 +99,7 @@ gcloud container clusters get-credentials "${GKE_CLUSTER_NAME}" \
 
 ```bash
 export SRE_AGENT_SA_EMAIL="sre-autonomous-agent-sa@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com"
+export SRE_AGENT_SA_UNIQUE_ID=$(gcloud iam service-accounts describe "${SRE_AGENT_SA_EMAIL}" --project="${GOOGLE_CLOUD_PROJECT}" --format="value(uniqueId)")
 export TARGET_APP_IMAGE_URI="${GOOGLE_CLOUD_REGION}-docker.pkg.dev/${GOOGLE_CLOUD_PROJECT}/sre-handson/order-service"
 
 # 1. サンプル注文 API (v1.0.0) のビルドとプッシュ
@@ -106,8 +107,9 @@ gcloud builds submit ./target-app \
   --tag="${TARGET_APP_IMAGE_URI}:v1.0.0" \
   --project="${GOOGLE_CLOUD_PROJECT}"
 
-# 2. Namespace と SRE エージェント用 最小権限 RBAC の適用
-sed "s|SRE_AGENT_SA_EMAIL|${SRE_AGENT_SA_EMAIL}|g" \
+# 2. Namespace と SRE エージェント用 最小権限 RBAC の適用（SA メールと数値 Unique ID の両方をバインド）
+sed -e "s|SRE_AGENT_SA_EMAIL|${SRE_AGENT_SA_EMAIL}|g" \
+    -e "s|SRE_AGENT_SA_UNIQUE_ID|${SRE_AGENT_SA_UNIQUE_ID}|g" \
   ./target-app/k8s/namespace.yaml | kubectl apply -f -
 
 # 3. 正常版 (v1.0.0) Deployment & Service のデプロイ
@@ -116,6 +118,9 @@ sed "s|TARGET_APP_IMAGE_URI|${TARGET_APP_IMAGE_URI}|g" \
 
 kubectl rollout status deployment/order-service -n sre-demo-app --timeout=180s
 ```
+
+> [!TIP]
+> Cloud Run や GCE のメタデータサーバーが払い出すトークンを GKE API サーバーへ直接渡した場合、Kubernetes RBAC は SA のメールアドレスではなく 21 桁の数値 **`uniqueId`** をユーザー ID として認証することがあります。`RoleBinding` に両方を明記しておくことで、ローカル `kubectl` 実行時と Cloud Run 常駐稼働時のどちらでも確実に動作します。
 
 ### 権限境界の確認（Verification）
 
@@ -148,10 +153,10 @@ gcloud pubsub subscriptions create "${ALERT_PUBSUB_SUBSCRIPTION}" \
   --message-retention-duration=1h \
   --project="${GOOGLE_CLOUD_PROJECT}"
 
-# 2. Cloud Logging シンクの作成（sre-demo-app の ERROR 以上のみ抽出）
+# 2. Cloud Logging シンクの作成（sre-demo-app の実エラー以上のみ抽出し、uvicorn の INFO stderr を除外）
 gcloud logging sinks create sre-gke-error-sink \
   "pubsub.googleapis.com/projects/${GOOGLE_CLOUD_PROJECT}/topics/${ALERT_TOPIC}" \
-  --log-filter='resource.type="k8s_container" AND resource.labels.namespace_name="sre-demo-app" AND severity>=ERROR' \
+  --log-filter='resource.type="k8s_container" AND resource.labels.namespace_name="sre-demo-app" AND severity>=ERROR AND NOT textPayload=~"^INFO:"' \
   --project="${GOOGLE_CLOUD_PROJECT}"
 
 # 3. ログルーターの書き込み専用サービスアカウントに Pub/Sub Publisher 権限を付与

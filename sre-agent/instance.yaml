@@ -23,6 +23,8 @@ spec:
   containers:
     - name: sre-agent
       image: SRE_AGENT_IMAGE_URI:latest
+      ports:
+        - containerPort: 8080
       sandboxLauncher: true
       resources:
         limits:
@@ -57,6 +59,8 @@ spec:
           value: "sre-demo-app"
         - name: SANDBOX_MODE
           value: "cloud_run"
+        - name: INITIAL_STABILIZATION_SECONDS
+          value: "30"
         - name: SLACK_ALERT_CHANNEL_ID
           value: "YOUR_SLACK_CHANNEL_ID"
         - name: SLACK_BOT_TOKEN

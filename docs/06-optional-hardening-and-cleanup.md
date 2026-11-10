@@ -126,6 +126,10 @@ gcloud artifacts repositories delete sre-handson \
   --location="${GOOGLE_CLOUD_REGION}" \
   --project="${GOOGLE_CLOUD_PROJECT}" \
   --quiet
+
+# （任意）Secret Manager シークレットとエージェント専用 SA を削除する場合
+gcloud secrets delete sre-slack-bot-token --project="${GOOGLE_CLOUD_PROJECT}" --quiet || true
+gcloud secrets delete sre-slack-app-token --project="${GOOGLE_CLOUD_PROJECT}" --quiet || true
 ```
 
 ---

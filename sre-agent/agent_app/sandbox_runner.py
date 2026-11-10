@@ -38,24 +38,32 @@ if n == 0:
     }))
     sys.exit(0)
 
+def _calc_slope(vals):
+    m = len(vals)
+    if m < 2:
+        return 0.0
+    mean_x = (m - 1) / 2.0
+    mean_y = sum(vals) / m
+    num = sum((i - mean_x) * (y - mean_y) for i, y in enumerate(vals))
+    den = sum((i - mean_x) ** 2 for i in range(m))
+    return num / den if den > 0 else 0.0
+
 peak = max(series)
+peak_idx = series.index(peak)
 latest = series[-1]
-if n >= 2:
-    mean_x = (n - 1) / 2.0
-    mean_y = sum(series) / n
-    num = sum((i - mean_x) * (y - mean_y) for i, y in enumerate(series))
-    den = sum((i - mean_x) ** 2 for i in range(n))
-    slope = num / den if den > 0 else 0.0
-else:
-    slope = 0.0
+overall_slope = _calc_slope(series)
+# スパイク前に正常ベースライン (0.0) を含む場合でも、ピーク以降の減衰区間を正確に評価する
+eval_series = series[peak_idx:] if (n - peak_idx) >= 3 else series
+effective_slope = _calc_slope(eval_series) if peak > 0 else overall_slope
 
 # ピーク後に負の傾きで減衰し、直近エラー率がピークの半分以下かつ 0.05 未満なら自然減衰中と判定
-decaying = bool(n >= 3 and slope < -0.02 and latest <= peak * 0.5 and latest < 0.05)
+decaying = bool(n >= 3 and effective_slope < -0.02 and latest <= peak * 0.5 and latest < 0.05)
+reported_slope = effective_slope if decaying else overall_slope
 print(json.dumps({
     "sample_count": n,
     "peak_error_rate": round(peak, 4),
     "latest_error_rate": round(latest, 4),
-    "linear_slope": round(slope, 4),
+    "linear_slope": round(reported_slope, 4),
     "is_naturally_decaying": decaying,
 }))
 """.strip()

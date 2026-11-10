@@ -24,6 +24,7 @@ ADK 2.x の `Workflow` / `JoinNode` / `@node(require_confirmation=True)` で制�
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -52,6 +53,12 @@ DecisionAnalyzerFn = Callable[
     [AlertEvent, SandboxMetricsAnalysis, list[SimilarRunbookMatch]],
     Awaitable[TriageDecision],
 ]
+TelemetryEnricherFn = Callable[[AlertEvent], Awaitable[AlertEvent]]
+
+
+def _emit_step_log(message: str, **extra: Any) -> None:
+    sys.stdout.write(json.dumps({"severity": "INFO", "message": message, **extra}, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
 
 
 @dataclass
@@ -152,6 +159,7 @@ class SreIncidentOrchestrator:
         guardrail_manager: IncidentGuardrailManager,
         remediation_service: SafeRemediationService,
         decision_analyzer: DecisionAnalyzerFn | None = None,
+        telemetry_enricher: TelemetryEnricherFn | None = None,
         session_service: BaseSessionService | None = None,
     ) -> None:
         self._settings = settings
@@ -160,6 +168,7 @@ class SreIncidentOrchestrator:
         self._guardrails = guardrail_manager
         self._remediation = remediation_service
         self._analyzer = decision_analyzer or build_llm_decision_analyzer(settings)
+        self._enricher = telemetry_enricher
         self._sessions = session_service or DatabaseSessionService(db_url=settings.session_db_url)
         self._app = self._build_adk_app()
         self._runner = Runner(app=self._app, session_service=self._sessions)
@@ -168,18 +177,29 @@ class SreIncidentOrchestrator:
         sandbox = self._sandbox
         kb = self._kb
         analyzer = self._analyzer
+        enricher = self._enricher
         guardrails = self._guardrails
         remediation = self._remediation
 
         @node(
             name="analyze_metrics_in_sandbox",
-            timeout=15.0,
+            timeout=75.0,
             retry_config=RetryConfig(max_attempts=2, initial_delay=0.5),
         )
         async def analyze_metrics_in_sandbox(ctx: Context) -> dict[str, Any]:
             alert = AlertEvent.model_validate(ctx.state["alert"])
+            if enricher is not None:
+                alert = await enricher(alert)
+                ctx.state["alert"] = alert.model_dump()
             stats = sandbox.analyze_error_series(alert.error_rate_series)
             ctx.state["sandbox_stats"] = stats.model_dump()
+            _emit_step_log(
+                "隔離サンドボックス時系列解析を完了しました。",
+                incident_id=alert.incident_id,
+                error_rate_series=alert.error_rate_series,
+                recent_deployment_within_30m=alert.recent_deployment_within_30m,
+                sandbox_stats=stats.model_dump(),
+            )
             return stats.model_dump()
 
         @node(
@@ -203,6 +223,13 @@ class SreIncidentOrchestrator:
             matches = [SimilarRunbookMatch.model_validate(m) for m in ctx.state["similar_matches"]]
             raw_decision = await analyzer(alert, stats, matches)
             ctx.state["raw_decision"] = raw_decision.model_dump()
+            _emit_step_log(
+                "Gemini トリアージ推論を完了しました。",
+                incident_id=alert.incident_id,
+                decision=raw_decision.decision,
+                matched_runbook_id=raw_decision.matched_runbook_id,
+                similarity_score=raw_decision.similarity_score,
+            )
             return raw_decision.model_dump()
 
         @node(name="enforce_guardrails_and_route")
@@ -232,6 +259,13 @@ class SreIncidentOrchestrator:
                 }
             )
             ctx.state["final_decision"] = final_decision.model_dump()
+            _emit_step_log(
+                "安全ガードレール検証・ルーティング判定を完了しました。",
+                incident_id=alert.incident_id,
+                final_route=final_decision.decision,
+                remediation_type=final_decision.remediation_type,
+                downgrade_reason=downgrade_reason,
+            )
             return Event(output=final_decision.model_dump(), route=final_decision.decision)
 
         @node(name="observe_node")
@@ -365,6 +399,15 @@ class SreIncidentOrchestrator:
         final_decision = TriageDecision.model_validate(state["final_decision"])
 
         if confirmation_call_id:
+            self._guardrails.record_outcome(
+                alert=alert,
+                decision="REQUIRE_APPROVAL",
+                remediation_type=final_decision.remediation_type,
+                matched_runbook_id=final_decision.matched_runbook_id,
+                similarity_score=final_decision.similarity_score,
+                verification_passed=False,
+                summary=f"[Slack 承認待機] {final_decision.rationale}",
+            )
             return WorkflowRunResult(
                 alert=alert,
                 session_id=session.id,

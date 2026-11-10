@@ -42,7 +42,7 @@ flowchart LR
 
 ### Step 2.1 コンテナイメージのビルド
 
-リポジトリルートから [sre-agent/Dockerfile](../sre-agent/Dockerfile) を使ってビルドし、Artifact Registry へ登録します。
+リポジトリルートから [sre-agent/cloudbuild.yaml](../sre-agent/cloudbuild.yaml) と [sre-agent/Dockerfile](../sre-agent/Dockerfile) を使ってビルドし、Artifact Registry へ登録します（`.gcloudignore` により `.venv` や `.env` はアップロードから自動除外されます）。
 
 ```bash
 source .env
@@ -51,14 +51,17 @@ export SRE_AGENT_SA_EMAIL="sre-autonomous-agent-sa@${GOOGLE_CLOUD_PROJECT}.iam.g
 export SRE_AGENT_IMAGE_URI="${GOOGLE_CLOUD_REGION}-docker.pkg.dev/${GOOGLE_CLOUD_PROJECT}/sre-handson/sre-autonomous-agent"
 
 gcloud builds submit . \
-  --file=./sre-agent/Dockerfile \
-  --tag="${SRE_AGENT_IMAGE_URI}:latest" \
+  --config=./sre-agent/cloudbuild.yaml \
+  --substitutions="_IMAGE_URI=${SRE_AGENT_IMAGE_URI}:latest" \
   --project="${GOOGLE_CLOUD_PROJECT}"
 ```
 
 ### Step 2.2 完全閉域・サンドボックス有効化設定でのインスタンス起動
 
-`--sandbox-launcher`、`--ingress internal`、`--no-default-url` をすべて指定してインスタンスを作成します。
+`--sandbox-launcher`、`--ingress internal`、`--no-default-url` をすべて指定してインスタンスを作成します（`gcloud beta` コンポーネントが未導入の場合は事前に `gcloud components install beta --quiet` を実行してください）。
+
+> [!NOTE]
+> Cloud Run instances の仕様上、`--ingress=internal` を指定する場合はコンテナに待受ポート（`--port=8080`）が必須となるため、`agent_app/main.py` にはコマンド実行や変更機能を持たない読み取り専用の `/healthz` 応答エンドポイントのみを最小実装しています。
 
 ```bash
 # Slack トークンを Secret Manager に登録済みの場合は --set-secrets を付与します
@@ -73,15 +76,19 @@ gcloud beta run instances deploy sre-autonomous-agent \
   --image="${SRE_AGENT_IMAGE_URI}:latest" \
   --region="${GOOGLE_CLOUD_REGION}" \
   --service-account="${SRE_AGENT_SA_EMAIL}" \
+  --port=8080 \
   --cpu=2 \
   --memory=2Gi \
   --sandbox-launcher \
   --ingress=internal \
   --no-default-url \
-  --set-env-vars="GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT},GOOGLE_CLOUD_REGION=${GOOGLE_CLOUD_REGION},GOOGLE_CLOUD_LOCATION=global,GOOGLE_GENAI_USE_VERTEXAI=True,GOOGLE_GENAI_USE_ENTERPRISE=True,SRE_TRIAGE_MODEL=${SRE_TRIAGE_MODEL},SRE_EMBEDDING_MODEL=${SRE_EMBEDDING_MODEL},ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false,ALERT_PUBSUB_SUBSCRIPTION=${ALERT_PUBSUB_SUBSCRIPTION},BQ_DATASET=${BQ_DATASET},GKE_CLUSTER_NAME=${GKE_CLUSTER_NAME},GKE_CLUSTER_LOCATION=${GKE_CLUSTER_LOCATION},ALLOWED_K8S_NAMESPACES=${ALLOWED_K8S_NAMESPACES},SANDBOX_MODE=cloud_run,SLACK_ALERT_CHANNEL_ID=${SLACK_ALERT_CHANNEL_ID}" \
-  "${SLACK_SECRET_FLAGS[@]}" \
+  --set-env-vars="GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT},GOOGLE_CLOUD_REGION=${GOOGLE_CLOUD_REGION},GOOGLE_CLOUD_LOCATION=global,GOOGLE_GENAI_USE_VERTEXAI=True,GOOGLE_GENAI_USE_ENTERPRISE=True,SRE_TRIAGE_MODEL=${SRE_TRIAGE_MODEL},SRE_EMBEDDING_MODEL=${SRE_EMBEDDING_MODEL},ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false,ALERT_PUBSUB_SUBSCRIPTION=${ALERT_PUBSUB_SUBSCRIPTION},BQ_DATASET=${BQ_DATASET},GKE_CLUSTER_NAME=${GKE_CLUSTER_NAME},GKE_CLUSTER_LOCATION=${GKE_CLUSTER_LOCATION},ALLOWED_K8S_NAMESPACES=${ALLOWED_K8S_NAMESPACES},SANDBOX_MODE=cloud_run,INITIAL_STABILIZATION_SECONDS=30,SLACK_ALERT_CHANNEL_ID=${SLACK_ALERT_CHANNEL_ID},SLACK_ALLOWED_APPROVER_IDS=${SLACK_ALLOWED_APPROVER_IDS:-}" \
+  ${SLACK_SECRET_FLAGS[@]+"${SLACK_SECRET_FLAGS[@]}"} \
   --project="${GOOGLE_CLOUD_PROJECT}"
 ```
+
+> [!TIP]
+> `INITIAL_STABILIZATION_SECONDS=30` を設定することで、単発のエラーログが Pub/Sub に到着した直後に即断せず、30 秒間の観測ウィンドウで直近のエラー率バケット推移を集計して「一時的スパイクの自然減衰」と「持続障害」を高精度に区別します。
 
 ### デプロイ設定の確認（Verification）
 
@@ -93,14 +100,18 @@ gcloud beta run instances describe sre-autonomous-agent \
   --project="${GOOGLE_CLOUD_PROJECT}"
 ```
 
-また、別ターミナルでエージェントの稼働ログを表示しておくと、以降の障害訓練の動きをリアルタイムに追跡できます。
+また、別ターミナルでエージェントの構造化ログを表示しておくと、以降の障害訓練の動きをリアルタイムに追跡できます。
 
 ```bash
 gcloud logging read \
-  'resource.type="cloud_run_instance" OR textPayload:"常駐自律型 SRE エージェント"' \
-  --limit=10 \
-  --project="${GOOGLE_CLOUD_PROJECT}"
+  'resource.labels.instance_name="sre-autonomous-agent" AND NOT jsonPayload.message:"重複排除スキップ"' \
+  --limit=25 \
+  --project="${GOOGLE_CLOUD_PROJECT}" \
+  --format='table(timestamp,severity,jsonPayload.incident_id,jsonPayload.decision,jsonPayload.matched_runbook_id,jsonPayload.message,textPayload)'
 ```
+
+> [!NOTE]
+> `agent_app/main.py` と `workflow.py` はステップ経過を標準出力（JSON 構造化ログ）へ出力するため、`gcloud beta run instances logs read` のデフォルト表示では `jsonPayload` 行が空行に見えることがあります。上記の `gcloud logging read` を使うと、判定結果や Runbook 一致情報を一覧で確認できます。
 
 ---
 
@@ -108,7 +119,7 @@ gcloud logging read \
 
 ### 訓練 1：一時的な下流ネットワーク瞬断 → 「静観（OBSERVE）」の検証
 
-75 秒間だけ下流決済ゲートウェイの TLS 瞬断（`UPSTREAM_CONN_RESET_503`）を発生させ、その後自然回復するシナリオを注入します。
+事前ベースラインリクエストの後、25 秒間だけ下流決済ゲートウェイの TLS 瞬断（`UPSTREAM_CONN_RESET_503`）を発生させ、自然回復を確認するシナリオを注入します。
 
 ```mermaid
 sequenceDiagram
@@ -118,10 +129,10 @@ sequenceDiagram
     participant BQ as BigQuery (100件知識ベース)
     participant Slack as Slack
 
-    Script->>GKE: 75秒間の一過性 503 モード設定 + 注文リクエスト送信
+    Script->>GKE: 正常送信後 25秒間の一過性 503 設定 + 回復リクエスト送信
     GKE->>Agent: Logging Sink -> Pub/Sub 経由で異常通知
     Agent->>BQ: VECTOR_SEARCH -> INC-013 (外部決済 TLS 瞬断) が一致
-    Note over Agent: 隔離 sandbox 解析 + 直近デプロイなしを確認<br/>「再起動すると再接続嵐になるため静観」と判定
+    Note over Agent: 30秒観測 + 隔離 sandbox 解析 + 直近デプロイなしを確認<br/>「再起動すると再接続嵐になるため静観」と判定
     Agent->>Slack: 🟢 静観レポート通知 (GKE ロールバック・再起動 0 回)
 ```
 
@@ -197,7 +208,24 @@ sequenceDiagram
 
 **確認ポイント**:
 * エージェントが勝手に Deployment を変更せず一時停止すること。
-* Slack 上に `[Approve & Execute]` と `[Reject (Manual Triage)]` ボタンが届き、ボタンを押すと即座に ADK セッションが再開されてメッセージが更新されること。
+* Slack 上に `[Approve & Execute]` と `[Reject (Manual Triage)]` ボタンが届き、許可されたユーザー ID がボタンを押すと即座に ADK セッションが再開されてメッセージが `✅ 承認・実行完了` へ更新されること。
+* BigQuery `sre_agent_ops.incident_events` に `REQUIRE_APPROVAL` に続いて `APPROVED_EXECUTED` の監査行が追記されること。
+
+```bash
+bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGION}" --use_legacy_sql=false \
+  'SELECT created_at, incident_id, error_code, decision, remediation_type, matched_runbook_id, ROUND(similarity_score, 3) AS sim, verification_passed FROM `sre_agent_ops.incident_events` ORDER BY created_at DESC LIMIT 6'
+```
+
+* 訓練 3 の確認が完了したら、擬似障害フラグを正常状態へ戻します。
+
+```bash
+./target-app/scripts/reset_fault.sh
+```
+
+### 💡 トラブルシューティングのヒント
+
+* **単発の `McpError: Server returned an error response` がログに出る場合**: LLM がリモート MCP ツールのフィルタ引数を初回試行で誤り、サーバーが入力補正エラーを返すことがあります。ADK のツール機構がエラーメッセージをモデルへ返して自動リトライするため、後続ステップで `Gemini トリアージ推論を完了しました` と記録されていれば正常動作です。全ツール呼び出しが連続失敗する場合のみ、`roles/mcp.toolUser` と `roles/serviceusage.serviceUsageConsumer` の付与を確認してください。
+* **訓練直後に同じ訓練を再実行したい場合**: 重複排除ストアが同一エラー指紋を 15 分間クールダウンするため、再テスト時は 15 分待つか、別のエラーシナリオを実行してください。
 
 ---
 

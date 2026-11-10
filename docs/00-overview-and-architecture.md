@@ -98,8 +98,10 @@ for ROLE in \
   roles/monitoring.viewer \
   roles/logging.viewer \
   roles/mcp.toolUser \
+  roles/serviceusage.serviceUsageConsumer \
   roles/bigquery.dataEditor \
   roles/bigquery.jobUser \
+  roles/bigquery.connectionUser \
   roles/pubsub.subscriber \
   roles/aiplatform.user \
   roles/container.clusterViewer \

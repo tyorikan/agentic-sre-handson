@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -174,21 +175,74 @@ class IncidentGuardrailManager:
     def __init__(self, settings: AgentSettings, backend: EventStoreBackend) -> None:
         self._settings = settings
         self._backend = backend
+        self._lock = threading.Lock()
+        self._recent_fingerprints: dict[str, tuple[datetime, str]] = {}
 
     def is_in_cooldown(self, alert: AlertEvent, now: datetime | None = None) -> tuple[bool, str]:
-        """直近のクールダウン期間内に同一障害が処理済みであれば True と理由を返す。"""
+        """直近のクールダウン期間内に同一障害が処理済み（または処理中）であれば True と理由を返す。"""
         current = now or datetime.now(timezone.utc)
-        since = current - timedelta(minutes=self._settings.cooldown_minutes)
+        window = timedelta(minutes=self._settings.cooldown_minutes)
         fp = alert.compute_fingerprint()
+
+        with self._lock:
+            cached = self._recent_fingerprints.get(fp)
+            if cached is not None:
+                cached_at, cached_desc = cached
+                if current >= cached_at and (current - cached_at) < window:
+                    return (
+                        True,
+                        f"クールダウン期間内 ({self._settings.cooldown_minutes}分) に同一 fingerprint={fp} が処理中または処理済みです ({cached_desc})",
+                    )
+
+        since = current - window
         recent = self._backend.find_recent_by_fingerprint(fp, since=since)
         if recent:
             latest = recent[0]
+            with self._lock:
+                self._recent_fingerprints[fp] = (
+                    latest.created_at,
+                    f"前回 incident_id={latest.incident_id}, decision={latest.decision}",
+                )
             return (
                 True,
                 f"クールダウン期間内 ({self._settings.cooldown_minutes}分) に同一 fingerprint={fp} が処理済みです "
                 f"(前回 incident_id={latest.incident_id}, decision={latest.decision})",
             )
         return False, ""
+
+    def claim_for_processing(self, alert: AlertEvent, now: datetime | None = None) -> tuple[bool, str]:
+        """StreamingPull 並行受信時の重複起動を防ぐため、クールダウン確認と処理権取得を原子的に行う。"""
+        current = now or datetime.now(timezone.utc)
+        window = timedelta(minutes=self._settings.cooldown_minutes)
+        fp = alert.compute_fingerprint()
+
+        with self._lock:
+            cached = self._recent_fingerprints.get(fp)
+            if cached is not None:
+                cached_at, cached_desc = cached
+                if current >= cached_at and (current - cached_at) < window:
+                    return (
+                        False,
+                        f"クールダウン期間内 ({self._settings.cooldown_minutes}分) に同一 fingerprint={fp} を重複排除しました ({cached_desc})",
+                    )
+            since = current - window
+            recent = self._backend.find_recent_by_fingerprint(fp, since=since)
+            if recent:
+                latest = recent[0]
+                desc = f"前回 incident_id={latest.incident_id}, decision={latest.decision}"
+                self._recent_fingerprints[fp] = (latest.created_at, desc)
+                return False, f"クールダウン期間内に同一 fingerprint={fp} が処理済みです ({desc})"
+
+            self._recent_fingerprints[fp] = (current, f"in_flight incident_id={alert.incident_id}")
+            return True, ""
+
+    def release_claim(self, alert: AlertEvent) -> None:
+        """例外発生により処理未完了となった場合に処理中ロックを解放する。"""
+        fp = alert.compute_fingerprint()
+        with self._lock:
+            cached = self._recent_fingerprints.get(fp)
+            if cached is not None and cached[1].startswith(f"in_flight incident_id={alert.incident_id}"):
+                self._recent_fingerprints.pop(fp, None)
 
     def enforce_safety_guardrails(
         self,
@@ -273,4 +327,9 @@ class IncidentGuardrailManager:
             created_at=now or datetime.now(timezone.utc),
         )
         self._backend.append_event(record)
+        with self._lock:
+            self._recent_fingerprints[record.fingerprint] = (
+                record.created_at,
+                f"前回 incident_id={record.incident_id}, decision={record.decision}",
+            )
         return record

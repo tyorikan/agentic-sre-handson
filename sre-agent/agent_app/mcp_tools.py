@@ -41,6 +41,8 @@ GKE_READONLY_ALLOWED_TOOLS = [
     "describe_k8s_resource",
     "list_k8s_events",
     "get_k8s_rollout_status",
+    "diagnose_k8s_workload",
+    "get_k8s_logs",
 ]
 
 
@@ -49,7 +51,7 @@ def _build_google_auth_header_provider(project_id: str):
 
     def _provider(_readonly_context: Any = None) -> dict[str, str]:
         credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-        if not credentials.valid:
+        if not credentials.valid or not credentials.token:
             credentials.refresh(google.auth.transport.requests.Request())
         return {
             "Authorization": f"Bearer {credentials.token}",

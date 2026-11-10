@@ -10,14 +10,20 @@ NAMESPACE="${NAMESPACE:-sre-demo-app}"
 SERVICE="${SERVICE:-order-service}"
 DURATION_SECONDS="${DURATION_SECONDS:-600}"
 
-echo "[Scenario 3] 高リスクの DB コネクション枯渇・ロック競合障害を注入します..."
+POD_IPS="$(kubectl get pods -n "${NAMESPACE}" -l app="${SERVICE}" -o jsonpath='{.items[*].status.podIP}')"
+if [[ -z "${POD_IPS}" ]]; then
+  echo "エラー: Namespace=${NAMESPACE} に稼働中 Pod (${SERVICE}) が見つかりません。" >&2
+  exit 1
+fi
+
+echo "[Scenario 3] 高リスクの DB コネクション枯渇・ロック競合障害を注入します (Pods: ${POD_IPS})..."
 
 kubectl run fault-injector-db \
   --namespace="${NAMESPACE}" \
   --rm -i --restart=Never \
   --image=curlimages/curl:8.10.1 \
   --command -- sh -c "
-    for pod_ip in \$(nslookup ${SERVICE}.${NAMESPACE}.svc.cluster.local | awk '/^Address: / { print \$2 }' | tail -n +2); do
+    for pod_ip in ${POD_IPS}; do
       curl -sS -X POST http://\${pod_ip}:8080/admin/fault \
         -H 'Content-Type: application/json' \
         -d '{\"mode\": \"DB_POOL_EXHAUSTED\", \"duration_seconds\": ${DURATION_SECONDS}}'
@@ -34,3 +40,4 @@ kubectl run fault-injector-db \
   "
 
 echo "[Scenario 3] 注入完了。Slack に届く調査レポートと [Approve / Reject] ボタンを確認してください。"
+echo "検証後に手動で障害モードを解除する場合は ./target-app/scripts/reset_fault.sh を実行してください。"

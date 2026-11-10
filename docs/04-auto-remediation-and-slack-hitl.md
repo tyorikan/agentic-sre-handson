@@ -66,13 +66,18 @@ LLM が仮に `AUTO_REMEDIATE` を提案した場合でも、`enforce_guardrails
 
 ```mermaid
 stateDiagram-v2
+    state "AUTO_REMEDIATE 提案  " as ProposedAuto
+    state "承認待機へ降格  " as DowngradedApproval
+    state "自動復旧を実行  " as ExecuteAuto
+    state "回復を事後検証  " as PostVerify
+
     [*] --> ProposedAuto: LLM が AUTO_REMEDIATE を提案
-    ProposedAuto --> DowngradedApproval: 対象が許可 Namespace 外
-    ProposedAuto --> DowngradedApproval: 類似度スコア < 0.85
-    ProposedAuto --> DowngradedApproval: 同一サービスで直近1時間に自動復旧1回実施済み
-    ProposedAuto --> ExecuteAuto: すべての安全条件を満たす
-    ExecuteAuto --> PostVerify: AppsV1 API で Rollback / Restart 実行
-    PostVerify --> [*]: 事後エラー率 < 1.0% を検証して監査記録
+    ProposedAuto --> DowngradedApproval: 対象が許可<br/>Namespace 外
+    ProposedAuto --> DowngradedApproval: 類似度スコア<br/>0.85 未満
+    ProposedAuto --> DowngradedApproval: 1時間以内に<br/>既に復旧実施済み
+    ProposedAuto --> ExecuteAuto: 全安全条件を満たす
+    ExecuteAuto --> PostVerify: AppsV1 で Rollback / Restart
+    PostVerify --> [*]: 事後エラー率 < 1.0% 検証
     DowngradedApproval --> [*]: Slack 承認ボタン待ちへ移行
 ```
 
@@ -125,7 +130,7 @@ Slack ワークスペースへの権限をお持ちの場合は、以下の **Ap
 
 ### Step 5.1 Slack App マニフェストの適用
 
-1. `https://api.slack.com/apps` を開き、**Create New App** → **From an app manifest** を選択します。
+1. [Slack API: Your Apps](https://api.slack.com/apps) を開き、**Create New App** → **From an app manifest** を選択します。
 2. 対象ワークスペースを選び、YAML タブに以下を貼り付けて作成します。
 
 ```yaml
@@ -151,7 +156,7 @@ settings:
 
 3. **Basic Information** → **App-Level Tokens** で `connections:write` スコープ付きのトークンを生成し、`xapp-...` で始まる **App Token** を控えます。
 4. **Install to Workspace** を実行し、`xoxb-...` で始まる **Bot User OAuth Token** を控えます。
-5. 通知先 Slack チャンネルで `/invite @sre-agent` を実行し、チャンネル ID（`C...`）を `.env` の `SLACK_ALERT_CHANNEL_ID` に設定します。
+5. 通知先 Slack チャンネルで `/invite @sre-agent` を実行し、チャンネル詳細下部に表示されるチャンネル ID（`C...`）を `.env` の `SLACK_ALERT_CHANNEL_ID` に設定します。あわせて、承認を許可するご自身のプロフィール画面（その他 → メンバー ID をコピー）から `U...` 形式の User ID を取得し、`SLACK_ALLOWED_APPROVER_IDS` に設定します。
 
 ### Step 5.2 Secret Manager への安全な格納
 
@@ -200,7 +205,7 @@ tests/test_slack_hitl_resume.py::test_pass_hat_k_blocks_flaky_agent PASSED
 
 ```markdown
 `AGENTS.md` を読み込み、第4章（`docs/04-auto-remediation-and-slack-hitl.md`）のテスト検証を実行してください。
-- `.venv` 環境で `pytest -v` を実行し、全 9 件のテスト（重複排除、サンドボックス隔離、100件検索、Workflow 3分岐、Slack 承認者検証と Resume）が PASS することを確認して報告すること。
+- `.venv` 環境で `pytest -v` を実行し、全 10 件のテスト（重複排除、サンドボックス隔離、100件検索、Workflow 3分岐、非対称回復検証、Slack 承認者検証と Resume）が PASS することを確認して報告すること。
 - Secret Manager への Slack トークン登録は私が手元でトークンを入力して行うため、実行用コマンドのみ案内すること。
 ```
 

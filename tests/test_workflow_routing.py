@@ -136,3 +136,29 @@ async def test_workflow_three_scenarios_end_to_end(tmp_path: Path) -> None:
     assert res3.confirmation_call_id is not None
     # 承認前は新たなロールバック・再起動が実行されていないこと
     assert len(k8s.rollbacks) == 1 and len(k8s.restarts) == 0
+    # 一時停止時点で BigQuery/監査ストアへ REQUIRE_APPROVAL レコードが記録されること
+    assert any(r.incident_id == "INC-S3" and r.decision == "REQUIRE_APPROVAL" for r in store.rows)
+
+    # 4. telemetry_enricher 注入時は空の error_rate_series が補完されて解析されること
+    async def _fake_enricher(a: AlertEvent) -> AlertEvent:
+        return a.model_copy(update={"error_rate_series": [0.0, 0.85, 0.25, 0.01]})
+
+    orchestrator_with_enricher = SreIncidentOrchestrator(
+        settings=settings,
+        sandbox_runner=SandboxRunner(settings),
+        knowledge_base=kb,
+        guardrail_manager=guardrails,
+        remediation_service=remediation,
+        decision_analyzer=_deterministic_test_analyzer,
+        telemetry_enricher=_fake_enricher,
+        session_service=DatabaseSessionService(db_url=settings.session_db_url),
+    )
+    res4 = await orchestrator_with_enricher.handle_alert(
+        AlertEvent(
+            incident_id="INC-S4-ENRICH",
+            error_code="UPSTREAM_CONN_RESET_503",
+            summary="Upstream payment gateway connection reset by peer during TLS handshake",
+            error_rate_series=[],
+        )
+    )
+    assert res4.decision.decision == "OBSERVE"

@@ -12,6 +12,8 @@ from agent_app.config import AgentSettings
 from agent_app.dedup_store import IncidentGuardrailManager, InMemoryEventStoreBackend
 from agent_app.models import AlertEvent
 from agent_app.main import parse_pubsub_payload
+from agent_app.sandbox_runner import SandboxRunner
+from agent_app.telemetry_enrichment import compute_error_rate_series_from_logs
 
 
 def test_cooldown_deduplication() -> None:
@@ -164,3 +166,48 @@ def test_pubsub_payload_normalization_and_target_app_modes(monkeypatch: pytest.M
     monkeypatch.delenv("PAYMENT_CURRENCY_PRECISION", raising=False)
     bug_resp = client.post("/orders", json={"item_id": "SKU-1", "quantity": 1, "amount_jpy": 1000})
     assert bug_resp.status_code == 500
+
+
+def test_atomic_claim_and_log_binning_decay_detection() -> None:
+    """並行重複排除 claim とログバケット集計からの自然減衰判定が正確に機能すること。"""
+    settings = AgentSettings(cooldown_minutes=15, sandbox_mode="local_subprocess")
+    mgr = IncidentGuardrailManager(settings, InMemoryEventStoreBackend())
+    t0 = datetime(2026, 11, 10, 4, 0, tzinfo=timezone.utc)
+    alert_a = AlertEvent(incident_id="BURST-1", error_code="UPSTREAM_CONN_RESET_503", summary="burst")
+    alert_b = AlertEvent(incident_id="BURST-2", error_code="UPSTREAM_CONN_RESET_503", summary="burst dup")
+
+    ok1, _ = mgr.claim_for_processing(alert_a, now=t0)
+    ok2, reason2 = mgr.claim_for_processing(alert_b, now=t0 + timedelta(seconds=2))
+    assert ok1 is True
+    assert ok2 is False
+    assert "BURST-1" in reason2
+
+    # 失敗時は claim 解放でリトライ可能になる
+    mgr.release_claim(alert_a)
+    ok_retry, _ = mgr.claim_for_processing(alert_b, now=t0 + timedelta(seconds=3))
+    assert ok_retry is True
+
+    # textPayload 形式の汎用 Cloud Logging エントリも落ちずに正規化できること
+    raw_text_log = b'{"insertId":"txt-1","severity":"ERROR","textPayload":"boom","resource":{"labels":{"namespace_name":"sre-demo-app","container_name":"order-service"}}}'
+    parsed_txt = parse_pubsub_payload(raw_text_log)
+    assert parsed_txt.incident_id == "txt-1"
+    assert parsed_txt.service_name == "order-service"
+
+    # 前半正常 → 一時的スパイク → 自然回復のタイムバケットから自然減衰が検出されること
+    end = datetime(2026, 11, 10, 4, 1, 30, tzinfo=timezone.utc)
+    entries = [
+        (end - timedelta(seconds=80), "INFO"),
+        (end - timedelta(seconds=75), "INFO"),
+        (end - timedelta(seconds=55), "ERROR"),
+        (end - timedelta(seconds=50), "ERROR"),
+        (end - timedelta(seconds=38), "ERROR"),
+        (end - timedelta(seconds=35), "INFO"),
+        (end - timedelta(seconds=20), "INFO"),
+        (end - timedelta(seconds=10), "INFO"),
+        (end - timedelta(seconds=5), "INFO"),
+    ]
+    series = compute_error_rate_series_from_logs(entries, window_end=end, bucket_seconds=18, num_buckets=5)
+    assert len(series) >= 4
+    stats = SandboxRunner(settings).analyze_error_series(series)
+    assert stats.is_naturally_decaying is True
+    assert stats.linear_slope < -0.02

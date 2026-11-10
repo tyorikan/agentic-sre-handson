@@ -12,13 +12,17 @@ LLM に自由な `kubectl` シェルコマンドを生成・実行させるア�
 from __future__ import annotations
 
 import base64
+import hashlib
+import os
 import tempfile
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Callable, Protocol
 
 import google.auth
 import google.auth.transport.requests
-from google.cloud import container_v1
+from google.cloud import container_v1, logging_v2
 from kubernetes import client as k8s_client
 
 from .config import AgentSettings
@@ -60,11 +64,57 @@ class GkeAppsV1RemediationExecutor:
         cfg.api_key = {"authorization": f"Bearer {credentials.token}"}
 
         ca_bytes = base64.b64decode(cluster.master_auth.cluster_ca_certificate)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".crt") as ca_file:
-            ca_file.write(ca_bytes)
-            cfg.ssl_ca_cert = ca_file.name
+        ca_digest = hashlib.sha256(ca_bytes).hexdigest()[:12]
+        ca_path = Path(tempfile.gettempdir()) / f"sre-gke-ca-{ca_digest}.crt"
+        if not ca_path.exists():
+            fd = os.open(str(ca_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, ca_bytes)
+            finally:
+                os.close(fd)
+        cfg.ssl_ca_cert = str(ca_path)
 
         return k8s_client.AppsV1Api(k8s_client.ApiClient(cfg))
+
+    def has_recent_deployment(self, namespace: str, deployment_name: str, *, within_minutes: int = 30) -> bool:
+        """直近 within_minutes 以内に新しいロールアウト (revision >= 2) が発生したか確認する。"""
+        apps_v1 = self._build_apps_v1_client()
+        dep = apps_v1.read_namespaced_deployment(name=deployment_name, namespace=namespace)
+        match_labels = dep.spec.selector.match_labels or {}
+        label_selector = ",".join(f"{k}={v}" for k, v in match_labels.items())
+        rs_list = apps_v1.list_namespaced_replica_set(namespace=namespace, label_selector=label_selector).items
+
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=within_minutes)
+        for rs in rs_list:
+            ann = (rs.metadata.annotations or {}).get("deployment.kubernetes.io/revision", "0")
+            rev = int(ann) if ann.isdigit() else 0
+            replicas = rs.spec.replicas or 0
+            created = rs.metadata.creation_timestamp
+            if rev >= 2 and replicas > 0 and created is not None and created >= cutoff:
+                return True
+        return False
+
+    def wait_deployment_ready(
+        self,
+        namespace: str,
+        deployment_name: str,
+        *,
+        timeout_seconds: int = 75,
+    ) -> tuple[bool, datetime]:
+        """Deployment の新リビジョン Pod がすべて Ready になるまで待機する。"""
+        apps_v1 = self._build_apps_v1_client()
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            dep = apps_v1.read_namespaced_deployment(name=deployment_name, namespace=namespace)
+            desired = dep.spec.replicas or 1
+            status = dep.status
+            gen_ok = (status.observed_generation or 0) >= (dep.metadata.generation or 0)
+            updated = status.updated_replicas or 0
+            available = status.available_replicas or 0
+            if gen_ok and updated >= desired and available >= desired:
+                return True, datetime.now(timezone.utc)
+            time.sleep(3)
+        return False, datetime.now(timezone.utc)
 
     def rollback_deployment(self, namespace: str, deployment_name: str) -> str:
         """ReplicaSet の revision 履歴から 1 つ前のリビジョンの PodTemplate を特定し Deployment を戻す。"""
@@ -174,3 +224,34 @@ class SafeRemediationService:
             verification_passed=verified,
             post_error_rate=post_rate,
         )
+
+
+def build_live_post_remediation_probe(
+    settings: AgentSettings,
+    executor: GkeAppsV1RemediationExecutor,
+) -> Callable[[str, str], float]:
+    """Deployment ロールアウト完了と Cloud Logging 直近エラー率を実測する本番用事後検証プローブ。"""
+
+    def _probe(namespace: str, deployment_name: str) -> float:
+        ready, converged_at = executor.wait_deployment_ready(namespace, deployment_name, timeout_seconds=75)
+        if not ready:
+            return 1.0
+
+        # 新リビジョン Pod の定常ログ安定を短時間待機してから ERROR ログ有無を確認する
+        time.sleep(8)
+        client = logging_v2.Client(project=settings.project_id)
+        since = (converged_at - timedelta(seconds=1)).isoformat()
+        log_filter = (
+            'resource.type="k8s_container" '
+            f'AND resource.labels.namespace_name="{namespace}" '
+            f'AND timestamp>="{since}"'
+        )
+        total = 0
+        errors = 0
+        for entry in client.list_entries(filter_=log_filter, page_size=100):
+            total += 1
+            if str(entry.severity or "INFO").upper() in {"ERROR", "CRITICAL", "ALERT", "EMERGENCY"}:
+                errors += 1
+        return (errors / total) if total > 0 else 0.0
+
+    return _probe
