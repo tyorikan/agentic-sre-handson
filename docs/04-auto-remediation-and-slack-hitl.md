@@ -9,24 +9,29 @@
 
 色が付いている **ADK 2.x ワークフロー制御層**、**型付き GKE 復旧層**、および **Slack Socket Mode 連携層** を確認・設定します。
 
+![第 4 章で実装する ADK 2.x ワークフロー・型付き復旧・Slack HITL 連携図](images/04-01-chapter4-scope.png)
+
+<details>
+<summary>詳細: Mermaid ソースを表示</summary>
+
 ```mermaid
 flowchart LR
-    subgraph Prev["✅ 第 1〜3 章で構築・確認済み"]
-        Diag["並列診断層<br/>・公式リモート MCP<br/>・Cloud Run sandbox<br/>・BigQuery 100件照合"]
+    subgraph Prev["第 1〜3 章で構築・確認済み"]
+        Diag["Phase 1 補完・並列診断層<br/>・telemetry_enrichment.py<br/>・公式リモート MCP 読取<br/>・Cloud Run sandbox<br/>・BigQuery 100件照合"]
     end
 
-    subgraph Now["🔵 本章の対象: 意思決定・安全復旧・Slack 双方向 HITL"]
+    subgraph Now["本章の対象: 意思決定・安全復旧・Slack 双方向 HITL"]
         WF["workflow.py<br/>ADK 2.x Workflow & JoinNode"]
-        Rem["remediation_tools.py<br/>型付き Rollback / Restart<br/>＋ 事後エラー率検証"]
-        SlackMod["slack_socket.py<br/>ticket_store.py<br/>Socket Mode 外向き WSS"]
-        DB["Firestore (本番) / SQLite (単体)<br/>ADKセッション＋<br/>承認チケット永続化"]
-        WF <--> DB
+        Rem["remediation_tools.py<br/>型付き Rollback / Restart + 事後検証"]
+        SlackMod["slack_socket.py / ticket_store.py<br/>Socket Mode 外向き WSS"]
+        DB["Firestore 本番 / SQLite 単体<br/>ADK セッション + 承認チケット永続化"]
         WF --> Rem
         WF <--> SlackMod
+        WF <--> DB
     end
 
     subgraph Target["監視対象 GKE & Slack"]
-        GKE["order-service<br/>(sre-demo-app)"]
+        GKE["order-service<br/>Namespace: sre-demo-app"]
         SlackUI["Slack チャンネル"]
     end
 
@@ -34,9 +39,13 @@ flowchart LR
     Rem -->|"AppsV1 API"| GKE
     SlackMod <-->|"Outbound TLS 443"| SlackUI
 
-    style Prev fill:#e6f4ea,stroke:#137333
-    style Now fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px
+    classDef done fill:#e6f4ea,stroke:#137333,stroke-width:2px,color:#202124;
+    classDef cur fill:#ffffff,stroke:#1a73e8,stroke-width:2px,color:#202124;
+    class Diag done;
+    class WF,Rem,SlackMod,DB,GKE,SlackUI cur;
 ```
+
+</details>
 
 ---
 
@@ -44,47 +53,74 @@ flowchart LR
 
 従来の対話型エージェントのように「次の手順を毎回すべて LLM の自由裁量に任せる」構造にすると、手順飛ばしや無限ループが起きやすくなります。[sre-agent/agent_app/workflow.py](../sre-agent/agent_app/workflow.py) では、ADK 2.x の `Workflow` を使って**処理順序と分岐条件をコードの有向グラフとして明示固定**しています。
 
+![ADK 2.x Workflow・JoinNode・require_confirmation によるインシデント処理グラフ構造図](images/04-02-adk-workflow-graph.png)
+
+<details>
+<summary>詳細: Mermaid ソースを表示</summary>
+
 ```mermaid
 flowchart TD
-    S(["START"]) --> P1["@node:<br/>analyze_metrics_in_sandbox<br/>隔離空間でスロープ計算"]
-    S --> P2["@node:<br/>search_similar_incidents<br/>BigQuery VECTOR_SEARCH<br/>上位3件を類似照合"]
+    Pre["前処理: CloudTelemetryEnricher.enrich_alert<br/>ログ時系列エラー率・直近デプロイ有無を補完"] --> S(["START"])
+    S --> P1["@node: analyze_metrics_in_sandbox<br/>隔離空間でスロープ計算"]
+    S --> P2["@node: search_similar_incidents<br/>BigQuery VECTOR_SEARCH 上位3件照合"]
     P1 & P2 --> J["JoinNode: join_diagnostics<br/>両方の診断完了を待機・合流"]
-    J --> LLM["@node: correlate_and_decide<br/>gemini-3.8-flash + 公式 MCP<br/>TriageDecision 構造化出力"]
-    LLM --> Router["@node:<br/>enforce_guardrails_and_route<br/>ガードレール検査・分岐"]
+    J --> LLM["@node: correlate_and_decide<br/>gemini-3.8-flash + 公式リモート MCP<br/>TriageDecision 構造化出力"]
+    LLM --> Router["@node: enforce_guardrails_and_route<br/>ガードレール検査・3分岐ルーティング"]
 
     Router -->|"route = OBSERVE"| N1["@node: observe_node<br/>変更操作なし・静観記録"]
-    Router -->|"route = AUTO_REMEDIATE"| N2["@node: auto_remediate_node<br/>即時 Rollback / Restart<br/>＋ 事後回復確認"]
-    Router -->|"route = REQUIRE_APPROVAL"| N3["@node:<br/>approved_remediate_node<br/>require_confirmation=True<br/>実行前に自動一時停止"]
+    Router -->|"route = AUTO_REMEDIATE"| N2["@node: auto_remediate_node<br/>即時 Rollback / Restart + 事後回復確認"]
+    Router -->|"route = REQUIRE_APPROVAL"| N3["@node: approved_remediate_node<br/>require_confirmation=True で自動一時停止"]
 
-    N3 -.->|"Slack で Approve 押下"| Exec["本体再開・処置実行"]
+    N3 -.->|"Slack で Approve 押下"| Exec["Firestore から再開・処置実行"]
     N3 -.->|"Slack で Reject 押下"| Cancel["実行スキップ・手動引き継ぎ"]
+
+    classDef nodeBox fill:#ffffff,stroke:#4285F4,stroke-width:1.5px,color:#202124;
+    classDef ok fill:#e6f4ea,stroke:#137333,stroke-width:2px,color:#202124;
+    classDef auto fill:#e8f0fe,stroke:#1967d2,stroke-width:2px,color:#202124;
+    classDef hitl fill:#fef7e0,stroke:#b06000,stroke-width:2px,color:#202124;
+    classDef reject fill:#fce8e6,stroke:#c5221f,stroke-width:2px,color:#202124;
+    class Pre,S,P1,P2,J,LLM,Router nodeBox;
+    class N1,Exec ok;
+    class N2 auto;
+    class N3 hitl;
+    class Cancel reject;
 ```
+
+</details>
 
 ### 安全ガードレールによる自動降格（サーキットブレーカー）
 
 LLM が仮に `AUTO_REMEDIATE` を提案した場合でも、`enforce_guardrails_and_route` ノード内の決定論的チェックが以下の状態遷移に従って安全側（`REQUIRE_APPROVAL`）へ強制降格させます。
 
-```mermaid
-stateDiagram-v2
-    state "AUTO_REMEDIATE 提案  " as ProposedAuto
-    state "承認待機へ降格  " as DowngradedApproval
-    state "自動復旧を実行  " as ExecuteAuto
-    state "事後エラー率を検証  " as PostVerify
-    state "自動復旧完了  " as Resolved
-    state "要オンコール対応  " as EscalateOnCall
+![安全ガードレールによる承認待機への自動降格条件と事後エラー率検証フロー図](images/04-03-guardrail-downgrade-and-probe.png)
 
-    [*] --> ProposedAuto: LLM が AUTO_REMEDIATE を提案
-    ProposedAuto --> DowngradedApproval: 対象が許可<br/>Namespace 外
-    ProposedAuto --> DowngradedApproval: 類似度スコア<br/>0.85 未満
-    ProposedAuto --> DowngradedApproval: 1時間以内に<br/>既に復旧実施済み
-    ProposedAuto --> ExecuteAuto: 全安全条件を満たす
-    ExecuteAuto --> PostVerify: AppsV1 で Rollback / Restart
-    PostVerify --> Resolved: エラー率 < 1.0%<br/>(回復確認)
-    PostVerify --> EscalateOnCall: エラー率 >= 1.0%<br/>(未回復・連鎖停止)
-    Resolved --> [*]: 復旧完了を Slack 通知
-    EscalateOnCall --> [*]: 要対応通知 & 1回/h 制限で以降停止
-    DowngradedApproval --> [*]: Slack 承認ボタン待ちへ移行
+<details>
+<summary>詳細: Mermaid ソースを表示</summary>
+
+```mermaid
+flowchart LR
+    Start["LLM が AUTO_REMEDIATE を提案<br/>ROLLBACK_DEPLOYMENT / RESTART_DEPLOYMENT"]
+
+    Start -->|"対象が許可 Namespace 外"| Downgrade["REQUIRE_APPROVAL へ強制降格<br/>Slack 承認ボタン待ちへ移行"]
+    Start -->|"類似度スコア 0.85 未満"| Downgrade
+    Start -->|"1時間以内に自動復旧実施済み"| Downgrade
+    Start -->|"全 3 条件をクリア"| Exec["型付き Kubernetes AppsV1 API 実行<br/>Deployment Rollback / Restart"]
+
+    Exec --> Probe{"事後回復プローブ検証<br/>直近エラー率を再計測"}
+    Probe -->|"エラー率 < 1.0%"| Resolved["自動復旧完了<br/>Slack へ完了レポート通知"]
+    Probe -->|"エラー率 >= 1.0%"| Escalate["要オンコール対応通知<br/>1時間1回上限により無限再実行を防止"]
+
+    classDef prop fill:#fef7e0,stroke:#b06000,stroke-width:2px,color:#202124;
+    classDef act fill:#e8f0fe,stroke:#1967d2,stroke-width:2px,color:#202124;
+    classDef ok fill:#e6f4ea,stroke:#137333,stroke-width:2px,color:#202124;
+    classDef ng fill:#fce8e6,stroke:#c5221f,stroke-width:2px,color:#202124;
+    class Start,Downgrade prop;
+    class Exec,Probe act;
+    class Resolved ok;
+    class Escalate ng;
 ```
+
+</details>
 
 ### 事後検証でエラー率が 1.0% 未満に回復しなかった場合（フェイルセーフ）
 
@@ -116,31 +152,47 @@ stateDiagram-v2
 > **なぜローカルの `/tmp` SQLite ではなく Firestore を使うのか？**  
 > Cloud Run instance のローカルディスク（`/tmp` 等）およびプロセス内メモリはエフェメラルであり、コンテナ再起動・停止・リビジョン更新時に消滅します。承認ボタン押下待ちの間にインスタンスが再起動しても途中から安全に再開（Resume）できるよう、本番デプロイ時（`SESSION_BACKEND=firestore`）は Firestore へ永続化し、ローカル開発やクラウド未接続の `pytest` 実行時のみ `SESSION_BACKEND=sqlite` で完結できるハイブリッド構造にしています。
 
+![Slack Socket Mode と Cloud Firestore による一時停止・承認再開シーケンス図](images/04-04-slack-hitl-resume-sequence.png)
+
+<details>
+<summary>詳細: Mermaid ソースを表示</summary>
+
 ```mermaid
 sequenceDiagram
     autonumber
-    participant WF as ADK 2.x Workflow<br/>(Cloud Run instance 内)
-    participant DB as Firestore (ADK Session & Tickets)
-    participant Bolt as SlackHitlCoordinator<br/>(Outbound WebSocket)
-    participant Slack as Slack Cloud / オンコール担当者
-    participant GKE as 監視対象 GKE
+    participant WF as ADK 2.x Workflow<br/>Cloud Run instance 内
+    participant DB as Cloud Firestore<br/>Session & Tickets
+    participant Bolt as SlackHitlCoordinator<br/>Outbound WebSocket
+    participant Slack as Slack チャンネル<br/>オンコール担当者
+    participant GKE as 監視対象 GKE<br/>sre-demo-app
 
-    WF->>DB: approved_remediate_node 到達時に<br/>中断セッションを保存 (adk_request_input)
-    WF->>Bolt: WorkflowRunResult (paused_for_approval=True)
-    Bolt->>DB: 承認待ちチケット保存 (ticket_store.py)
-    Bolt->>Slack: Block Kit 調査レポート + [Approve] / [Reject] ボタン投稿
-    Note over WF,Slack: Cloud Run 側に公開受信ポートは一切不要。<br/>待機中に instance が再起動しても Firestore 上の状態は保持される。
+    rect rgb(232, 240, 254)
+        Note over WF,Slack: フェーズ 1: 自動一時停止と状態永続化 — 公開受信 URL なしで承認依頼を送信
+        WF->>DB: approved_remediate_node 到達時に中断セッション保存
+        WF-->>Bolt: WorkflowRunResult 返却 paused_for_approval=True
+        Bolt->>DB: 承認待ちチケット保存 sre_pending_approval_tickets
+        Bolt->>Slack: Block Kit 調査レポート + Approve / Reject ボタン投稿
+    end
 
-    Slack-->>Bolt: 担当者が [Approve] をクリック (WebSocket 配信)
-    Bolt->>Bolt: 押下者の Slack User ID が許可リスト内か検証
-    Bolt->>DB: トランザクションで承認チケット取得 (二重実行防止)
-    Bolt->>WF: resume_from_approval(confirmed=True, invocation_id=...)
-    WF->>DB: 中断箇所から ADK セッション復元
-    WF->>GKE: Rollback/Restart 時は型付き復旧+検証を実行<br/>(MANUAL_INTERVENTION 時は手動引継を記録)
-    WF-->>Bolt: RemediationOutcome 返却
-    Bolt->>DB: 完了済みチケット削除
-    Bolt->>Slack: 元メッセージを「✅ 承認・実行完了」へ更新
+    rect rgb(254, 247, 224)
+        Note over WF,Slack: 待機中も着信 HTTP ポート不要・instance 再起動時も Firestore 上の状態を維持
+    end
+
+    rect rgb(230, 244, 234)
+        Note over WF,GKE: フェーズ 2: WebSocket 承認イベント受信・二重実行防止・ADK セッション再開
+        Slack-->>Bolt: 担当者が Approve をクリックし WebSocket 経由で受信
+        Bolt->>Bolt: 押下者の Slack User ID が許可リスト内か検証
+        Bolt->>DB: Firestore トランザクションでチケット取得・ロック
+        Bolt->>WF: resume_from_approval confirmed=True, invocation_id=...
+        WF->>DB: 中断箇所から ADK セッション復元
+        WF->>GKE: 型付き復旧 + 事後検証を実行 / 手動引継時は記録のみ
+        WF-->>Bolt: RemediationOutcome 返却
+        Bolt->>DB: 完了済み承認チケット削除
+        Bolt->>Slack: 元メッセージを「承認・実行完了」表示へ更新
+    end
 ```
+
+</details>
 
 ---
 

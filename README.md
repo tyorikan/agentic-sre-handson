@@ -8,54 +8,61 @@ Cloud Monitoring や Cloud Logging のイベントストリームを 24 時間 3
 
 監視対象の GKE クラスタが障害に陥っても監視エージェント自体が共倒れしないよう、常駐 SRE エージェントは別基盤の **Cloud Run instances（＋ Cloud Run sandboxes）** 上で稼働させます（Out-of-Band 監視）。また、外部からの着信エンドポイントを完全に無効化（`--ingress internal --no-default-url`）したまま、外向き通信のみで Pub/Sub 購読と双方向 Slack 承認ボタンを実現します。
 
+![常駐自律型 SRE エージェント 全体アーキテクチャ構成図](docs/images/00-overall-architecture.png)
+
+<details>
+<summary>詳細: Mermaid ソースを表示</summary>
+
 ```mermaid
-flowchart TB
-    subgraph TargetGKE["監視対象環境: GKE クラスタ (sre-demo-app)"]
-        OrderApp["注文 API (order-service)<br/>v1 正常版 / v2 バグ版"]
+flowchart LR
+    subgraph S1["① 監視対象 GKE & イベント転送"]
+        direction TB
+        OrderApp["注文 API: order-service<br/>Namespace: sre-demo-app"]
+        LogSink["Cloud Logging シンク<br/>ERROR / CRITICAL のみ抽出"]
+        PubSub["Cloud Pub/Sub<br/>sre-alert-stream-sub"]
+        OrderApp -->|"構造化 JSON ログ"| LogSink --> PubSub
     end
 
-    subgraph StreamLayer["イベント駆動ストリーム層"]
-        CloudObs["Cloud Monitoring アラート<br/>& Cloud Logging シンク"]
-        PubSub["Cloud Pub/Sub<br/>(sre-alert-stream-sub)"]
-        CloudObs --> PubSub
+    subgraph S2["② 常駐エージェント基盤: Cloud Run instances / ingress: internal・URL 非公開"]
+        direction TB
+        Dedup["1. 重複排除・テレメトリ補完<br/>15分クールダウン + 直近90秒エラー率算出"]
+        Diag["2. 並列診断 JoinNode<br/>Cloud Run sandbox + BigQuery 照合"]
+        Decide["3. Gemini 3.8 Flash 相関推論<br/>公式リモート MCP 読取 + 構造化出力"]
+        Guard["4. 安全ガードレール<br/>許可NS・類似度0.85・1時間1回上限"]
+        Dedup --> Diag --> Decide --> Guard
     end
 
-    subgraph AgentInstance["常駐エージェント基盤: Cloud Run instances (--ingress internal --no-default-url)"]
-        Dedup["① 決定論的プリフィルタ<br/>Fingerprint 重複排除・15分クールダウン"]
-        Orch["② ADK 2.x Workflow<br/>(gemini-3.8-flash)"]
-        Sandbox["③ Cloud Run sandboxes<br/>(/usr/local/gcp/bin/sandbox do)<br/>外向き通信遮断・時系列減衰解析"]
-        Guard["④ 安全ガードレール<br/>許可 Namespace・類似度下限・1時間1回上限"]
-
-        Dedup -->|"新規事象のみ起動"| Orch
-        Orch <-->|"隔離 Python 実行"| Sandbox
-        Orch --> Guard
+    subgraph S3["③ 観測・知識・状態ストア"]
+        direction TB
+        BQ["BigQuery: sre_agent_ops<br/>過去障害100件 VECTOR & 監査表"]
+        MCP["Google Cloud 公式リモート MCP<br/>Monitoring / Logging / GKE 読取10種"]
+        FS["Cloud Firestore<br/>ADK 中断セッション・承認チケット"]
     end
 
-    subgraph KnowledgeAndTools["知識ベース・状態管理・観測ツール群"]
-        RemoteMCP["Google Cloud 公式リモート MCP<br/>Monitoring / Logging / GKE (Read-Only)"]
-        BQ["BigQuery (sre_agent_ops)<br/>・過去インシデント 100 件 (VECTOR_SEARCH)<br/>・gemini-embedding-2<br/>・追記型監査テーブル (incident_events)"]
-        FS["Cloud Firestore (Native)<br/>・ADK セッション中断状態<br/>・Slack 承認待ちチケット永続化"]
+    subgraph S4["④ 3分岐アクション & Slack Socket Mode"]
+        direction TB
+        R1["ルート A: 静観 OBSERVE<br/>一過性瞬断は再起動ゼロで報告"]
+        R2["ルート B: 自動復旧 AUTO_REMEDIATE<br/>AppsV1 Rollback + 回復検証 < 1.0%"]
+        R3["ルート C: 人間承認 REQUIRE_APPROVAL<br/>Socket Mode 外向き WSS 承認再開"]
     end
 
-    subgraph ActionsAndSlack["3分岐アクション & Slack Socket Mode"]
-        R1["🟢 ルート A: 静観 (OBSERVE)<br/>一過性エラーは再起動せず経過監視"]
-        R2["🛠️ ルート B: 自動復旧 (AUTO_REMEDIATE)<br/>型付き API で Rollback / Restart + 回復検証"]
-        R3["🟠 ルート C: 人間承認 (REQUIRE_APPROVAL)<br/>ADK 一時停止 → Approve 押下で再開"]
-        Slack["Slack (Socket Mode 外向き WSS)<br/>事後レポート & Approve / Reject ボタン"]
-    end
-
-    OrderApp --> CloudObs
-    PubSub -->|"外向き StreamingPull"| Dedup
-    Orch <-->|"tool_filter 厳選"| RemoteMCP
-    Orch <-->|"類似事例照合"| BQ
-    Orch <-->|"セッション・承認状態"| FS
-    Dedup <-->|"クールダウン確認・記録"| BQ
+    PubSub -->|"StreamingPull"| Dedup
+    Diag <-->|"VECTOR_SEARCH"| BQ
+    Decide <-->|"Read-Only 照会"| MCP
     Guard --> R1 & R2 & R3
-    R2 -->|"AppsV1 API 最小権限"| OrderApp
-    R3 <-->|"Outbound WebSocket"| Slack
-    R3 -->|"承認時のみ実行"| OrderApp
-    R1 & R2 --> Slack
+    R3 <-->|"状態永続化"| FS
+
+    classDef surface fill:#ffffff,stroke:#4285F4,stroke-width:1.5px,color:#202124;
+    classDef routeA fill:#e6f4ea,stroke:#137333,stroke-width:2px,color:#202124;
+    classDef routeB fill:#e8f0fe,stroke:#1967d2,stroke-width:2px,color:#202124;
+    classDef routeC fill:#fef7e0,stroke:#b06000,stroke-width:2px,color:#202124;
+    class OrderApp,LogSink,PubSub,Dedup,Diag,Decide,Guard,MCP,BQ,FS surface;
+    class R1 routeA;
+    class R2 routeB;
+    class R3 routeC;
 ```
+
+</details>
 
 ### おもちゃのデモと本リポジトリの設計の違い
 

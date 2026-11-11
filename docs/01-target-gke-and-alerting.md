@@ -9,57 +9,81 @@
 
 色が付いている **GKE クラスタ（監視対象）** と **イベント駆動ストリーム層（Log Sink → Pub/Sub）** を構築します。
 
+![第 1 章で構築する監視対象 GKE・最小権限 RBAC・イベント駆動ストリームの範囲図](images/01-01-chapter1-scope.png)
+
+<details>
+<summary>詳細: Mermaid ソースを表示</summary>
+
 ```mermaid
 flowchart LR
-    subgraph Now1["🔵 本章で構築 (1): 監視対象 GKE"]
-        App["注文 API (order-service)<br/>Namespace: sre-demo-app"]
-        RBAC["Role / RoleBinding<br/>sre-demo-app 内の Deployment<br/>更新・参照のみ許可"]
+    subgraph Now1["本章で構築 1: 監視対象 GKE クラスタ"]
+        direction TB
+        App["注文 API: order-service<br/>Namespace: sre-demo-app"]
+        RBAC["Role / RoleBinding<br/>sre-demo-app 内の Deployment 更新・参照のみ許可"]
     end
 
-    subgraph Now2["🔵 本章で構築 (2): イベント駆動ストリーム"]
-        Sink["Cloud Logging Sink<br/>ERROR / CRITICAL 抽出"]
-        Topic["Pub/Sub Topic & Sub<br/>(sre-alert-stream-sub)"]
-        Sink --> Topic
+    subgraph Now2["本章で構築 2: イベント駆動ストリーム"]
+        direction TB
+        Sink["Cloud Logging Sink<br/>severity >= ERROR のみ抽出"]
+        Topic["Cloud Pub/Sub<br/>sre-alert-stream-sub"]
+        Sink -->|"条件一致時のみ"| Topic
     end
 
-    subgraph Later["⚪ 第 2〜5 章で構築"]
+    subgraph Later["第 2〜5 章で構築・接続"]
+        direction TB
         Agent["Cloud Run instance<br/>常駐 SRE エージェント"]
         BQ["BigQuery 100件知識ベース"]
+        Agent <-.->|"類似検索"| BQ
     end
 
     App -->|"構造化 JSON ログ"| Sink
     Topic -.->|"StreamingPull"| Agent
-    Agent -.->|"復旧 API 呼び出し"| RBAC
+    RBAC <-.->|"型付き復旧 API"| Agent
 
-    style Now1 fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px
-    style Now2 fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px
-    style Later fill:#f8f9fa,stroke:#dadce0,stroke-dasharray: 5 5
+    classDef active fill:#ffffff,stroke:#1a73e8,stroke-width:2px,color:#202124;
+    classDef future fill:#f8f9fa,stroke:#9aa0a6,stroke-width:1.5px,color:#202124;
+    class App,RBAC,Sink,Topic active;
+    class Agent,BQ future;
 ```
+
+</details>
 
 ### なぜ「毎分ログ検索ポーリング」ではなく「Log Sink → Pub/Sub」にするのか？
 
 常駐エージェントが `while True:` ループで毎分 Cloud Logging API を全件検索する設計にすると、平時でも API 呼び出しとトークン費用が発生し続け、障害発生から検知までのタイムラグも生じます。  
 代わりに **Cloud Logging のログルーター（Sink）** を使えば、GKE から出力されるログのうち `severity >= ERROR` の異常ログだけを Google Cloud 基盤側でリアルタイムにフィルタリングし、ミリ秒〜数秒で **Cloud Pub/Sub** へ転送できます。平時の LLM 推論コストは完全にゼロになります。
 
+![平常時ログ除外と異常発生時のみの Pub/Sub イベント発火シーケンス図](images/01-02-log-routing-sequence.png)
+
+<details>
+<summary>詳細: Mermaid ソースを表示</summary>
+
 ```mermaid
 sequenceDiagram
     autonumber
     participant Client as クライアント / 負荷スクリプト
-    participant Pod as GKE Pod (order-service)
+    participant Pod as GKE Pod: order-service
     participant Router as Cloud Logging Router
-    participant PS as Pub/Sub (sre-alert-stream)
-    participant Agent as SRE Agent (第5章で接続)
+    participant PS as Pub/Sub: sre-alert-stream
+    participant Agent as SRE Agent: 第5章で接続
 
-    Client->>Pod: POST /orders
-    Note over Pod: 正常時は INFO ログのみ出力
-    Pod->>Router: stdout 構造化 JSON (severity=INFO)
-    Note over Router: フィルタ不一致のため破棄 (課金・通知なし)
+    rect rgb(230, 244, 234)
+        Note over Client,Router: 平常運用フェーズ — 正常ログは Router で除外され Pub/Sub・LLM 課金ゼロ
+        Client->>Pod: POST /orders 正常注文リクエスト
+        Pod->>Router: stdout 構造化 JSON 出力 severity=INFO
+        Note over Router: シンク条件 severity>=ERROR 不一致のため配信せず終了
+    end
 
-    Client->>Pod: POST /orders (障害発生時)
-    Pod->>Router: stdout 構造化 JSON (severity=ERROR, error_code=...)
-    Router->>PS: 条件一致ログのみ即時 Publish
-    PS-->>Agent: StreamingPull でイベント受信・調査開始
+    rect rgb(252, 232, 230)
+        Note over Client,Agent: 異常発生フェーズ — ERROR / CRITICAL 発生時のみイベント発火
+        Client->>Pod: POST /orders 障害発生時リクエスト
+        Pod->>Router: stdout 構造化 JSON 出力 severity=ERROR, error_code=...
+        Router->>PS: 条件一致ログのみ即時 Publish
+        PS-->>Agent: StreamingPull でイベント受信・自律調査を起動
+    end
 ```
+
+</details>
 
 ---
 

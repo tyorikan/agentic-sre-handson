@@ -9,31 +9,42 @@
 
 色が付いている **BigQuery 知識ベース・状態管理基盤（`sre_agent_ops`）** を構築します。VPC コネクタや常時課金の DB インスタンスを立てることなく、IAM 認証と標準 SQL だけで類似インシデント検索とクールダウン監査を実現します。
 
+![第 2 章で構築する BigQuery ベクトル知識ベースと監査テーブル構成図](images/02-01-chapter2-scope.png)
+
+<details>
+<summary>詳細: Mermaid ソースを表示</summary>
+
 ```mermaid
 flowchart LR
-    subgraph Prev["✅ 第 1 章で構築済み"]
-        GKE["監視対象 GKE<br/>(order-service)"] --> PS["Pub/Sub<br/>(sre-alert-stream-sub)"]
+    subgraph Prev["第 1 章で構築済み"]
+        direction TB
+        GKE["監視対象 GKE<br/>order-service"] -->|"ERROR ログ"| PS["Cloud Pub/Sub<br/>sre-alert-stream-sub"]
     end
 
-    subgraph Now["🔵 本章で構築: BigQuery (sre_agent_ops)"]
-        Raw["incident_runbooks_raw<br/>(100件 JSONL 原本)"]
-        Model["embedding_model<br/>(gemini-embedding-2)"]
-        VecTable["incident_runbooks<br/>(ARRAY&lt;FLOAT64&gt; ベクトル表)"]
-        EventTable["incident_events<br/>(クールダウン・監査追記表)"]
-        Raw -->|"ML.GENERATE_EMBEDDING"| Model --> VecTable
+    subgraph Now["本章で構築: BigQuery データセット sre_agent_ops"]
+        direction TB
+        Raw["incident_runbooks_raw<br/>過去障害 100件 JSONL 原本"] -->|"ML.GENERATE_EMBEDDING"| Model["embedding_model<br/>gemini-embedding-2"]
+        Model --> VecTable["incident_runbooks<br/>ARRAY FLOAT64 ベクトル表"]
+        EventTable["incident_events<br/>クールダウン・監査追記テーブル"]
     end
 
-    subgraph Next["⚪ 第 3〜5 章で構築"]
-        Agent["常駐 SRE エージェント"]
+    subgraph Next["第 3〜5 章で接続"]
+        Agent["常駐 SRE エージェント<br/>Cloud Run instance"]
     end
 
-    Agent -.->|"VECTOR_SEARCH (COSINE)"| VecTable
-    Agent -.->|"クールダウン照会・記録"| EventTable
+    PS -.->|"StreamingPull"| Agent
+    VecTable <-.->|"VECTOR_SEARCH COSINE"| Agent
+    EventTable <-.->|"クールダウン照会・記録"| Agent
 
-    style Prev fill:#e6f4ea,stroke:#137333
-    style Now fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px
-    style Next fill:#f8f9fa,stroke:#dadce0,stroke-dasharray: 5 5
+    classDef done fill:#e6f4ea,stroke:#137333,stroke-width:2px,color:#202124;
+    classDef current fill:#ffffff,stroke:#1a73e8,stroke-width:2px,color:#202124;
+    classDef future fill:#f8f9fa,stroke:#9aa0a6,stroke-width:1.5px,color:#202124;
+    class GKE,PS done;
+    class Raw,Model,VecTable,EventTable current;
+    class Agent future;
 ```
+
+</details>
 
 ---
 
@@ -47,26 +58,42 @@ flowchart LR
 
 本リポジトリの [seed_runbooks_100.jsonl](../bigquery/seed_runbooks_100.jsonl) には、以下 10 カテゴリ・計 100 件の本番インシデント履歴が収録されています。
 
+![過去インシデント知識ベース全 100 件の 3 領域・10 カテゴリ体系図](images/02-02-runbooks-taxonomy.png)
+
+<details>
+<summary>詳細: Mermaid ソースを表示</summary>
+
 ```mermaid
 flowchart LR
-    Root["過去インシデント知識ベース<br/>(全 100 件)"]
-    Root --> L1["アプリ・設定・認証系 (29件)"]
-    Root --> L2["通信・非同期・流量系 (40件)"]
-    Root --> L3["DB・リソース・基盤系 (31件)"]
+    Root["過去インシデント知識ベース<br/>全 100 件"]
+    Root --> L1["アプリ・設定・認証領域: 29件"]
+    Root --> L2["通信・非同期・流量領域: 40件"]
+    Root --> L3["DB・リソース・基盤領域: 31件"]
 
-    L1 --> C1["1. GKE デプロイ・設定バグ (12件)"]
-    L1 --> C7["7. 認証・IAM・証明書・Secret (9件)"]
-    L1 --> C10["10. アプリ論理・データ境界バグ (8件)"]
+    L1 --> C1["1. GKE デプロイ・設定バグ: 12件"]
+    L1 --> C7["7. 認証・IAM・証明書・Secret: 9件"]
+    L1 --> C10["10. アプリ論理・データ境界バグ: 8件"]
 
-    L2 --> C2["2. 外部 API・通信一過性瞬断 (12件)"]
-    L2 --> C5["5. キャッシュ層 Redis 障害 (10件)"]
-    L2 --> C6["6. Pub/Sub・非同期滞留 (10件)"]
-    L2 --> C9["9. トラフィック急増・クォータ (8件)"]
+    L2 --> C2["2. 外部 API・通信一過性瞬断: 12件"]
+    L2 --> C5["5. キャッシュ層 Redis 障害: 10件"]
+    L2 --> C6["6. Pub/Sub・非同期処理滞留: 10件"]
+    L2 --> C9["9. トラフィック急増・クォータ到達: 8件"]
 
-    L3 --> C3["3. DB 接続枯渇・ロック競合 (12件)"]
-    L3 --> C4["4. メモリリーク・FD/PID 枯渇 (10件)"]
-    L3 --> C8["8. GKE ノード・オートスケール (9件)"]
+    L3 --> C3["3. DB 接続枯渇・ロック競合: 12件"]
+    L3 --> C4["4. メモリリーク・FD/PID 枯渇: 10件"]
+    L3 --> C8["8. GKE ノード・オートスケール: 9件"]
+
+    classDef root fill:#e8f0fe,stroke:#1967d2,stroke-width:2px,color:#202124;
+    classDef g1 fill:#f3e8fd,stroke:#A142F4,stroke-width:1.5px,color:#202124;
+    classDef g2 fill:#e6f4ea,stroke:#137333,stroke-width:1.5px,color:#202124;
+    classDef g3 fill:#fef7e0,stroke:#b06000,stroke-width:1.5px,color:#202124;
+    class Root root;
+    class L1,C1,C7,C10 g1;
+    class L2,C2,C5,C6,C9 g2;
+    class L3,C3,C4,C8 g3;
 ```
+
+</details>
 
 各レコードには文章だけでなく、決定論的な制御に使える構造化カラム（`recommended_action`、`remediation_type`、`anti_patterns`［やってはいけない誤対応］、`verification_check`［回復判定条件］）を持たせています。
 

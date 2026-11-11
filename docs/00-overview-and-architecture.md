@@ -9,19 +9,39 @@
 
 本番システムの運用では、「すべてのアラートで Pod を再起動すればよい」わけではありません。誤った自動操作は障害をかえって拡大させます。本ハンズオンでは、以下の判断フローをゼロから構築します。
 
+![アラート検知から 3 分岐・Slack 承認再開までの意思決定フロー図](images/00-01-triage-routing-flow.png)
+
+<details>
+<summary>詳細: Mermaid ソースを表示</summary>
+
 ```mermaid
 flowchart LR
-    Alert["🚨 アラート・異常ログ検知<br/>(Pub/Sub ストリーム)"] --> Dedup{"クールダウン中か?<br/>(直近15分以内)"}
-    Dedup -->|"はい"| Skip["⏭️ 重複排除スキップ<br/>(LLM 呼び出しゼロ)"]
-    Dedup -->|"いいえ"| Parallel["🔍 並列診断 (ADK JoinNode)<br/>1. 公式リモート MCP 読取<br/>2. 隔離 sandbox 減衰傾き計算<br/>3. BigQuery 過去障害100件照合"]
-    Parallel --> Guard{"🛡️ 安全ガードレール検証<br/>Namespace・類似度・回数上限"}
+    Alert["アラート・異常ログ検知<br/>Pub/Sub ストリーム受信"] --> Dedup{"クールダウン判定<br/>直近15分以内か?"}
+    Dedup -->|"はい"| Skip["重複排除スキップ<br/>LLM 呼び出し 0 回"]
+    Dedup -->|"いいえ"| Parallel["テレメトリ補完 & 並列診断<br/>1. ログ時系列エラー率・デプロイ履歴補完<br/>2. 隔離 sandbox 減衰傾き計算<br/>3. BigQuery 過去障害100件照合 + 公式 MCP"]
+    Parallel --> Guard{"安全ガードレール検証<br/>許可NS・類似度・回数上限"}
 
-    Guard -->|"一過性エラー<br/>(自然減衰中)"| S1["🟢 シナリオ 1: 静観<br/>操作せず Slack へ根拠通知"]
-    Guard -->|"既知バグ (類似度≧0.85)<br/>かつ 1時間以内初回"| S2["🛠️ シナリオ 2: 自動復旧<br/>Deployment ロールバック実行<br/>＋ エラー率回復を事後確認"]
-    Guard -->|"未知の DB 障害 / 低確信度<br/>または回数上限到達"| S3["🟠 シナリオ 3: 人間承認待ち<br/>ADK を一時停止し Slack に<br/>Approve / Reject ボタン送信"]
-    S3 -->|"Approve 押下"| Resume["▶️ ADK 再開・処置実行"]
-    S3 -->|"Reject 押下"| Manual["👩‍💻 手動調査へ引き継ぎ"]
+    Guard -->|"一過性エラー・自然減衰中"| S1["シナリオ 1: 静観 OBSERVE<br/>操作せず Slack へ根拠通知"]
+    Guard -->|"既知バグ 類似度>=0.85<br/>かつ 1時間以内初回"| S2["シナリオ 2: 自動復旧 AUTO_REMEDIATE<br/>Deployment ロールバック実行<br/>+ エラー率 < 1.0% 回復確認"]
+    Guard -->|"未知の DB 障害 / 低確信度<br/>または回数上限到達"| S3["シナリオ 3: 人間承認待ち REQUIRE_APPROVAL<br/>Firestore 保存・ADK 一時停止<br/>Slack Approve / Reject ボタン送信"]
+    S3 -->|"Approve 押下"| Resume["ADK 再開・処置実行"]
+    S3 -->|"Reject 押下"| Manual["手動調査へ引き継ぎ"]
+
+    classDef base fill:#ffffff,stroke:#4285F4,stroke-width:1.5px,color:#202124;
+    classDef mute fill:#f8f9fa,stroke:#9aa0a6,stroke-width:1.5px,color:#202124;
+    classDef ok fill:#e6f4ea,stroke:#137333,stroke-width:2px,color:#202124;
+    classDef auto fill:#e8f0fe,stroke:#1967d2,stroke-width:2px,color:#202124;
+    classDef hitl fill:#fef7e0,stroke:#b06000,stroke-width:2px,color:#202124;
+    classDef warn fill:#fce8e6,stroke:#c5221f,stroke-width:2px,color:#202124;
+    class Alert,Dedup,Parallel,Guard base;
+    class Skip mute;
+    class S1,Resume ok;
+    class S2 auto;
+    class S3 hitl;
+    class Manual warn;
 ```
+
+</details>
 
 ### なぜこの設計が本番で機能するのか／何ができない・不向きなのか
 
@@ -38,14 +58,23 @@ flowchart LR
 
 ## 2. 事前準備ステップ（Cloud Shell または手元端末）
 
+![第 0 章の環境変数・API 有効化・最小権限 IAM 準備ステップ](images/00-02-iam-setup-steps.png)
+
+<details>
+<summary>詳細: Mermaid ソースを表示</summary>
+
 ```mermaid
 flowchart LR
-    Step1["1. 環境変数 (.env) 設定"] --> Step2["2. Google Cloud API 有効化"]
-    Step2 --> Step3["3. エージェント専用 SA と<br/>最小権限 IAM 作成"]
-    style Step1 fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px
-    style Step2 fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px
-    style Step3 fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px
+    Step1["Step 1: 環境変数 .env 設定<br/>PROJECT_ID / REGION=asia-northeast1"] --> Step2["Step 2: Google Cloud API 有効化<br/>GKE / Cloud Run / BigQuery / Firestore / MCP"]
+    Step2 --> Step3["Step 3: エージェント専用 SA 作成<br/>観測読取ロールと最小変更権限を分離"]
+
+    classDef stepBlue fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px,color:#202124;
+    classDef stepGreen fill:#e6f4ea,stroke:#137333,stroke-width:2px,color:#202124;
+    class Step1,Step2 stepBlue;
+    class Step3 stepGreen;
 ```
+
+</details>
 
 ### Step 2.0 実施者（作業ユーザー）に必要な Google Cloud IAM ロールの確認
 

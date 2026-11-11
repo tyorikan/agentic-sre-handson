@@ -9,23 +9,38 @@
 
 ついにすべての部品を結合し、**Cloud Run instances 上の完全閉域・常駐エージェント** を本稼働させます。
 
-```mermaid
-flowchart TB
-    Internet["🌐 外部インターネット<br/>攻撃者 / 未認証アクセス"] -.->|"❌ 完全遮断<br/>ingress: internal<br/>default-url-disabled"| Instance
+![Cloud Run instance の着信遮断と外向き TLS/WSS のみによる閉域通信構成図](images/05-01-closed-network-topology.png)
 
-    subgraph Instance["🔵 本章でデプロイ: Cloud Run instance (asia-northeast1)"]
-        direction LR
-        SubSB["Cloud Run sandbox<br/>(sandboxLauncher: true)"] <--> Daemon["agent_app.main (常駐プロセス)<br/>restartPolicy: always"]
+<details>
+<summary>詳細: Mermaid ソースを表示</summary>
+
+```mermaid
+flowchart LR
+    Internet["外部インターネット<br/>未認証アクセス / Webhook 偽装攻撃"] -.->|"完全遮断: ingress=internal & default-url-disabled"| Daemon
+
+    subgraph Instance["本章でデプロイ: Cloud Run instance / asia-northeast1"]
+        direction TB
+        Daemon["agent_app.main 常駐プロセス<br/>restartPolicy: always"] <--> SubSB["Cloud Run sandbox<br/>sandboxLauncher: true"]
     end
 
-    Daemon -->|"① 外向き TLS: StreamingPull"| PS["Cloud Pub/Sub<br/>(sre-alert-stream-sub)"]
-    Daemon -->|"② 外向き TLS: MCP・KB・LLM"| GCP["Monitoring / Logging / GKE MCP<br/>BigQuery / Firestore<br/>Gemini 3.8 Flash"]
-    Daemon -->|"③ 外向き TLS: AppsV1 Patch"| GKE["監視対象 GKE<br/>(sre-demo-app/order-service)"]
-    Daemon <-->|"④ 外向き WSS: Socket Mode"| Slack["Slack ワークスペース"]
+    subgraph Outbound["すべて外向き TLS / WSS 通信のみで接続"]
+        direction TB
+        PS["1. Cloud Pub/Sub<br/>StreamingPull"]
+        GCP["2. 公式 MCP / BigQuery / Firestore<br/>Gemini 3.8 Flash"]
+        GKE["3. 監視対象 GKE<br/>sre-demo-app/order-service"]
+        Slack["4. Slack ワークスペース<br/>Socket Mode 外向き WSS"]
+    end
 
-    style Instance fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px
-    style Internet fill:#fce8e6,stroke:#c5221f
+    Daemon --> PS & GCP & GKE
+    Daemon <--> Slack
+
+    classDef block fill:#fce8e6,stroke:#c5221f,stroke-width:2px,color:#202124;
+    classDef core fill:#ffffff,stroke:#1a73e8,stroke-width:2px,color:#202124;
+    class Internet block;
+    class SubSB,Daemon,PS,GCP,GKE,Slack core;
 ```
+
+</details>
 
 ### なぜ Cloud Run Services ではなく Cloud Run instances なのか？
 
@@ -121,20 +136,41 @@ gcloud logging read \
 
 事前ベースラインリクエストの後、15 秒間だけ下流決済ゲートウェイの TLS 瞬断（`UPSTREAM_CONN_RESET_503`）を発生させ、自然回復を確認するシナリオを注入します。
 
+![シナリオ 1: 一過性ネットワーク瞬断に対する静観判定シーケンス図](images/05-02-drill1-observe-sequence.png)
+
+<details>
+<summary>詳細: Mermaid ソースを表示</summary>
+
 ```mermaid
 sequenceDiagram
+    autonumber
     participant Script as inject_transient_net_err.sh
-    participant GKE as order-service (v1.0.0)
-    participant Agent as SRE Agent (Cloud Run instance)
-    participant BQ as BigQuery (100件知識ベース)
-    participant Slack as Slack
+    participant GKE as GKE: order-service v1.0.0
+    participant Agent as SRE Agent: Cloud Run instance
+    participant BQ as BigQuery: 100件知識ベース
+    participant Slack as Slack チャンネル
 
-    Script->>GKE: 正常送信後 15秒間の一過性 503 設定 + 回復リクエスト送信
-    GKE->>Agent: Logging Sink -> Pub/Sub 経由で異常通知
-    Agent->>BQ: VECTOR_SEARCH -> INC-013 (外部決済 TLS 瞬断) が一致
-    Note over Agent: 30秒観測 + 隔離 sandbox 解析 + 直近デプロイなしを確認<br/>「再起動すると再接続嵐になるため静観」と判定
-    Agent->>Slack: 🟢 静観レポート通知 (GKE ロールバック・再起動 0 回)
+    rect rgb(252, 232, 230)
+        Note over Script,GKE: 1. 一過性ゲートウェイ TLS 瞬断の発生と自然回復トラフィック送信
+        Script->>GKE: 正常8件送信 → 15秒間 503 注入・12件送信 → 回復後16件正常送信
+        GKE->>Agent: Logging シンク → Pub/Sub 経由で TRANSIENT_NET_ERR 通知
+    end
+
+    rect rgb(232, 240, 254)
+        Note over Agent,BQ: 2. 30秒安定化観測・隔離 sandbox 減衰解析・過去事例照合
+        Agent->>Agent: INITIAL_STABILIZATION_SECONDS=30 待機後に直近90秒ログ時系列を取得
+        Agent->>Agent: sandbox do で減衰傾き負 is_naturally_decaying=True・直近デプロイ無しを確認
+        Agent->>BQ: VECTOR_SEARCH により INC-013 外部決済 TLS 瞬断が上位一致
+    end
+
+    rect rgb(230, 244, 234)
+        Note over Agent,Slack: 3. 不要な Pod 再起動による再接続ストームを防ぎ静観を選択
+        Agent->>BQ: incident_events に OBSERVE 判断を監査記録
+        Agent->>Slack: 静観レポート通知 — GKE ロールバック・再起動 0 回
+    end
 ```
+
+</details>
 
 ```bash
 ./target-app/scripts/inject_transient_net_err.sh
@@ -150,22 +186,43 @@ sequenceDiagram
 
 必須環境変数 `PAYMENT_CURRENCY_PRECISION` が漏れた `v2.0.0-buggy` を GKE にロールアウトし、HTTP 500（`CONFIG_KEY_ERROR_500`）を発生させます。
 
+![シナリオ 2: バグ版デプロイに対する自動ロールバックと事後回復確認シーケンス図](images/05-03-drill2-auto-rollback-sequence.png)
+
+<details>
+<summary>詳細: Mermaid ソースを表示</summary>
+
 ```mermaid
 sequenceDiagram
+    autonumber
     participant Script as inject_buggy_release.sh
-    participant GKE as order-service (v2.0.0-buggy)
-    participant Agent as SRE Agent (Cloud Run instance)
-    participant BQ as BigQuery (100件知識ベース)
-    participant Slack as Slack
+    participant GKE as GKE: order-service v2.0.0-buggy
+    participant Agent as SRE Agent: Cloud Run instance
+    participant BQ as BigQuery: 100件知識ベース
+    participant Slack as Slack チャンネル
 
-    Script->>GKE: v2.0.0-buggy デプロイ + 注文リクエスト送信 (500 急増)
-    GKE->>Agent: Pub/Sub 経由で CONFIG_KEY_ERROR_500 通知
-    Agent->>BQ: VECTOR_SEARCH -> INC-001 (必須環境変数欠落) 高類似度一致
-    Agent->>Agent: ガードレール検査 PASS (sre-demo-app 内・1時間以内初回)
-    Agent->>GKE: AppsV1 API で直前の正常 v1.0.0 へ自動ロールバック
-    Agent->>GKE: 事後エラー率 < 1.0% への回復を確認
-    Agent->>Slack: 🛠️ 自動復旧完了レポート通知
+    rect rgb(252, 232, 230)
+        Note over Script,Agent: 1. 必須環境変数欠落バグ版のデプロイと 500 エラー継続発生
+        Script->>GKE: v2.0.0-buggy デプロイ + 注文トラフィック25件送信
+        GKE->>Agent: Pub/Sub 経由で CONFIG_KEY_ERROR_500 通知
+    end
+
+    rect rgb(232, 240, 254)
+        Note over Agent,BQ: 2. 直近デプロイ検知・知識ベース高類似度一致・安全ガード検証
+        Agent->>Agent: 直近30分以内の新規 ReplicaSet ロールアウトと高止まりエラー率を確認
+        Agent->>BQ: VECTOR_SEARCH により INC-001 必須環境変数欠落が類似度 >= 0.85 で一致
+        Agent->>Agent: ガードレール PASS — sre-demo-app 内・類似度 >= 0.85・1時間以内初回
+    end
+
+    rect rgb(230, 244, 234)
+        Note over GKE,Slack: 3. 型付き API 自動ロールバックと事後回復プローブ検証
+        Agent->>GKE: AppsV1 API で直前の正常リビジョン v1.0.0 へ自動ロールバック
+        Agent->>GKE: 事後回復プローブでエラー率 < 1.0% への回復を確認
+        Agent->>BQ: incident_events に AUTO_REMEDIATE 完了を監査記録
+        Agent->>Slack: 自動復旧完了レポート通知
+    end
 ```
+
+</details>
 
 ```bash
 export TARGET_APP_IMAGE_URI="${GOOGLE_CLOUD_REGION}-docker.pkg.dev/${GOOGLE_CLOUD_PROJECT}/sre-handson/order-service"
@@ -187,20 +244,41 @@ bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGIO
 
 DB コネクションスロット枯渇と行ロック待ち（`DB_CONN_SLOTS_EXHAUSTED_500`）を注入します。アプリを勝手に再起動すると DB がダウンする危険な事象です。
 
+![シナリオ 3: 高リスク DB 枯渇障害における自動一時停止と Slack 人間承認再開シーケンス図](images/05-04-drill3-approval-sequence.png)
+
+<details>
+<summary>詳細: Mermaid ソースを表示</summary>
+
 ```mermaid
 sequenceDiagram
+    autonumber
     participant Script as inject_unknown_db_stall.sh
-    participant GKE as order-service
-    participant Agent as SRE Agent (ADK 2.x Workflow)
-    participant Slack as Slack (オンコール担当者)
+    participant GKE as GKE: order-service
+    participant Agent as SRE Agent: ADK 2.x Workflow
+    participant FS as Firestore & BigQuery
+    participant Slack as Slack: オンコール担当者
 
-    Script->>GKE: DB_POOL_EXHAUSTED 注入 + CRITICAL ログ発火
-    GKE->>Agent: Pub/Sub 経由で通知
-    Note over Agent: INC-025 (DB 接続枯渇・ロック待ち) と照合<br/>REQUIRE_APPROVAL ルートへ進み<br/>approved_remediate_node で自動一時停止
-    Agent->>Slack: 🟠 調査レポート + [Approve & Execute] / [Reject] ボタン送信
-    Slack-->>Agent: 担当者が内容を確認してボタンクリック (Socket Mode)
-    Agent->>Slack: 承認結果を反映してメッセージ更新 & BigQuery 監査記録
+    rect rgb(252, 232, 230)
+        Note over Script,Agent: 1. 高リスクな DB コネクション枯渇・ロック競合の発生
+        Script->>GKE: DB_POOL_EXHAUSTED 注入 + CRITICAL ログ発火
+        GKE->>Agent: Pub/Sub 経由で DB_CONN_SLOTS_EXHAUSTED_500 通知
+    end
+
+    rect rgb(254, 247, 224)
+        Note over Agent,Slack: 2. 独断での Pod 再起動を抑止し ADK ワークフローを一時停止
+        Agent->>FS: INC-025 DB接続枯渇と照合 → REQUIRE_APPROVAL で中断セッション・チケット保存
+        Agent->>Slack: 調査レポート + Approve & Execute / Reject ボタン送信
+    end
+
+    rect rgb(230, 244, 234)
+        Note over Agent,Slack: 3. Socket Mode 外向き WSS で承認を受信し再開・監査記録
+        Slack-->>Agent: オンコール担当者が内容確認後にボタンクリック
+        Agent->>FS: 承認者 ID 検証・トランザクション取得・ADK セッション復元・BigQuery 監査記録
+        Agent->>Slack: 元メッセージを承認結果で更新し完了報告
+    end
 ```
+
+</details>
 
 ```bash
 ./target-app/scripts/inject_unknown_db_stall.sh
