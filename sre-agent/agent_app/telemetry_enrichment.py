@@ -75,16 +75,28 @@ class CloudTelemetryEnricher:
         self._settings = settings
         self._deployment_checker = deployment_checker
 
-    def _fetch_recent_log_entries(self, namespace: str, lookback_seconds: int = 90) -> list[tuple[datetime, str]]:
+    def _fetch_recent_log_entries(
+        self,
+        namespace: str,
+        service_name: str,
+        lookback_seconds: int = 90,
+    ) -> list[tuple[datetime, str]]:
         client = logging_v2.Client(project=self._settings.project_id)
         since = (datetime.now(timezone.utc) - timedelta(seconds=lookback_seconds)).isoformat()
         log_filter = (
             'resource.type="k8s_container" '
             f'AND resource.labels.namespace_name="{namespace}" '
+            f'AND resource.labels.container_name="{service_name}" '
+            'AND NOT textPayload=~"^INFO:" '
             f'AND timestamp>="{since}"'
         )
         items: list[tuple[datetime, str]] = []
-        for entry in client.list_entries(filter_=log_filter, order_by=logging_v2.ASCENDING, page_size=200):
+        for entry in client.list_entries(
+            filter_=log_filter,
+            order_by=logging_v2.ASCENDING,
+            page_size=200,
+            max_results=300,
+        ):
             if entry.timestamp is not None:
                 items.append((entry.timestamp, str(entry.severity or "INFO").upper()))
         return items
@@ -96,7 +108,12 @@ class CloudTelemetryEnricher:
         if not alert.error_rate_series:
             if self._settings.stabilization_wait_seconds > 0:
                 await asyncio.sleep(self._settings.stabilization_wait_seconds)
-            entries = await asyncio.to_thread(self._fetch_recent_log_entries, alert.namespace, 90)
+            entries = await asyncio.to_thread(
+                self._fetch_recent_log_entries,
+                alert.namespace,
+                alert.service_name,
+                90,
+            )
             series = compute_error_rate_series_from_logs(
                 entries,
                 window_end=datetime.now(timezone.utc),

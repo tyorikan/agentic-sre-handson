@@ -211,3 +211,26 @@ def test_atomic_claim_and_log_binning_decay_detection() -> None:
     stats = SandboxRunner(settings).analyze_error_series(series)
     assert stats.is_naturally_decaying is True
     assert stats.linear_slope < -0.02
+
+
+def test_remediation_failure_returns_failed_outcome() -> None:
+    """復旧実行器が例外を送出した場合でも未捕捉クラッシュせず FAILED ステータスで返ること。"""
+    from agent_app.remediation_tools import SafeRemediationService
+
+    class FailingExecutor:
+        def rollback_deployment(self, namespace: str, deployment_name: str) -> str:
+            raise RuntimeError(f"Deployment {namespace}/{deployment_name} に前リビジョンがありません")
+
+        def restart_deployment(self, namespace: str, deployment_name: str) -> str:
+            return "ok"
+
+    svc = SafeRemediationService(AgentSettings(allowed_namespaces=("sre-demo-app",)), FailingExecutor())
+    outcome = svc.execute_and_verify(
+        namespace="sre-demo-app",
+        deployment_name="order-service",
+        remediation_type="ROLLBACK_DEPLOYMENT",
+    )
+    assert outcome.executed is False
+    assert outcome.action_status == "FAILED"
+    assert outcome.verification_passed is False
+    assert "前リビジョンがありません" in outcome.detail_message

@@ -134,7 +134,7 @@ bq query \
 ```
 
 > [!TIP]
-> プロジェクトの組織ポリシーによって `CONNECTION DEFAULT` の自動権限付与が制限されている場合は、[bigquery/02_remote_model.sql](../bigquery/02_remote_model.sql) 末尾のコメントに記載された 3 行のコマンドで明示的な Cloud Resource Connection を作成してください。
+> プロジェクトの組織ポリシーによって `CONNECTION DEFAULT` の自動権限付与が制限されている場合、または実行ユーザー自身に IAM 管理権限（`roles/bigquery.admin` および `roles/resourcemanager.projectIamAdmin`）がない場合は、[bigquery/02_remote_model.sql](../bigquery/02_remote_model.sql) 末尾のコメントに記載された 3 行のコマンドで明示的な Cloud Resource Connection を作成してください。
 
 ### 期待される出力の確認（Verification）
 

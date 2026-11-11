@@ -1,10 +1,13 @@
 # ============================================================================
-# 付録: GKE Sandbox (microVM) 用の NetworkPolicy（着信完全遮断 + メタデータ保護）
+# 付録: GKE Sandbox (microVM) 用の NetworkPolicy（着信完全遮断 + 最小 Egress 制限）
 # 公式セキュリティ推奨事項:
-#   gVisor と異なり microVM ではノードレベルのメタデータエンドポイントへの到達が既定で開いているため、
-#   未信頼のサブプロセスを実行する分離ワーカー Pod 等では 169.254.169.254 / 169.254.169.252 を遮断します。
-#   また、SRE エージェントは外向き（Pub/Sub Pull & Slack Socket Mode）のみで動作するため、
-#   Ingress（着信）は全面拒否とします。
+#   - SRE エージェントは外向き通信（Pub/Sub Pull & Slack Socket Mode）のみで動作するため、
+#     Ingress（着信）は全面拒否とします。
+#   - エージェント本体は Workload Identity で GCP API へ認証するため、DNS (53)、HTTPS (443)、および
+#     Workload Identity メタデータエンドポイント（Dataplane V2 では 169.254.169.254:80、従来構成では
+#     169.254.169.252:988）のみを許可します。
+#   - 未信頼コードを別 Pod で分離実行するワーカー Pod の場合は、下記 169.254.169.254/32 と
+#     169.254.169.252/32 の許可ブロックを削除することでメタデータ到達を完全遮断できます。
 # ============================================================================
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -27,16 +30,23 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
-    # Workload Identity 用 GKE メタデータサーバー (169.254.169.252:988) と HTTPS (443) 通信のみ許可し、
-    # 生の GCE メタデータ IP (169.254.169.254) や不要な内部ポートへの到達を制限
+    # 外向き HTTPS (443) 通信のみ許可（メタデータ IP への 443 等は除外）
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
             except:
               - 169.254.169.254/32
+              - 169.254.169.252/32
       ports:
         - protocol: TCP
           port: 443
+    # Workload Identity トークン取得用エンドポイント（Dataplane V2: 169.254.169.254:80 / 標準: 169.254.169.252:988）
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 80
     - to:
         - ipBlock:
             cidr: 169.254.169.252/32

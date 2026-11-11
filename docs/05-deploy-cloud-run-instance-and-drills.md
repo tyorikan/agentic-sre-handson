@@ -75,13 +75,14 @@ gcloud beta run instances deploy sre-autonomous-agent \
   --image="${SRE_AGENT_IMAGE_URI}:latest" \
   --region="${GOOGLE_CLOUD_REGION}" \
   --service-account="${SRE_AGENT_SA_EMAIL}" \
+  --restart-policy=always \
   --port=8080 \
   --cpu=2 \
   --memory=2Gi \
   --sandbox-launcher \
   --ingress=internal \
   --no-default-url \
-  --set-env-vars="GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT},GOOGLE_CLOUD_REGION=${GOOGLE_CLOUD_REGION},GOOGLE_CLOUD_LOCATION=global,GOOGLE_GENAI_USE_VERTEXAI=True,GOOGLE_GENAI_USE_ENTERPRISE=True,SRE_TRIAGE_MODEL=${SRE_TRIAGE_MODEL},SRE_EMBEDDING_MODEL=${SRE_EMBEDDING_MODEL},ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false,ALERT_PUBSUB_SUBSCRIPTION=${ALERT_PUBSUB_SUBSCRIPTION},BQ_DATASET=${BQ_DATASET},GKE_CLUSTER_NAME=${GKE_CLUSTER_NAME},GKE_CLUSTER_LOCATION=${GKE_CLUSTER_LOCATION},ALLOWED_K8S_NAMESPACES=${ALLOWED_K8S_NAMESPACES},SANDBOX_MODE=cloud_run,INITIAL_STABILIZATION_SECONDS=30,SESSION_BACKEND=firestore,FIRESTORE_DATABASE=(default),SLACK_ALERT_CHANNEL_ID=${SLACK_ALERT_CHANNEL_ID},SLACK_ALLOWED_APPROVER_IDS=${SLACK_ALLOWED_APPROVER_IDS:-}" \
+  --set-env-vars="^@^GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}@GOOGLE_CLOUD_REGION=${GOOGLE_CLOUD_REGION}@GOOGLE_CLOUD_LOCATION=global@GOOGLE_GENAI_USE_ENTERPRISE=True@SRE_TRIAGE_MODEL=${SRE_TRIAGE_MODEL}@SRE_EMBEDDING_MODEL=${SRE_EMBEDDING_MODEL}@ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false@ALERT_PUBSUB_SUBSCRIPTION=${ALERT_PUBSUB_SUBSCRIPTION}@BQ_DATASET=${BQ_DATASET}@GKE_CLUSTER_NAME=${GKE_CLUSTER_NAME}@GKE_CLUSTER_LOCATION=${GKE_CLUSTER_LOCATION}@ALLOWED_K8S_NAMESPACES=${ALLOWED_K8S_NAMESPACES}@SANDBOX_MODE=cloud_run@INITIAL_STABILIZATION_SECONDS=30@SESSION_BACKEND=firestore@FIRESTORE_DATABASE=(default)@SLACK_ALERT_CHANNEL_ID=${SLACK_ALERT_CHANNEL_ID}@SLACK_ALLOWED_APPROVER_IDS=${SLACK_ALLOWED_APPROVER_IDS:-}" \
   ${SLACK_SECRET_FLAGS[@]+"${SLACK_SECRET_FLAGS[@]}"} \
   --project="${GOOGLE_CLOUD_PROJECT}"
 ```
@@ -118,7 +119,7 @@ gcloud logging read \
 
 ### 訓練 1：一時的な下流ネットワーク瞬断 → 「静観（OBSERVE）」の検証
 
-事前ベースラインリクエストの後、25 秒間だけ下流決済ゲートウェイの TLS 瞬断（`UPSTREAM_CONN_RESET_503`）を発生させ、自然回復を確認するシナリオを注入します。
+事前ベースラインリクエストの後、15 秒間だけ下流決済ゲートウェイの TLS 瞬断（`UPSTREAM_CONN_RESET_503`）を発生させ、自然回復を確認するシナリオを注入します。
 
 ```mermaid
 sequenceDiagram
@@ -128,7 +129,7 @@ sequenceDiagram
     participant BQ as BigQuery (100件知識ベース)
     participant Slack as Slack
 
-    Script->>GKE: 正常送信後 25秒間の一過性 503 設定 + 回復リクエスト送信
+    Script->>GKE: 正常送信後 15秒間の一過性 503 設定 + 回復リクエスト送信
     GKE->>Agent: Logging Sink -> Pub/Sub 経由で異常通知
     Agent->>BQ: VECTOR_SEARCH -> INC-013 (外部決済 TLS 瞬断) が一致
     Note over Agent: 30秒観測 + 隔離 sandbox 解析 + 直近デプロイなしを確認<br/>「再起動すると再接続嵐になるため静観」と判定
@@ -207,7 +208,7 @@ sequenceDiagram
 
 **確認ポイント**:
 * エージェントが勝手に Deployment を変更せず一時停止し、Firestore の `adk-session` と `sre_pending_approval_tickets` へ中断状態が永続化されること（待機中にインスタンスを再起動しても途中再開可能）。
-* Slack 上に `[Approve & Execute]` と `[Reject (Manual Triage)]` ボタンが届き、許可されたユーザー ID がボタンを押すと即座に ADK セッションが再開されてメッセージが `✅ 承認・実行完了` へ更新されること。
+* Slack 上に `[Approve & Execute]` と `[Reject (Manual Triage)]` ボタンが届き、許可されたユーザー ID がボタンを押すと即座に ADK セッションが再開されてメッセージが `✅ 承認・実行完了` へ更新されること（なお `INC-025` は `MANUAL_INTERVENTION` 種別の DB 障害であるため GKE への無断再起動は行わず、オンコール担当者の手動調査引き継ぎ確認として記録されます。中リスクの Deployment 再起動等であれば承認後に型付き復旧が実行されます）。
 * BigQuery `sre_agent_ops.incident_events` に `REQUIRE_APPROVAL` に続いて `APPROVED_EXECUTED` の監査行が追記されること。
 
 ```bash

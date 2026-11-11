@@ -17,6 +17,7 @@ from __future__ import annotations
 from google.adk.integrations.model_armor import ModelArmorConfig, ModelArmorPlugin
 from google.api_core.client_options import ClientOptions
 from google.cloud import modelarmor_v1
+from google.protobuf import field_mask_pb2
 
 
 def ensure_multilingual_detection_enabled(project_id: str, location: str, template_id: str) -> str:
@@ -27,12 +28,21 @@ def ensure_multilingual_detection_enabled(project_id: str, location: str, templa
     name = f"projects/{project_id}/locations/{location}/templates/{template_id}"
     template = client.get_template(name=name)
     template.template_metadata.multi_language_detection.enable_multi_language_detection = True
-    client.update_template(template=template)
+    client.update_template(
+        template=template,
+        update_mask=field_mask_pb2.FieldMask(
+            paths=["template_metadata.multi_language_detection.enable_multi_language_detection"]
+        ),
+    )
     return name
 
 
 def build_log_screening_plugin(project_id: str, location: str, template_id: str) -> ModelArmorPlugin:
-    """ログ・メトリクス取得ツールの出力を検査するフェイルクローズ Model Armor プラグインを構築する。"""
+    """ログ・メトリクス取得ツールの出力を検査するフェイルクローズ Model Armor プラグインを構築する。
+
+    注意: `ModelArmorPlugin` は非同期実行のため `client` 引数を省略し、ADK 標準機能によって
+    テンプレート名のリージョンに応じた `ModelArmorAsyncClient` をイベントループごとに自動生成させます。
+    """
     template_name = f"projects/{project_id}/locations/{location}/templates/{template_id}"
     config = ModelArmorConfig(
         prompt_template_name=template_name,
@@ -43,7 +53,4 @@ def build_log_screening_plugin(project_id: str, location: str, template_id: str)
             "該当ログのモデル入力を遮断しました。オンコール担当者が直接ログを確認してください。"
         ),
     )
-    client = modelarmor_v1.ModelArmorClient(
-        client_options=ClientOptions(api_endpoint=f"modelarmor.{location}.rep.googleapis.com")
-    )
-    return ModelArmorPlugin(config=config, client=client)
+    return ModelArmorPlugin(config=config)

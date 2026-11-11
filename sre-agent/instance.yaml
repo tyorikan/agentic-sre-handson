@@ -37,8 +37,6 @@ spec:
           value: "asia-northeast1"
         - name: GOOGLE_CLOUD_LOCATION
           value: "global"
-        - name: GOOGLE_GENAI_USE_VERTEXAI
-          value: "True"
         - name: GOOGLE_GENAI_USE_ENTERPRISE
           value: "True"
         - name: SRE_TRIAGE_MODEL

@@ -53,7 +53,7 @@ peak_idx = series.index(peak)
 latest = series[-1]
 overall_slope = _calc_slope(series)
 # スパイク前に正常ベースライン (0.0) を含む場合でも、ピーク以降の減衰区間を正確に評価する
-eval_series = series[peak_idx:] if (n - peak_idx) >= 3 else series
+eval_series = series[peak_idx:] if (n - peak_idx) >= 2 else series
 effective_slope = _calc_slope(eval_series) if peak > 0 else overall_slope
 
 # ピーク後に負の傾きで減衰し、直近エラー率がピークの半分以下かつ 0.05 未満なら自然減衰中と判定
@@ -77,7 +77,12 @@ class SandboxRunner:
 
     def build_command(self, python_code: str, arg_json: str, sandbox_id: str) -> list[str]:
         """実行モードに応じたコマンド配列を構築する（テストで直接検証可能）。"""
-        if self._settings.sandbox_mode == "cloud_run" and Path(self._settings.sandbox_binary_path).exists():
+        if self._settings.sandbox_mode == "cloud_run":
+            if not Path(self._settings.sandbox_binary_path).exists():
+                raise RuntimeError(
+                    f"SANDBOX_MODE='cloud_run' ですが隔離バイナリが見つかりません: {self._settings.sandbox_binary_path} "
+                    "(--sandbox-launcher が有効か確認してください)"
+                )
             return [
                 self._settings.sandbox_binary_path,
                 "do",
@@ -90,7 +95,7 @@ class SandboxRunner:
                 python_code,
                 arg_json,
             ]
-        # ローカル開発・単体テスト環境フォールバック（-I 分離モード・空環境変数で実行）
+        # ローカル開発・単体テスト環境（SANDBOX_MODE="local_subprocess" 時、-I 分離・空環境変数で実行）
         return [sys.executable, "-I", "-c", python_code, arg_json]
 
     def analyze_error_series(self, series: list[float], timeout_seconds: float = 10.0) -> SandboxMetricsAnalysis:
@@ -126,5 +131,6 @@ class SandboxRunner:
                 [self._settings.sandbox_binary_path, "delete", "--force", sandbox_id],
                 capture_output=True,
                 text=True,
+                timeout=5.0,
                 check=False,
             )

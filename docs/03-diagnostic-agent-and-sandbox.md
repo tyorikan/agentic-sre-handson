@@ -54,7 +54,7 @@ flowchart LR
 |---|---|---|
 | **Cloud Monitoring** | `https://monitoring.googleapis.com/mcp` | `list_timeseries`, `query_range`, `list_alerts` |
 | **Cloud Logging** | `https://logging.googleapis.com/mcp` | `list_log_entries` |
-| **GKE (Read-Only)** | `https://container.googleapis.com/mcp/read-only` | `get_k8s_resource`, `describe_k8s_resource`, `list_k8s_events`, `get_k8s_rollout_status`, `diagnose_k8s_workload`, `get_k8s_logs` |
+| **GKE (Read-Only)** | `https://container.googleapis.com/mcp/read-only` | `get_cluster`, `get_k8s_resource`, `describe_k8s_resource`, `list_k8s_events`, `get_k8s_rollout_status`, `get_k8s_logs` |
 
 ### 設計上の 2 つの急所
 1. **GKE は `/mcp` ではなく必ず `/mcp/read-only` エンドポイントを指定する**: これにより `delete_k8s_resource` や `patch_k8s_resource` といった変更系 MCP ツールがエンドポイントレベルで除外され、調査フェーズでの誤変更を 100% 防止できます。
@@ -108,8 +108,11 @@ pytest tests/test_dedup_and_guardrails.py tests/test_sandbox_runner.py -v
 tests/test_dedup_and_guardrails.py::test_cooldown_deduplication PASSED
 tests/test_dedup_and_guardrails.py::test_guardrail_downgrades_disallowed_namespace_and_circuit_breaker PASSED
 tests/test_dedup_and_guardrails.py::test_pubsub_payload_normalization_and_target_app_modes PASSED
+tests/test_dedup_and_guardrails.py::test_atomic_claim_and_log_binning_decay_detection PASSED
+tests/test_dedup_and_guardrails.py::test_remediation_failure_returns_failed_outcome PASSED
 tests/test_sandbox_runner.py::test_sandbox_command_enforces_strict_isolation PASSED
 tests/test_sandbox_runner.py::test_sandbox_series_analysis_distinguishes_decay_from_persistent_failure PASSED
+tests/test_sandbox_runner.py::test_mcp_tool_filter_and_model_armor_plugin_configuration PASSED
 tests/test_sandbox_runner.py::test_100_runbooks_dataset_integrity_and_retrieval PASSED
 ```
 

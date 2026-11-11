@@ -57,7 +57,10 @@ async def test_slack_hitl_authorization_approve_and_reject_resume(tmp_path: Path
     db_file = tmp_path / "hitl_sessions.db"
     settings = AgentSettings(
         sandbox_mode="local_subprocess",
+        session_backend="sqlite",
         session_db_url=f"sqlite+aiosqlite:///{db_file}",
+        slack_bot_token="",
+        slack_app_token="",
         slack_allowed_approvers=("U_SRE_LEAD",),
     )
     store = InMemoryEventStoreBackend()

@@ -65,19 +65,29 @@ spec:
               value: "asia-northeast1"
             - name: GOOGLE_CLOUD_LOCATION
               value: "global"
-            - name: GOOGLE_GENAI_USE_VERTEXAI
-              value: "True"
             - name: GOOGLE_GENAI_USE_ENTERPRISE
               value: "True"
             - name: SRE_TRIAGE_MODEL
               value: "gemini-3.8-flash"
             - name: SRE_EMBEDDING_MODEL
               value: "gemini-embedding-2"
+            - name: ALERT_PUBSUB_SUBSCRIPTION
+              value: "sre-alert-stream-sub"
+            - name: BQ_DATASET
+              value: "sre_agent_ops"
+            - name: GKE_CLUSTER_NAME
+              value: "sre-demo-cluster"
+            - name: GKE_CLUSTER_LOCATION
+              value: "asia-northeast1"
             - name: SANDBOX_MODE
               value: "local_subprocess"
+            - name: INITIAL_STABILIZATION_SECONDS
+              value: "30"
             - name: ALLOWED_K8S_NAMESPACES
               value: "sre-demo-app"
             - name: SESSION_BACKEND
               value: "firestore"
             - name: FIRESTORE_DATABASE
               value: "(default)"
+            - name: SLACK_ALERT_CHANNEL_ID
+              value: "YOUR_SLACK_CHANNEL_ID"

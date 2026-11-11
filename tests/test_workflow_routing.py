@@ -72,6 +72,7 @@ async def test_workflow_three_scenarios_end_to_end(tmp_path: Path) -> None:
     db_file = tmp_path / "sessions.db"
     settings = AgentSettings(
         sandbox_mode="local_subprocess",
+        session_backend="sqlite",
         session_db_url=f"sqlite+aiosqlite:///{db_file}",
     )
     store = InMemoryEventStoreBackend()
@@ -139,14 +140,26 @@ async def test_workflow_three_scenarios_end_to_end(tmp_path: Path) -> None:
     # 一時停止時点で BigQuery/監査ストアへ REQUIRE_APPROVAL レコードが記録されること
     assert any(r.incident_id == "INC-S3" and r.decision == "REQUIRE_APPROVAL" for r in store.rows)
 
-    # 4. telemetry_enricher 注入時は空の error_rate_series が補完されて解析されること
+    # 4. telemetry_enricher 注入時は補完済みの AlertEvent が並列知識ベース検索と結果の両方に伝播すること
+    observed_kb_Deployment_flags: list[bool] = []
+
+    class SpyKb:
+        def search_similar(self, alert: AlertEvent, top_k: int = 3) -> list[SimilarRunbookMatch]:
+            observed_kb_Deployment_flags.append(alert.recent_deployment_within_30m)
+            return kb.search_similar(alert, top_k=top_k)
+
     async def _fake_enricher(a: AlertEvent) -> AlertEvent:
-        return a.model_copy(update={"error_rate_series": [0.0, 0.85, 0.25, 0.01]})
+        return a.model_copy(
+            update={
+                "error_rate_series": [0.0, 0.85, 0.0],
+                "recent_deployment_within_30m": True,
+            }
+        )
 
     orchestrator_with_enricher = SreIncidentOrchestrator(
         settings=settings,
         sandbox_runner=SandboxRunner(settings),
-        knowledge_base=kb,
+        knowledge_base=SpyKb(),
         guardrail_manager=guardrails,
         remediation_service=remediation,
         decision_analyzer=_deterministic_test_analyzer,
@@ -159,6 +172,9 @@ async def test_workflow_three_scenarios_end_to_end(tmp_path: Path) -> None:
             error_code="UPSTREAM_CONN_RESET_503",
             summary="Upstream payment gateway connection reset by peer during TLS handshake",
             error_rate_series=[],
+            recent_deployment_within_30m=False,
         )
     )
     assert res4.decision.decision == "OBSERVE"
+    assert observed_kb_Deployment_flags == [True]
+    assert res4.alert.recent_deployment_within_30m is True

@@ -37,22 +37,27 @@ LOGGING_ALLOWED_TOOLS = [
 ]
 
 GKE_READONLY_ALLOWED_TOOLS = [
+    "get_cluster",
     "get_k8s_resource",
     "describe_k8s_resource",
     "list_k8s_events",
     "get_k8s_rollout_status",
-    "diagnose_k8s_workload",
     "get_k8s_logs",
 ]
 
 
 def _build_google_auth_header_provider(project_id: str):
-    """Application Default Credentials (ADC) から最新の OAuth 2.0 トークンを取得してヘッダを返す。"""
+    """Application Default Credentials (ADC) をキャッシュ保持し、有効期限切れ時のみ更新してヘッダを返す。"""
+    cached_creds: list[Any] = []
+    auth_req = google.auth.transport.requests.Request()
 
     def _provider(_readonly_context: Any = None) -> dict[str, str]:
-        credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        if not cached_creds:
+            creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+            cached_creds.append(creds)
+        credentials = cached_creds[0]
         if not credentials.valid or not credentials.token:
-            credentials.refresh(google.auth.transport.requests.Request())
+            credentials.refresh(auth_req)
         return {
             "Authorization": f"Bearer {credentials.token}",
             "x-goog-user-project": project_id,
@@ -69,18 +74,21 @@ def build_observability_mcp_toolsets(settings: AgentSettings) -> list[McpToolset
         connection_params=StreamableHTTPConnectionParams(url=MONITORING_MCP_URL, timeout=15.0),
         tool_filter=MONITORING_ALLOWED_TOOLS,
         tool_name_prefix="monitoring_",
+        tool_list_cache_ttl_seconds=300.0,
         header_provider=header_provider,
     )
     logging_toolset = McpToolset(
         connection_params=StreamableHTTPConnectionParams(url=LOGGING_MCP_URL, timeout=15.0),
         tool_filter=LOGGING_ALLOWED_TOOLS,
         tool_name_prefix="logging_",
+        tool_list_cache_ttl_seconds=300.0,
         header_provider=header_provider,
     )
     gke_readonly_toolset = McpToolset(
         connection_params=StreamableHTTPConnectionParams(url=GKE_READONLY_MCP_URL, timeout=15.0),
         tool_filter=GKE_READONLY_ALLOWED_TOOLS,
         tool_name_prefix="gke_",
+        tool_list_cache_ttl_seconds=300.0,
         header_provider=header_provider,
     )
     return [monitoring_toolset, logging_toolset, gke_readonly_toolset]

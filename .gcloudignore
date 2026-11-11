@@ -1,9 +1,11 @@
 .git/
+.gemini/
 .venv/
 .pytest_cache/
 __pycache__/
 *.pyc
 .env
+.env.*
 docs/
 tests/
 appendix/

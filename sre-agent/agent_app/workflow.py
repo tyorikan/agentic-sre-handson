@@ -23,6 +23,7 @@ ADK 2.x の `Workflow` / `JoinNode` / `@node(require_confirmation=True)` で制�
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from dataclasses import dataclass
@@ -119,6 +120,11 @@ def build_llm_decision_analyzer(
 
         prompt = json.dumps(
             {
+                "environment": {
+                    "project_id": settings.project_id,
+                    "gke_cluster_name": settings.gke_cluster_name,
+                    "gke_cluster_location": settings.gke_cluster_location,
+                },
                 "alert": alert.model_dump(),
                 "sandbox_metrics_analysis": sandbox_stats.model_dump(),
                 "similar_past_incidents": [m.model_dump() for m in similar_matches],
@@ -134,7 +140,7 @@ def build_llm_decision_analyzer(
         ):
             if ev.content and ev.content.parts:
                 for part in ev.content.parts:
-                    if part.text:
+                    if part.text and not getattr(part, "thought", False):
                         last_text = part.text
 
         if not last_text:
@@ -208,10 +214,7 @@ class SreIncidentOrchestrator:
         )
         async def analyze_metrics_in_sandbox(ctx: Context) -> dict[str, Any]:
             alert = AlertEvent.model_validate(ctx.state["alert"])
-            if enricher is not None:
-                alert = await enricher(alert)
-                ctx.state["alert"] = alert.model_dump()
-            stats = sandbox.analyze_error_series(alert.error_rate_series)
+            stats = await asyncio.to_thread(sandbox.analyze_error_series, alert.error_rate_series)
             ctx.state["sandbox_stats"] = stats.model_dump()
             _emit_step_log(
                 "隔離サンドボックス時系列解析を完了しました。",
@@ -229,7 +232,7 @@ class SreIncidentOrchestrator:
         )
         async def search_similar_incidents(ctx: Context) -> list[dict[str, Any]]:
             alert = AlertEvent.model_validate(ctx.state["alert"])
-            matches = kb.search_similar(alert, top_k=3)
+            matches = await asyncio.to_thread(kb.search_similar, alert, 3)
             dumped = [m.model_dump() for m in matches]
             ctx.state["similar_matches"] = dumped
             return dumped
@@ -257,7 +260,8 @@ class SreIncidentOrchestrator:
             alert = AlertEvent.model_validate(ctx.state["alert"])
             decision = TriageDecision.model_validate(ctx.state["raw_decision"])
 
-            safe_decision, safe_rem, downgrade_reason = guardrails.enforce_safety_guardrails(
+            safe_decision, safe_rem, downgrade_reason = await asyncio.to_thread(
+                guardrails.enforce_safety_guardrails,
                 namespace=alert.namespace,
                 service_name=alert.service_name,
                 proposed_decision=decision.decision,
@@ -298,7 +302,8 @@ class SreIncidentOrchestrator:
                 detail_message="一過性事象または静観対象と判定されたため、Pod 再起動・ロールバックを行わず静観しました。",
                 verification_passed=True,
             )
-            guardrails.record_outcome(
+            await asyncio.to_thread(
+                guardrails.record_outcome,
                 alert=alert,
                 decision="OBSERVE",
                 remediation_type="NONE",
@@ -314,12 +319,14 @@ class SreIncidentOrchestrator:
         async def auto_remediate_node(ctx: Context) -> dict[str, Any]:
             alert = AlertEvent.model_validate(ctx.state["alert"])
             decision = TriageDecision.model_validate(ctx.state["final_decision"])
-            outcome = remediation.execute_and_verify(
+            outcome = await asyncio.to_thread(
+                remediation.execute_and_verify,
                 namespace=decision.target_namespace,
                 deployment_name=decision.target_deployment,
                 remediation_type=decision.remediation_type,
             )
-            guardrails.record_outcome(
+            await asyncio.to_thread(
+                guardrails.record_outcome,
                 alert=alert,
                 decision="AUTO_REMEDIATE",
                 remediation_type=decision.remediation_type,
@@ -338,7 +345,8 @@ class SreIncidentOrchestrator:
             decision = TriageDecision.model_validate(ctx.state["final_decision"])
 
             if decision.remediation_type in ("ROLLBACK_DEPLOYMENT", "RESTART_DEPLOYMENT"):
-                outcome = remediation.execute_and_verify(
+                outcome = await asyncio.to_thread(
+                    remediation.execute_and_verify,
                     namespace=decision.target_namespace,
                     deployment_name=decision.target_deployment,
                     remediation_type=decision.remediation_type,
@@ -351,7 +359,8 @@ class SreIncidentOrchestrator:
                     verification_passed=True,
                 )
 
-            guardrails.record_outcome(
+            await asyncio.to_thread(
+                guardrails.record_outcome,
                 alert=alert,
                 decision="APPROVED_EXECUTED",
                 remediation_type=decision.remediation_type,
@@ -387,7 +396,10 @@ class SreIncidentOrchestrator:
         )
 
     async def handle_alert(self, alert: AlertEvent) -> WorkflowRunResult:
-        """新規アラートに対してワークフローを起動する（承認が必要な場合は一時停止状態で返る）。"""
+        """新規アラートに対してテレメトリ補完後にワークフローを起動する（承認が必要な場合は一時停止状態で返る）。"""
+        if self._enricher is not None:
+            alert = await self._enricher(alert)
+
         session = await self._sessions.create_session(
             app_name=self.APP_NAME,
             user_id=self.USER_ID,
@@ -419,7 +431,8 @@ class SreIncidentOrchestrator:
         final_decision = TriageDecision.model_validate(state["final_decision"])
 
         if confirmation_call_id:
-            self._guardrails.record_outcome(
+            await asyncio.to_thread(
+                self._guardrails.record_outcome,
                 alert=alert,
                 decision="REQUIRE_APPROVAL",
                 remediation_type=final_decision.remediation_type,
@@ -480,7 +493,8 @@ class SreIncidentOrchestrator:
             pass
 
         if not approved:
-            self._guardrails.record_outcome(
+            await asyncio.to_thread(
+                self._guardrails.record_outcome,
                 alert=alert,
                 decision="REJECTED",
                 remediation_type="NONE",

@@ -10,8 +10,6 @@ import os
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
-load_dotenv()
-
 
 def _split_csv(raw: str) -> tuple[str, ...]:
     """カンマ区切り文字列を空白除去済みタプルへ変換する。"""
@@ -83,5 +81,6 @@ class AgentSettings:
 
 
 def load_settings() -> AgentSettings:
-    """最新の環境変数から設定オブジェクトを構築する。"""
+    """`.env`（存在する場合）と最新の環境変数から設定オブジェクトを構築する。"""
+    load_dotenv()
     return AgentSettings()

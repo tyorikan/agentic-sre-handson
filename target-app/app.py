@@ -4,7 +4,7 @@ GKE クラスタ上で稼働し、構造化 JSON ログと HTTP ステータス�
 ハンズオンの障害訓練用に、以下の 3 つの障害モードを環境変数または管理エンドポイントから再現できます。
 
 1. TRANSIENT_NET_ERR: 下流決済ゲートウェイの一時的な通信瞬断（指定秒数後に自然回復）
-2. MISSING_CONFIG_BUG: v2 デプロイ時の必須設定キー（PAYMENT_API_TIMEOUT_MS）型変換/欠落バグ（ロールバックで解消）
+2. MISSING_CONFIG_BUG: v2 デプロイ時の必須設定キー（PAYMENT_CURRENCY_PRECISION）欠落バグ（ロールバックで解消）
 3. DB_POOL_EXHAUSTED: データベースコネクションプール枯渇・ロック待ち（未知/高リスク障害として人間承認を要求）
 """
 
@@ -60,7 +60,7 @@ def _emit_structured_log(
 
 def _active_fault_mode() -> str:
     """有効期限を考慮して現在の障害モードを返す。"""
-    # v2 バグ入りイメージの再現: PAYMENT_GATEWAY_MULTIPLIER 環境変数が不正または欠落している場合
+    # v2 バグ入りイメージの再現: PAYMENT_CURRENCY_PRECISION 環境変数が欠落している場合
     if os.getenv("APP_VERSION") == "v2.0.0-buggy" and not os.getenv("PAYMENT_CURRENCY_PRECISION"):
         return "MISSING_CONFIG_BUG"
 

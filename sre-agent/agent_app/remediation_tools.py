@@ -80,12 +80,23 @@ class GkeAppsV1RemediationExecutor:
         """直近 within_minutes 以内に新しいロールアウト (revision >= 2) が発生したか確認する。"""
         apps_v1 = self._build_apps_v1_client()
         dep = apps_v1.read_namespaced_deployment(name=deployment_name, namespace=namespace)
+        dep_uid = getattr(dep.metadata, "uid", None)
         match_labels = dep.spec.selector.match_labels or {}
         label_selector = ",".join(f"{k}={v}" for k, v in match_labels.items())
         rs_list = apps_v1.list_namespaced_replica_set(namespace=namespace, label_selector=label_selector).items
 
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=within_minutes)
+        dep_ann = (dep.metadata.annotations or {}).get("deployment.kubernetes.io/revision", "0")
+        dep_rev = int(dep_ann) if dep_ann.isdigit() else 0
+        if dep_rev >= 2 and dep.status and dep.status.conditions:
+            for cond in dep.status.conditions:
+                if cond.type == "Progressing" and cond.last_update_time and cond.last_update_time >= cutoff:
+                    return True
+
         for rs in rs_list:
+            if dep_uid and rs.metadata.owner_references:
+                if not any(ref.uid == dep_uid for ref in rs.metadata.owner_references):
+                    continue
             ann = (rs.metadata.annotations or {}).get("deployment.kubernetes.io/revision", "0")
             rev = int(ann) if ann.isdigit() else 0
             replicas = rs.spec.replicas or 0
@@ -101,7 +112,7 @@ class GkeAppsV1RemediationExecutor:
         *,
         timeout_seconds: int = 75,
     ) -> tuple[bool, datetime]:
-        """Deployment の新リビジョン Pod がすべて Ready になるまで待機する。"""
+        """Deployment の新リビジョン Pod がすべて Ready かつ旧 Pod が縮退するまで待機する。"""
         apps_v1 = self._build_apps_v1_client()
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
@@ -111,19 +122,27 @@ class GkeAppsV1RemediationExecutor:
             gen_ok = (status.observed_generation or 0) >= (dep.metadata.generation or 0)
             updated = status.updated_replicas or 0
             available = status.available_replicas or 0
-            if gen_ok and updated >= desired and available >= desired:
+            total_replicas = status.replicas or 0
+            if gen_ok and updated >= desired and available >= desired and total_replicas <= updated:
                 return True, datetime.now(timezone.utc)
             time.sleep(3)
         return False, datetime.now(timezone.utc)
 
     def rollback_deployment(self, namespace: str, deployment_name: str) -> str:
-        """ReplicaSet の revision 履歴から 1 つ前のリビジョンの PodTemplate を特定し Deployment を戻す。"""
+        """ReplicaSet の revision 履歴から 1 つ前のリビジョンの PodTemplate を特定し JSON Patch replace で戻す。"""
         apps_v1 = self._build_apps_v1_client()
         dep = apps_v1.read_namespaced_deployment(name=deployment_name, namespace=namespace)
+        dep_uid = getattr(dep.metadata, "uid", None)
         match_labels = dep.spec.selector.match_labels or {}
         label_selector = ",".join(f"{k}={v}" for k, v in match_labels.items())
 
-        rs_list = apps_v1.list_namespaced_replica_set(namespace=namespace, label_selector=label_selector).items
+        raw_rs_list = apps_v1.list_namespaced_replica_set(namespace=namespace, label_selector=label_selector).items
+        rs_list = [
+            rs
+            for rs in raw_rs_list
+            if not (dep_uid and rs.metadata.owner_references)
+            or any(ref.uid == dep_uid for ref in rs.metadata.owner_references)
+        ]
 
         def _rev(rs: k8s_client.V1ReplicaSet) -> int:
             ann = (rs.metadata.annotations or {}).get("deployment.kubernetes.io/revision", "0")
@@ -137,12 +156,12 @@ class GkeAppsV1RemediationExecutor:
         previous_rs = sorted_rs[1]
         previous_rev = _rev(previous_rs)
 
-        # pod-template-hash ラベルを除去した前リビジョンのテンプレートで Deployment をパッチ更新
+        # pod-template-hash ラベルを除去した前リビジョンのテンプレートで /spec/template を完全置換
         template_dict = k8s_client.ApiClient().sanitize_for_serialization(previous_rs.spec.template)
         labels = template_dict.get("metadata", {}).get("labels", {})
         labels.pop("pod-template-hash", None)
 
-        patch_body = {"spec": {"template": template_dict}}
+        patch_body = [{"op": "replace", "path": "/spec/template", "value": template_dict}]
         apps_v1.patch_namespaced_deployment(name=deployment_name, namespace=namespace, body=patch_body)
         return (
             f"Deployment {namespace}/{deployment_name} を revision {current_rev} から "
@@ -195,13 +214,7 @@ class SafeRemediationService:
                 f"セキュリティ拒否: Namespace '{namespace}' は許可リスト {self._settings.allowed_namespaces} に含まれていません。"
             )
 
-        if remediation_type == "ROLLBACK_DEPLOYMENT":
-            msg = self._executor.rollback_deployment(namespace=namespace, deployment_name=deployment_name)
-            status = "ROLLED_BACK"
-        elif remediation_type == "RESTART_DEPLOYMENT":
-            msg = self._executor.restart_deployment(namespace=namespace, deployment_name=deployment_name)
-            status = "RESTARTED"
-        else:
+        if remediation_type not in ("ROLLBACK_DEPLOYMENT", "RESTART_DEPLOYMENT"):
             return RemediationOutcome(
                 executed=False,
                 action_status="OBSERVED",
@@ -210,7 +223,24 @@ class SafeRemediationService:
                 post_error_rate=None,
             )
 
-        post_rate = round(float(self._post_probe(namespace, deployment_name)), 4)
+        try:
+            if remediation_type == "ROLLBACK_DEPLOYMENT":
+                msg = self._executor.rollback_deployment(namespace=namespace, deployment_name=deployment_name)
+                status = "ROLLED_BACK"
+            else:
+                msg = self._executor.restart_deployment(namespace=namespace, deployment_name=deployment_name)
+                status = "RESTARTED"
+
+            post_rate = round(float(self._post_probe(namespace, deployment_name)), 4)
+        except Exception as exc:  # noqa: BLE001
+            return RemediationOutcome(
+                executed=False,
+                action_status="FAILED",
+                detail_message=f"復旧操作または事後検証中にエラーが発生しました: {exc}",
+                verification_passed=False,
+                post_error_rate=None,
+            )
+
         verified = post_rate < 0.01
         verify_note = (
             f"事後検証 OK: 復旧後のエラー率は {post_rate * 100:.2f}% (< 1.0%) に回復しました。"
@@ -244,11 +274,13 @@ def build_live_post_remediation_probe(
         log_filter = (
             'resource.type="k8s_container" '
             f'AND resource.labels.namespace_name="{namespace}" '
+            f'AND resource.labels.container_name="{deployment_name}" '
+            'AND NOT textPayload=~"^INFO:" '
             f'AND timestamp>="{since}"'
         )
         total = 0
         errors = 0
-        for entry in client.list_entries(filter_=log_filter, page_size=100):
+        for entry in client.list_entries(filter_=log_filter, page_size=100, max_results=300):
             total += 1
             if str(entry.severity or "INFO").upper() in {"ERROR", "CRITICAL", "ALERT", "EMERGENCY"}:
                 errors += 1

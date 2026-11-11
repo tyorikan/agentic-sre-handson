@@ -136,7 +136,7 @@ sequenceDiagram
     Bolt->>DB: トランザクションで承認チケット取得 (二重実行防止)
     Bolt->>WF: resume_from_approval(confirmed=True, invocation_id=...)
     WF->>DB: 中断箇所から ADK セッション復元
-    WF->>GKE: 型付き復旧関数を実行 + 事後エラー率確認
+    WF->>GKE: Rollback/Restart 時は型付き復旧+検証を実行<br/>(MANUAL_INTERVENTION 時は手動引継を記録)
     WF-->>Bolt: RemediationOutcome 返却
     Bolt->>DB: 完了済みチケット削除
     Bolt->>Slack: 元メッセージを「✅ 承認・実行完了」へ更新
@@ -217,6 +217,10 @@ pytest tests/test_workflow_routing.py tests/test_slack_hitl_resume.py -v
 tests/test_workflow_routing.py::test_workflow_three_scenarios_end_to_end PASSED
 tests/test_slack_hitl_resume.py::test_slack_hitl_authorization_approve_and_reject_resume PASSED
 tests/test_slack_hitl_resume.py::test_pass_hat_k_blocks_flaky_agent PASSED
+tests/test_slack_hitl_resume.py::test_slack_report_highlights_failed_post_verification PASSED
+tests/test_slack_hitl_resume.py::test_resume_survives_instance_restart_via_persistent_ticket_and_session PASSED
+tests/test_slack_hitl_resume.py::test_build_session_service_rejects_unknown_backend PASSED
+tests/test_slack_hitl_resume.py::test_build_session_service_firestore_returns_adk_service PASSED
 ```
 
 ---
@@ -233,7 +237,7 @@ tests/test_slack_hitl_resume.py::test_pass_hat_k_blocks_flaky_agent PASSED
 
 ## Links and References
 
-* [ADK Graph Workflows & Human Input](https://adk.dev/) — ADK 2.x における `Workflow`・`JoinNode`・確認付きノードの仕様
+* [Human input for agent workflows (ADK)](https://adk.dev/graphs/human-input/) — ADK 2.x グラフワークフローにおける Human-in-the-Loop 一時停止・再開仕様
 * [Slack Socket Mode documentation](https://api.slack.com/apis/connections/socket) — 外向き WebSocket によるイベント・Interactivity 受信仕様
 * [Secret Manager overview](https://docs.cloud.google.com/secret-manager/docs/overview) — シークレットの安全な管理と Cloud Run 連携
 

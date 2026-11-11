@@ -31,12 +31,23 @@ flowchart TB
 
 ### `gVisor` ではなく `microVM` を選ぶ理由と注意点
 * **柔軟性**: `gVisor` はユーザースペースでシステムコールの一部を再実装するため、低レベルネットワーク診断ツール等で非対応システムコールに当たることがあります。`microVM` は各 Pod に専用のゲスト Linux カーネルを割り当てるため、通常の Linux バイナリがそのまま動作します。
-* **構築時の必須条件**: **GKE Standard クラスタ** かつ **Nested Virtualization 対応の x86 マシンシリーズ（`n4` / `n2` / `c4` 等、`e2` や Autopilot は非対応）** が必要です。またシステムワークロード用に非 Sandbox の通常ノードプールを最低 1 ノード残す必要があります。
+* **構築時の必須条件**: **GKE Standard クラスタ（バージョン `1.37` 以降）** かつ **Nested Virtualization 対応の x86 マシンシリーズ（`n4` / `n2` / `c4` 等、`e2` や Autopilot は非対応）** が必要です。またシステムワークロード用に非 Sandbox の通常ノードプールを最低 1 ノード残す必要があります。
 
 ```bash
-# 管理用 GKE Standard クラスタに接続した状態で適用する例
+# 管理用 GKE Standard クラスタに接続した状態で、Workload Identity バインドとプレースホルダー置換を行って適用する例
+gcloud iam service-accounts add-iam-policy-binding "${SRE_AGENT_SA_EMAIL}" \
+  --role="roles/iam.workloadIdentityUser" \
+  --member="serviceAccount:${GOOGLE_CLOUD_PROJECT}.svc.id.goog[sre-agent-system/sre-agent-ksa]" \
+  --project="${GOOGLE_CLOUD_PROJECT}"
+
 kubectl apply -f ./appendix/gke-microvm/compute-class-microvm.yaml
-kubectl apply -f ./appendix/gke-microvm/agent-deployment-microvm.yaml
+
+sed -e "s|SRE_AGENT_SA_EMAIL|${SRE_AGENT_SA_EMAIL}|g" \
+    -e "s|SRE_AGENT_IMAGE_URI|${SRE_AGENT_IMAGE_URI}|g" \
+    -e "s|YOUR_PROJECT_ID|${GOOGLE_CLOUD_PROJECT}|g" \
+    -e "s|YOUR_SLACK_CHANNEL_ID|${SLACK_ALERT_CHANNEL_ID}|g" \
+  ./appendix/gke-microvm/agent-deployment-microvm.yaml | kubectl apply -f -
+
 kubectl apply -f ./appendix/gke-microvm/network-policy-metadata-deny.yaml
 ```
 
@@ -56,6 +67,7 @@ flowchart LR
 ```
 
 ### 実装時の勘所
+* 事前に `gcloud services enable modelarmor.googleapis.com` で API を有効化し、対象リージョンに検査テンプレートを作成しておきます。
 * 日本語の通常ログが誤検知されるのを防ぐため、`ensure_multilingual_detection_enabled()` でテンプレートの `enable_multi_language_detection = True` を有効化します。
 * Model Armor API の呼び出しにはリージョン固有エンドポイント（`modelarmor.<LOCATION>.rep.googleapis.com`）を指定します。
 
@@ -133,6 +145,8 @@ gcloud artifacts repositories delete sre-handson \
 # （任意）Secret Manager シークレットとエージェント専用 SA を削除する場合
 gcloud secrets delete sre-slack-bot-token --project="${GOOGLE_CLOUD_PROJECT}" --quiet || true
 gcloud secrets delete sre-slack-app-token --project="${GOOGLE_CLOUD_PROJECT}" --quiet || true
+gcloud iam service-accounts delete "sre-autonomous-agent-sa@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com" \
+  --project="${GOOGLE_CLOUD_PROJECT}" --quiet || true
 ```
 
 ---

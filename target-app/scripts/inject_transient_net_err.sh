@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # ============================================================================
 # シナリオ 1 障害注入スクリプト: 一時的な下流決済ゲートウェイ瞬断 (TRANSIENT_NET_ERR)
-# 挙動: 正常ベースライン送信 → 25秒間だけ 503 発生 → 自然回復後の正常トラフィック送信
+# 挙動: 正常ベースライン送信 → 15秒間だけ 503 発生 → 自然回復後の正常トラフィック送信
 # 期待される SRE エージェントの判断: OBSERVE（Pod 再起動やロールバックを行わず静観）
 # ============================================================================
 set -euo pipefail
 
 NAMESPACE="${NAMESPACE:-sre-demo-app}"
 SERVICE="${SERVICE:-order-service}"
-DURATION_SECONDS="${DURATION_SECONDS:-25}"
+DURATION_SECONDS="${DURATION_SECONDS:-15}"
 
 POD_IPS="$(kubectl get pods -n "${NAMESPACE}" -l app="${SERVICE}" -o jsonpath='{.items[*].status.podIP}')"
 if [[ -z "${POD_IPS}" ]]; then
@@ -40,8 +40,8 @@ kubectl run fault-injector-transient \
       echo ''
     done
 
-    echo '3/4 スパイク中トラフィック (16リクエスト) を送信します...'
-    for i in \$(seq 1 16); do
+    echo '3/4 スパイク中トラフィック (12リクエスト) を送信します...'
+    for i in \$(seq 1 12); do
       curl -s -o /dev/null -w 'err=%{http_code} ' -X POST http://${SERVICE}.${NAMESPACE}.svc.cluster.local/orders \
         -H 'Content-Type: application/json' \
         -d '{\"item_id\": \"SKU-1001\", \"quantity\": 1, \"amount_jpy\": 4800}'
@@ -49,9 +49,9 @@ kubectl run fault-injector-transient \
     done
     echo ''
 
-    echo '4/4 障害タイマーの自然終了 (14秒待機) 後、正常回復トラフィック (12リクエスト) を送信します...'
-    sleep 14
-    for i in \$(seq 1 12); do
+    echo '4/4 障害タイマーの自然終了 (5秒待機) 後、正常回復トラフィック (16リクエスト) を送信します...'
+    sleep 5
+    for i in \$(seq 1 16); do
       curl -s -o /dev/null -w 'rec=%{http_code} ' -X POST http://${SERVICE}.${NAMESPACE}.svc.cluster.local/orders \
         -H 'Content-Type: application/json' \
         -d '{\"item_id\": \"SKU-1002\", \"quantity\": 1, \"amount_jpy\": 3200}'

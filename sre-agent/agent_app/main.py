@@ -97,7 +97,7 @@ async def process_incoming_alert(
     slack_coordinator: SlackHitlCoordinator,
 ) -> bool:
     """単一アラートを重複排除・処理権取得の上で実行する（スキップ時は False、実行時は True）。"""
-    claimed, reason = guardrails.claim_for_processing(alert)
+    claimed, reason = await asyncio.to_thread(guardrails.claim_for_processing, alert)
     if not claimed:
         _log_json("INFO", "クールダウン中のためアラートを重複排除スキップしました。", incident_id=alert.incident_id, reason=reason)
         return False
@@ -114,8 +114,8 @@ async def process_incoming_alert(
             paused_for_approval=result.paused_for_approval,
         )
         return True
-    except Exception:
-        guardrails.release_claim(alert)
+    except BaseException:
+        await asyncio.to_thread(guardrails.release_claim, alert)
         raise
 
 
