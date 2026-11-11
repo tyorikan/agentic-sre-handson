@@ -97,7 +97,36 @@ pytest -v
 
 ---
 
-## 4. ディレクトリ構成
+## 4. Google Cloud 利用料金の目安（東京 `asia-northeast1`・無料枠控除前の定価基準）
+
+本ハンズオンはイベント駆動（異常発生時のみ起動）かつ軽量構成のため、無料枠を一切考慮しない定価計算でも、実施後に第 6 章のクリーンアップを行えば **総額 1 ドル未満（約 \$0.70〜\$0.80）** で完走できます。
+
+### A. ハンズオン実施時・クリーンアップ未実施で放置した場合の料金
+
+| ケース | 想定状況 | 概算コスト (USD) | 定価ベースの内訳 |
+|---|---|---:|---|
+| **① 通常実施（推奨）** | 約 4 時間実施し、終了後に第 6 章の削除手順を実行 | **約 \$0.70〜\$0.80** | GKE クラスタ管理手数料 4 時間（\$0.40）＋ GKE Pod 4 時間（\$0.13）＋ Cloud Run instance 2 時間（\$0.03）＋ Cloud Build・100 件ベクトル化・障害訓練 3 回分の Gemini 推論（\$0.14〜\$0.24） |
+| **② 1 ヶ月放置（未削除）** | 削除せず 730 時間稼働させたまま放置 | **約 \$108 / 月** | GKE クラスタ管理手数料（\$73.00）＋ 監視対象 GKE Autopilot Pod 2 台（\$23.25）＋ 常駐 Cloud Run instance 1 台（\$11.56）＋ Artifact Registry・Secret Manager 保管（約 \$0.20）。平時の Pub/Sub・BigQuery スキャン・Gemini 推論は \$0.00 |
+
+* **無料枠に関する補足**: 上記はすべて無料枠を差し引かない定価（オンデマンド価格）です。請求先アカウントで 1 台目の GKE Autopilot クラスタ管理手数料の無料枠（月最大 \$74.40 割引）などが残っている環境では、上記から自動割引され、①通常実施時は **約 \$0.30〜\$0.40**、②1 ヶ月放置時は **約 \$35 / 月** となります。
+* **環境を残して待機課金だけ抑える方法**: 数日後に再デモしたい場合は、`gcloud beta run instances stop` と `kubectl scale deployment/order-service -n sre-demo-app --replicas=0` を実行しておくことで、Pod・インスタンスの稼働課金（月 \$34.81 相当）を停止できます。GKE クラスタ管理手数料（\$0.10/時間）まで完全に止める場合はクラスタ自体を削除してください。
+
+### B. 本番システムへ導入・常時運用した際の月額コスト目安（規模別 3 パターン）
+
+既存の監視対象システム（GKE クラスタ等）に対して、**本リポジトリの常駐 SRE エージェント基盤一式を追加導入して 24 時間 365 日稼働させた場合の増分コスト**（無料枠控除前の定価基準）です。15 分クールダウン重複排除により、同一障害のエラーログ連発時でも LLM 呼び出しは初回のみに抑止される前提で試算しています。
+
+| 運用規模 | 監視対象・実質トリアージ発火件数 | エージェント常駐基盤 | 月額コスト目安 (USD) | 定価ベースの主な内訳 |
+|---|---|---|---:|---|
+| **小規模** | 1〜3 サービス監視 ／ **月 30 件**（平均 1 件/日） ／ 知識ベース 500 件 | Cloud Run instance 1 台（`2 vCPU / 2 GiB`） | **約 \$13〜\$14 / 月** | 常駐基盤 \$11.56 ＋ `gemini-3.8-flash` 推論 \$1.02〜\$2.03 ＋ BigQuery・Pub/Sub・Firestore・Secret Manager 等 \$0.30 |
+| **中規模** | 10〜30 サービス監視 ／ **月 300 件**（平均 10 件/日） ／ 知識ベース 2,000 件 | Cloud Run instance 1 台（`2 vCPU / 4 GiB`） | **約 \$35〜\$48 / 月** | 常駐基盤 \$21.71 ＋ `gemini-3.8-flash` 推論 \$12.40〜\$24.78 ＋ BigQuery・Pub/Sub・Firestore・Secret Manager 等 \$0.62 |
+| **大規模** | 50〜100+ サービス監視 ／ **月 1,500 件**（平均 50 件/日） ／ 知識ベース 10,000 件 | Cloud Run instances 冗長 2 台（各 `4 vCPU / 8 GiB`） | **約 \$165〜\$240 / 月** | 常駐基盤 \$86.83 ＋ `gemini-3.8-flash` 推論 \$73.28〜\$146.40 ＋ BigQuery・Pub/Sub・Firestore・ログ保管等 \$3.42 |
+
+* **推論単価の前提**: `gemini-3.8-flash` の導入価格（入力 \$0.75・出力 \$3.75 / 100 万トークン）〜標準価格（入力 \$1.50・出力 \$7.50 / 100 万トークン）およびリモート MCP ツール往復（1 件あたり入力 2.5 万〜3.5 万・出力 4,000〜6,000 トークン想定）で算出しています。
+* **発展構成選択時の補足**: 大規模環境で第 6 章オプション A の専用 GKE Standard `microVM` クラスタ（`n4-standard-4` 等）を構築してエージェントを常駐させる場合は、専用ノード常駐費と GKE クラスタ管理手数料が加わり **約 \$360〜\$470 / 月** が目安となります。またオプション B の Model Armor を有効化する場合は検査対象テキスト量に応じた従量費が加算されます。
+
+---
+
+## 5. ディレクトリ構成
 
 ```text
 .
@@ -122,3 +151,4 @@ pytest -v
 * [Isolate workloads by using GKE Sandbox](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/sandbox-pods) — GKE Sandbox（`microVM` / `gVisor`）の設定ガイド
 * [Use the GKE, Cloud Monitoring, and Cloud Logging MCP servers](https://docs.cloud.google.com/mcp/overview) — Google Cloud リモート MCP サーバーの概要と IAM 設定
 * [Agent Development Kit (ADK) Documentation](https://adk.dev/) — ADK Python 2.x のグラフワークフローと Human-in-the-Loop 仕様
+* [Cloud Run pricing](https://cloud.google.com/run/pricing) / [GKE pricing](https://cloud.google.com/kubernetes-engine/pricing) — Cloud Run および GKE Autopilot の公式料金表
