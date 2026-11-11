@@ -137,9 +137,29 @@ gcloud beta run instances delete sre-autonomous-agent \
   --project="${GOOGLE_CLOUD_PROJECT}" \
   --quiet
 
-# 2. 監視対象 GKE クラスタの削除
+# 2. 監視対象 GKE クラスタと専用 VPC・Cloud NAT の削除
 gcloud container clusters delete "${GKE_CLUSTER_NAME}" \
   --region="${GKE_CLUSTER_LOCATION}" \
+  --project="${GOOGLE_CLOUD_PROJECT}" \
+  --quiet
+
+gcloud compute routers nats delete sre-handson-nat \
+  --router=sre-handson-router \
+  --region="${GOOGLE_CLOUD_REGION}" \
+  --project="${GOOGLE_CLOUD_PROJECT}" \
+  --quiet
+
+gcloud compute routers delete sre-handson-router \
+  --region="${GOOGLE_CLOUD_REGION}" \
+  --project="${GOOGLE_CLOUD_PROJECT}" \
+  --quiet
+
+gcloud compute networks subnets delete sre-handson-subnet \
+  --region="${GOOGLE_CLOUD_REGION}" \
+  --project="${GOOGLE_CLOUD_PROJECT}" \
+  --quiet
+
+gcloud compute networks delete sre-handson-vpc \
   --project="${GOOGLE_CLOUD_PROJECT}" \
   --quiet
 
@@ -168,11 +188,13 @@ gcloud artifacts repositories delete sre-handson \
 # （任意）Firestore 上の検証データ（adk-session / sre_pending_approval_tickets コレクション）を削除する場合:
 # 既定データベース `(default)` 自体の削除が不要な場合は、Cloud コンソールまたは gcloud firestore bulk-delete で不要ドキュメントのみ整理できます。
 
-# （任意）Secret Manager シークレットとエージェント専用 SA を削除する場合
+# （任意）Secret Manager シークレットと 3 つの専用 SA を削除する場合
 gcloud secrets delete sre-slack-bot-token --project="${GOOGLE_CLOUD_PROJECT}" --quiet || true
 gcloud secrets delete sre-slack-app-token --project="${GOOGLE_CLOUD_PROJECT}" --quiet || true
-gcloud iam service-accounts delete "sre-autonomous-agent-sa@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com" \
-  --project="${GOOGLE_CLOUD_PROJECT}" --quiet || true
+for SA_NAME in sre-autonomous-agent-sa sre-gke-node-sa sre-cloudbuild-sa; do
+  gcloud iam service-accounts delete "${SA_NAME}@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com" \
+    --project="${GOOGLE_CLOUD_PROJECT}" --quiet || true
+done
 ```
 
 ---

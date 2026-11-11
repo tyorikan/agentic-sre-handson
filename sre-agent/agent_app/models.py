@@ -63,6 +63,18 @@ class SimilarRunbookMatch(BaseModel):
     anti_patterns: str
     verification_check: str
     similarity_score: float = Field(ge=0.0, le=1.0)
+    last_verified_at: str | None = Field(
+        default=None,
+        description="直近の自動復旧成功または人間承認により有効性が検証された日時 (ISO8601 UTC)",
+    )
+    verified_age_days: float | None = Field(
+        default=None,
+        description="最終検証日時からの経過日数（鮮度判定用）",
+    )
+    is_stale: bool = Field(
+        default=False,
+        description="RUNBOOK_FRESHNESS_TTL_DAYS を超過しており人間による再評価が必要か",
+    )
 
 
 class TriageDecision(BaseModel):
@@ -77,6 +89,14 @@ class TriageDecision(BaseModel):
     root_cause_hypothesis: str = Field(description="相関分析から導かれた根本原因の推定")
     rationale: str = Field(description="なぜ静観・自動復旧・人間承認のいずれを選んだかの明確な根拠")
     anti_pattern_warning: str = Field(default="", description="避けるべき誤対応の注意喚起")
+    matched_runbook_age_days: float = Field(
+        default=-1.0,
+        description="一致した過去 Runbook の最終検証からの経過日数（未計測・該当なしの場合は -1.0）",
+    )
+    stale_revalidation_required: bool = Field(
+        default=False,
+        description="Runbook の鮮度有効期限超過により人間再承認へ降格されたか",
+    )
 
 
 class SynthesizedRunbookDraft(BaseModel):
@@ -139,4 +159,12 @@ class RemediationOutcome(BaseModel):
     learned_recommended_action: DecisionType | None = Field(
         default=None,
         description="自律登録された Runbook に設定された次回発生時の推奨判断区分",
+    )
+    refreshed_runbook_id: str | None = Field(
+        default=None,
+        description="自動復旧または再承認の成功により last_verified_at が更新された既存 Runbook ID",
+    )
+    demoted_runbook_id: str | None = Field(
+        default=None,
+        description="人間による却下または事後検証 NG により REQUIRE_APPROVAL へ降格された既存 Runbook ID",
     )

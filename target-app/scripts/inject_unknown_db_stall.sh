@@ -30,7 +30,7 @@ kubectl run fault-injector-db \
       echo ''
     done
     echo 'サンプル注文トラフィックを送信して CRITICAL ログを発火させます...'
-    for i in \$(seq 1 20); do
+    for i in \$(seq 1 35); do
       curl -s -o /dev/null -w 'req=%{http_code} ' -X POST http://${SERVICE}.${NAMESPACE}.svc.cluster.local/orders \
         -H 'Content-Type: application/json' \
         -d '{\"item_id\": \"SKU-3003\", \"quantity\": 1, \"amount_jpy\": 15000}'

@@ -24,7 +24,7 @@
    - Cloud Run instances は `us-central1`・`us-east1`・`europe-west1` では利用できないため、既定リージョンは `asia-northeast1`（東京）を使用します。
 2. **調査と変更の厳格な分離（Two-Phase Execution Boundary）**:
    - **Phase 1（読み取り調査）**: Google Cloud 公式リモート MCP（Monitoring / Logging / GKE `read-only`）および隔離サンドボックス（`/usr/local/gcp/bin/sandbox do`）のみを使用し、対象クラスタの状態を変更しません。
-   - **Phase 2（復旧操作）**: 任意のシェルコマンド（自由な `kubectl` 文字列生成）を LLM に実行させてはなりません。必ず `sre-agent/agent_app/remediation_tools.py` に定義された型付き関数（許可 Namespace 検証・1 時間に 1 回までのサーキットブレーカー・事後メトリクス回復確認付き）のみを使用してください。
+   - **Phase 2（復旧操作）**: 任意のシェルコマンド（自由な `kubectl` 文字列生成）を LLM に実行させてはなりません。必ず `sre-agent/agent_app/remediation_tools.py` に定義された型付き関数（許可 Namespace 検証・類似度しきい値・Runbook 鮮度有効期限 90 日・1 時間に 1 回までのサーキットブレーカー・事後メトリクス回復確認付き）のみを使用してください。
 3. **外部公開エンドポイントの遮断**:
    - Cloud Run instance のデプロイ時は必ず `--sandbox-launcher --ingress internal --no-default-url` を維持し、Slack との双方向承認連携は外向き WebSocket 接続（Slack Socket Mode）で行ってください。
 4. **仮想環境での検証**:

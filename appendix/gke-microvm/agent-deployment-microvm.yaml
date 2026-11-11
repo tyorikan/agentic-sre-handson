@@ -79,6 +79,8 @@ spec:
               value: "sre_genai_conn"
             - name: ENABLE_AUTONOMOUS_KB_LEARNING
               value: "true"
+            - name: RUNBOOK_FRESHNESS_TTL_DAYS
+              value: "90"
             - name: GKE_CLUSTER_NAME
               value: "sre-demo-cluster"
             - name: GKE_CLUSTER_LOCATION

@@ -99,15 +99,19 @@ def build_llm_decision_analyzer(
             "および過去インシデント知識ベースの類似事例（上位3件）を突き合わせ、"
             "必要に応じて読み取り専用の Monitoring / Logging / GKE ツールで直近状況を確認した上で、"
             "以下の基準で厳密に TriageDecision スキーマを出力してください。\n\n"
-            "1. 一過性エラーで既に自然減衰傾向（is_naturally_decaying=True）または過去事例が OBSERVE 推奨の場合:\n"
+            "1. 最上位の過去類似事例（類似度 >= 0.85）が recommended_action='REQUIRE_APPROVAL'（DB ロック競合・スキーマ不整合等）の場合、"
+            "または過去事例との類似度が 0.85 未満の初見持続エラー（is_naturally_decaying=False）の場合:\n"
+            "   -> 必ず decision='REQUIRE_APPROVAL' とし、勝手に本番変更も放置静観もせず人間の判断を仰ぐ。\n"
+            "      その際、インメモリキャッシュ破損・チェックサム不整合（CRC32 mismatch / heap cache corrupted）・メモリリークなど "
+            "稼働中ワーカーのメモリ状態異常で Pod 再起動による初期化回復が見込める場合は必ず remediation_type='RESTART_DEPLOYMENT' を提案し、\n"
+            "      直近の新規デプロイ（recent_deployment_within_30m=True）で環境変数欠落や起動バグが混入した場合のみ 'ROLLBACK_DEPLOYMENT'、"
+            "      DB ロック・永続データ不整合・外部システム障害の場合は 'MANUAL_INTERVENTION' を指定する。\n"
+            "2. 一過性通信瞬断などで実トラフィック上のエラー率が既に自然減衰（is_naturally_decaying=True）しており、"
+            "かつ過去類似事例が OBSERVE 推奨である場合:\n"
             "   -> decision='OBSERVE', remediation_type='NONE' とする（不要な再起動でコネクション再確立嵐を起こさないこと）。\n"
-            "2. 直近デプロイ起因の既知バグや既知の Stateless リソース肥大化で、過去事例と強く一致する場合:\n"
-            "   -> decision='AUTO_REMEDIATE' とし、remediation_type に 'ROLLBACK_DEPLOYMENT' または 'RESTART_DEPLOYMENT' を指定する。\n"
-            "3. DB ロック競合・スキーマ不整合・過去事例との類似度が 0.85 未満の初見障害・確信度が低い場合:\n"
-            "   -> decision='REQUIRE_APPROVAL' とし、勝手に本番変更せず人間の判断を仰ぐ。\n"
-            "      その際、インメモリキャッシュ破損やワーカー状態異常など Pod 再起動で初期化回復が見込める場合は "
-            "remediation_type='RESTART_DEPLOYMENT'（直近デプロイ直後なら 'ROLLBACK_DEPLOYMENT'）を提案し、\n"
-            "      DB ロック・永続データ不整合・外部システム障害の場合は remediation_type='MANUAL_INTERVENTION' を指定する。"
+            "3. 直近デプロイ起因の既知バグや既知のインメモリキャッシュ破損・Stateless リソース肥大化で、AUTO_REMEDIATE 推奨の過去事例と強く一致（>= 0.85）し持続エラー（is_naturally_decaying=False）である場合:\n"
+            "   -> decision='AUTO_REMEDIATE' とし、remediation_type に過去事例と同じ 'ROLLBACK_DEPLOYMENT' または 'RESTART_DEPLOYMENT' を指定する"
+            "（Runbook の鮮度有効期限チェックや1時間回数上限は後続の決定論的ガードレールが自動適用するため、ここでは過去事例の推奨区分に従って出力すること）。"
         ),
         tools=tools,
         output_schema=TriageDecision,
@@ -209,10 +213,10 @@ class SreIncidentOrchestrator:
         self._runner = Runner(app=self._app, session_service=self._sessions)
 
     def _build_adk_app(self) -> App:
+        settings = self._settings
         sandbox = self._sandbox
         kb = self._kb
         analyzer = self._analyzer
-        enricher = self._enricher
         guardrails = self._guardrails
         remediation = self._remediation
 
@@ -268,6 +272,18 @@ class SreIncidentOrchestrator:
         async def enforce_guardrails_and_route(ctx: Context) -> Event:
             alert = AlertEvent.model_validate(ctx.state["alert"])
             decision = TriageDecision.model_validate(ctx.state["raw_decision"])
+            matches = [SimilarRunbookMatch.model_validate(m) for m in ctx.state.get("similar_matches", [])]
+            matched_match = next(
+                (m for m in matches if m.runbook_id == decision.matched_runbook_id),
+                None,
+            )
+            if (
+                matched_match is None
+                and matches
+                and decision.similarity_score >= settings.auto_remediate_similarity_threshold
+            ):
+                matched_match = matches[0]
+            matched_age = matched_match.verified_age_days if matched_match is not None else None
 
             safe_decision, safe_rem, downgrade_reason = await asyncio.to_thread(
                 guardrails.enforce_safety_guardrails,
@@ -276,7 +292,22 @@ class SreIncidentOrchestrator:
                 proposed_decision=decision.decision,
                 proposed_remediation=decision.remediation_type,
                 similarity_score=decision.similarity_score,
+                matched_runbook_age_days=matched_age,
             )
+            stale_revalidation = bool(
+                safe_decision == "REQUIRE_APPROVAL"
+                and matched_match is not None
+                and matched_match.recommended_action == "AUTO_REMEDIATE"
+                and decision.similarity_score >= settings.auto_remediate_similarity_threshold
+                and matched_age is not None
+                and matched_age > float(settings.runbook_freshness_ttl_days)
+            )
+            if stale_revalidation and not downgrade_reason:
+                downgrade_reason = (
+                    f"一致した過去 Runbook ({matched_match.runbook_id}) の最終検証から {matched_age:.1f} 日が経過しており、"
+                    f"鮮度有効期限 ({settings.runbook_freshness_ttl_days} 日) を超過しているため人間による再評価・承認を要求します。"
+                )
+
             rationale = (
                 f"{decision.rationale} [ガードレール注記: {downgrade_reason}]"
                 if downgrade_reason
@@ -289,6 +320,8 @@ class SreIncidentOrchestrator:
                     "target_namespace": alert.namespace,
                     "target_deployment": alert.service_name,
                     "rationale": rationale,
+                    "matched_runbook_age_days": matched_age if matched_age is not None else -1.0,
+                    "stale_revalidation_required": stale_revalidation,
                 }
             )
             ctx.state["final_decision"] = final_decision.model_dump()
@@ -297,6 +330,8 @@ class SreIncidentOrchestrator:
                 incident_id=alert.incident_id,
                 final_route=final_decision.decision,
                 remediation_type=final_decision.remediation_type,
+                matched_runbook_age_days=final_decision.matched_runbook_age_days,
+                stale_revalidation_required=final_decision.stale_revalidation_required,
                 downgrade_reason=downgrade_reason,
             )
             return Event(output=final_decision.model_dump(), route=final_decision.decision)
@@ -334,6 +369,45 @@ class SreIncidentOrchestrator:
                 deployment_name=decision.target_deployment,
                 remediation_type=decision.remediation_type,
             )
+            if (
+                outcome.verification_passed
+                and decision.matched_runbook_id != "NONE"
+                and hasattr(kb, "refresh_runbook_verification")
+            ):
+                refreshed = await asyncio.to_thread(
+                    kb.refresh_runbook_verification,
+                    decision.matched_runbook_id,
+                )
+                if refreshed:
+                    outcome = outcome.model_copy(
+                        update={
+                            "refreshed_runbook_id": decision.matched_runbook_id,
+                            "detail_message": (
+                                f"{outcome.detail_message} | "
+                                f"Runbook {decision.matched_runbook_id} の最終検証日時 (last_verified_at) を更新しました"
+                            ),
+                        }
+                    )
+            elif (
+                not outcome.verification_passed
+                and decision.matched_runbook_id != "NONE"
+                and hasattr(kb, "demote_runbook_to_approval")
+            ):
+                demoted = await asyncio.to_thread(
+                    kb.demote_runbook_to_approval,
+                    decision.matched_runbook_id,
+                )
+                if demoted:
+                    outcome = outcome.model_copy(
+                        update={
+                            "demoted_runbook_id": decision.matched_runbook_id,
+                            "detail_message": (
+                                f"{outcome.detail_message} | "
+                                f"事後検証 NG のため Runbook {decision.matched_runbook_id} を REQUIRE_APPROVAL へ自動降格しました"
+                            ),
+                        }
+                    )
+
             await asyncio.to_thread(
                 guardrails.record_outcome,
                 alert=alert,
@@ -502,6 +576,29 @@ class SreIncidentOrchestrator:
             pass
 
         if not approved:
+            demoted_id: str | None = None
+            if (
+                decision.matched_runbook_id != "NONE"
+                and decision.similarity_score >= self._settings.auto_remediate_similarity_threshold
+                and hasattr(self._kb, "demote_runbook_to_approval")
+            ):
+                demoted = await asyncio.to_thread(
+                    self._kb.demote_runbook_to_approval,
+                    decision.matched_runbook_id,
+                )
+                if demoted:
+                    demoted_id = decision.matched_runbook_id
+                    _emit_step_log(
+                        "担当者による却下を受け、既存 Runbook を REQUIRE_APPROVAL へ自動降格しました。",
+                        incident_id=alert.incident_id,
+                        demoted_runbook_id=demoted_id,
+                    )
+
+            demote_suffix = (
+                f"（Runbook {demoted_id} を REQUIRE_APPROVAL へ自動降格）"
+                if demoted_id
+                else ""
+            )
             await asyncio.to_thread(
                 self._guardrails.record_outcome,
                 alert=alert,
@@ -510,13 +607,14 @@ class SreIncidentOrchestrator:
                 matched_runbook_id=decision.matched_runbook_id,
                 similarity_score=decision.similarity_score,
                 verification_passed=False,
-                summary=f"担当者 ({approver_id}) により自動処置案が却下され、手動調査へ移行しました。",
+                summary=f"担当者 ({approver_id}) により自動処置案が却下され、手動調査へ移行しました。{demote_suffix}",
             )
             return RemediationOutcome(
                 executed=False,
                 action_status="REJECTED",
-                detail_message=f"承認者 <@{approver_id}> が自動操作を却下し、手動対応へ切り替えました。",
+                detail_message=f"承認者 <@{approver_id}> が自動操作を却下し、手動対応へ切り替えました。{demote_suffix}",
                 verification_passed=False,
+                demoted_runbook_id=demoted_id,
             )
 
         updated_session = await self._sessions.get_session(
@@ -527,7 +625,7 @@ class SreIncidentOrchestrator:
         state = updated_session.state if updated_session else {}
         outcome = RemediationOutcome.model_validate(state["outcome"])
 
-        # 初見・低類似度事象が承認実行後に正常回復した場合、構造化 Runbook を知識ベースへ自律登録する
+        # 1. 初見・低類似度事象が承認実行後に正常回復した場合、構造化 Runbook を知識ベースへ自律登録する
         if (
             self._settings.enable_autonomous_kb_learning
             and outcome.verification_passed
@@ -553,6 +651,52 @@ class SreIncidentOrchestrator:
                     incident_id=alert.incident_id,
                     learned_runbook_id=entry.runbook_id,
                     learned_recommended_action=entry.recommended_action,
+                )
+        # 2. 既存の高類似度 Runbook（鮮度期限切れ再評価を含む）が承認実行後に回復確認できた場合、last_verified_at を更新する
+        elif (
+            outcome.verification_passed
+            and decision.matched_runbook_id != "NONE"
+            and decision.similarity_score >= self._settings.auto_remediate_similarity_threshold
+            and hasattr(self._kb, "refresh_runbook_verification")
+        ):
+            refreshed = await asyncio.to_thread(
+                self._kb.refresh_runbook_verification,
+                decision.matched_runbook_id,
+            )
+            if refreshed:
+                outcome = outcome.model_copy(
+                    update={
+                        "refreshed_runbook_id": decision.matched_runbook_id,
+                        "detail_message": (
+                            f"{outcome.detail_message} | "
+                            f"Runbook {decision.matched_runbook_id} の鮮度 (last_verified_at) を再承認更新しました"
+                        ),
+                    }
+                )
+                _emit_step_log(
+                    "承認実行成功により既存 Runbook の最終検証日時を更新しました。",
+                    incident_id=alert.incident_id,
+                    refreshed_runbook_id=decision.matched_runbook_id,
+                )
+        # 3. 承認実行しても事後回復検証が NG だった場合、既存 AUTO_REMEDIATE Runbook を REQUIRE_APPROVAL へ降格する
+        elif (
+            not outcome.verification_passed
+            and decision.matched_runbook_id != "NONE"
+            and hasattr(self._kb, "demote_runbook_to_approval")
+        ):
+            demoted = await asyncio.to_thread(
+                self._kb.demote_runbook_to_approval,
+                decision.matched_runbook_id,
+            )
+            if demoted:
+                outcome = outcome.model_copy(
+                    update={
+                        "demoted_runbook_id": decision.matched_runbook_id,
+                        "detail_message": (
+                            f"{outcome.detail_message} | "
+                            f"事後検証 NG のため Runbook {decision.matched_runbook_id} を REQUIRE_APPROVAL へ自動降格しました"
+                        ),
+                    }
                 )
 
         return outcome

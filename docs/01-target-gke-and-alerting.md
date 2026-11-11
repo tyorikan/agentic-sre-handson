@@ -87,12 +87,21 @@ sequenceDiagram
 
 ---
 
-## 2. GKE Autopilot クラスタと Artifact Registry の作成
+## 2. 専用カスタム VPC・Cloud NAT・GKE Autopilot クラスタ・Artifact Registry の作成
 
 監視対象のマイクロサービスを動かす GKE Autopilot クラスタと、コンテナイメージ置き場を作成します。
 
+> [!NOTE]
+> Google Cloud の新規組織では、セキュリティ初期設定（`constraints/compute.skipDefaultNetworkCreation` および `constraints/compute.vmExternalIpAccess: DENY`）により `default` VPC が存在せず、かつワーカーノードへの外部 IP 付与が禁止されている場合があります。どのような環境のプロジェクトでもそのまま確実に動作するよう、本手順では専用カスタム VPC・Cloud NAT と `--enable-private-nodes`（プライベートノード構成）を使用します。
+
 ```bash
 source .env
+
+export VPC_NAME="sre-handson-vpc"
+export SUBNET_NAME="sre-handson-subnet"
+export ROUTER_NAME="sre-handson-router"
+export NAT_NAME="sre-handson-nat"
+export GKE_NODE_SA_EMAIL="sre-gke-node-sa@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com"
 
 # 1. コンテナイメージ用 Artifact Registry リポジトリの作成
 gcloud artifacts repositories create sre-handson \
@@ -101,12 +110,41 @@ gcloud artifacts repositories create sre-handson \
   --description="Agentic SRE Hands-on container repository" \
   --project="${GOOGLE_CLOUD_PROJECT}"
 
-# 2. 監視対象 GKE Autopilot クラスタの作成（約 5〜8 分かかります）
-gcloud container clusters create-auto "${GKE_CLUSTER_NAME}" \
-  --region="${GKE_CLUSTER_LOCATION}" \
+# 2. 専用カスタム VPC とサブネット［Private Google Access 有効］の作成
+gcloud compute networks create "${VPC_NAME}" \
+  --subnet-mode=custom \
   --project="${GOOGLE_CLOUD_PROJECT}"
 
-# 3. kubectl 認証情報の取得
+gcloud compute networks subnets create "${SUBNET_NAME}" \
+  --network="${VPC_NAME}" \
+  --region="${GOOGLE_CLOUD_REGION}" \
+  --range="10.10.0.0/20" \
+  --enable-private-ip-google-access \
+  --project="${GOOGLE_CLOUD_PROJECT}"
+
+# 3. プライベートノードからの外向きイメージ取得用 Cloud Router & Cloud NAT 作成
+gcloud compute routers create "${ROUTER_NAME}" \
+  --network="${VPC_NAME}" \
+  --region="${GOOGLE_CLOUD_REGION}" \
+  --project="${GOOGLE_CLOUD_PROJECT}"
+
+gcloud compute routers nats create "${NAT_NAME}" \
+  --router="${ROUTER_NAME}" \
+  --region="${GOOGLE_CLOUD_REGION}" \
+  --auto-allocate-nat-external-ips \
+  --nat-all-subnet-ip-ranges \
+  --project="${GOOGLE_CLOUD_PROJECT}"
+
+# 4. 監視対象 GKE Autopilot クラスタの作成（専用ノード SA・プライベートノード有効・約 5〜8 分かかります）
+gcloud container clusters create-auto "${GKE_CLUSTER_NAME}" \
+  --region="${GKE_CLUSTER_LOCATION}" \
+  --network="${VPC_NAME}" \
+  --subnetwork="${SUBNET_NAME}" \
+  --enable-private-nodes \
+  --service-account="${GKE_NODE_SA_EMAIL}" \
+  --project="${GOOGLE_CLOUD_PROJECT}"
+
+# 5. kubectl 認証情報の取得
 gcloud container clusters get-credentials "${GKE_CLUSTER_NAME}" \
   --region="${GKE_CLUSTER_LOCATION}" \
   --project="${GOOGLE_CLOUD_PROJECT}"
@@ -122,13 +160,16 @@ gcloud container clusters get-credentials "${GKE_CLUSTER_NAME}" \
 そこで `target-app/k8s/namespace.yaml` では、**`sre-demo-app` Namespace 内の `deployments` と `replicasets` のみを更新できる Kubernetes `Role` と `RoleBinding`** を定義しています。Secret の読み取りや Namespace の削除は構造的に不可能です。
 
 ```bash
+export SRE_BUILD_SA_EMAIL="sre-cloudbuild-sa@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com"
 export SRE_AGENT_SA_EMAIL="sre-autonomous-agent-sa@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com"
 export SRE_AGENT_SA_UNIQUE_ID=$(gcloud iam service-accounts describe "${SRE_AGENT_SA_EMAIL}" --project="${GOOGLE_CLOUD_PROJECT}" --format="value(uniqueId)")
 export TARGET_APP_IMAGE_URI="${GOOGLE_CLOUD_REGION}-docker.pkg.dev/${GOOGLE_CLOUD_PROJECT}/sre-handson/order-service"
 
-# 1. サンプル注文 API (v1.0.0) のビルドとプッシュ
+# 1. サンプル注文 API (v1.0.0) のビルドとプッシュ（Cloud Build 専用最小権限 SA を使用）
 gcloud builds submit ./target-app \
-  --tag="${TARGET_APP_IMAGE_URI}:v1.0.0" \
+  --config=./target-app/cloudbuild.yaml \
+  --substitutions="_IMAGE_URI=${TARGET_APP_IMAGE_URI}:v1.0.0" \
+  --service-account="projects/${GOOGLE_CLOUD_PROJECT}/serviceAccounts/${SRE_BUILD_SA_EMAIL}" \
   --project="${GOOGLE_CLOUD_PROJECT}"
 
 # 2. Namespace と SRE エージェント用 最小権限 RBAC の適用（SA メールと数値 Unique ID の両方をバインド）
@@ -136,11 +177,11 @@ sed -e "s|SRE_AGENT_SA_EMAIL|${SRE_AGENT_SA_EMAIL}|g" \
     -e "s|SRE_AGENT_SA_UNIQUE_ID|${SRE_AGENT_SA_UNIQUE_ID}|g" \
   ./target-app/k8s/namespace.yaml | kubectl apply -f -
 
-# 3. 正常版 (v1.0.0) Deployment & Service のデプロイ
+# 3. 正常版 (v1.0.0) Deployment & Service のデプロイ（Autopilot 初回ノード起動のため最大 5 分待機）
 sed "s|TARGET_APP_IMAGE_URI|${TARGET_APP_IMAGE_URI}|g" \
   ./target-app/k8s/deployment-v1-healthy.yaml | kubectl apply -f -
 
-kubectl rollout status deployment/order-service -n sre-demo-app --timeout=180s
+kubectl rollout status deployment/order-service -n sre-demo-app --timeout=300s
 ```
 
 > [!TIP]

@@ -24,6 +24,7 @@ USING (
     anti_patterns,
     verification_check,
     historical_mttr_minutes,
+    verified_age_days,
     CONCAT(
       'カテゴリ: ', category, '\n',
       '件名: ', title, '\n',
@@ -52,7 +53,11 @@ WHEN NOT MATCHED THEN
     anti_patterns,
     verification_check,
     historical_mttr_minutes,
-    search_document
+    search_document,
+    created_at,
+    last_verified_at,
+    verified_count,
+    lifecycle_status
   )
   VALUES (
     src.runbook_id,
@@ -69,7 +74,11 @@ WHEN NOT MATCHED THEN
     src.anti_patterns,
     src.verification_check,
     src.historical_mttr_minutes,
-    src.search_document
+    src.search_document,
+    TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL (src.verified_age_days + 30) DAY),
+    TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL src.verified_age_days DAY),
+    CASE WHEN src.verified_age_days <= 90 THEN 3 ELSE 1 END,
+    'ACTIVE'
   );
 
 -- 2. バックグラウンド自律埋め込み生成の進捗確認クエリ

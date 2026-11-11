@@ -28,13 +28,13 @@ flowchart LR
         Dedup["1. 重複排除・テレメトリ補完<br/>15分クールダウン + 直近90秒エラー率算出"]
         Diag["2. 並列診断 JoinNode<br/>Cloud Run sandbox + BigQuery 照合"]
         Decide["3. Gemini 3.8 Flash 相関推論<br/>公式リモート MCP 読取 + 構造化出力"]
-        Guard["4. 安全ガードレール<br/>許可NS・類似度0.85・1時間1回上限"]
+        Guard["4. 安全ガードレール<br/>許可NS・類似度0.85・鮮度90日・1時間1回上限"]
         Dedup --> Diag --> Decide --> Guard
     end
 
     subgraph S3["③ 観測・自律成長知識ストア"]
         direction TB
-        BQ["BigQuery: sre_agent_ops<br/>AI.EMBED 自動ベクトル生成列<br/>初期100件 + 自律追加 AUTO-*"]
+        BQ["BigQuery: sre_agent_ops<br/>AI.EMBED 自動ベクトル生成列<br/>鮮度管理 last_verified_at 付き"]
         MCP["Google Cloud 公式リモート MCP<br/>Monitoring / Logging / GKE 読取10種"]
         FS["Cloud Firestore<br/>ADK 中断セッション・承認チケット"]
     end
@@ -42,8 +42,8 @@ flowchart LR
     subgraph S4["④ 3分岐アクション & 自律学習還流"]
         direction TB
         R1["ルート A: 静観 OBSERVE<br/>一過性瞬断は再起動ゼロで報告"]
-        R2["ルート B: 自動復旧 AUTO_REMEDIATE<br/>AppsV1 Rollback/Restart + 回復検証 < 1.0%"]
-        R3["ルート C: 人間承認 REQUIRE_APPROVAL<br/>承認回復時に新規 Runbook を自動登録"]
+        R2["ルート B: 自動復旧 AUTO_REMEDIATE<br/>AppsV1 Rollback/Restart + 回復検証 + 鮮度更新"]
+        R3["ルート C: 人間承認 REQUIRE_APPROVAL<br/>回復時に新規 Runbook 登録 / 再承認で鮮度更新"]
     end
 
     PubSub -->|"StreamingPull"| Dedup
@@ -73,7 +73,7 @@ flowchart LR
 | **一過性エラー対応** | 通信瞬断でも毎回 Pod を再起動し、再接続ストームで悪化させる | 隔離サンドボックスでエラー率の減衰傾きを計算し、過去履歴と照合して**「何もしない（静観）」**を自律選択 |
 | **変更操作の安全性** | LLM に自由な `kubectl` シェルコマンドを生成させクラスタ破壊リスクがある | 読取は公式リモート MCP（Read-Only）、変更は許可 Namespace 固定・1 時間 1 回上限・事後回復確認付きの型付き関数に分離 |
 | **承認コールバック & 再開耐性** | Slack Webhook 受信用に未認証公開 URL が必要、また承認待ち中のコンテナ再起動で状態が消える | 常駐 instance から **Slack Socket Mode** で外向き接続し、ADK セッション＋承認チケットを **Firestore** へ永続化して再起動後も再開可能 |
-| **運用ナレッジの継続蓄積** | 初期投入データの検索止まりで、未知の障害は何度発生しても毎回人間が対応し続ける | 初見の障害が Slack 承認と事後回復検証を通過した時点で、BigQuery の **`AI.EMBED` 自動埋め込み列**へ新規 Runbook を自律登録し、次回以降は **`AI.SEARCH`** で人間介入なしに自動復旧 |
+| **運用ナレッジの蓄積と鮮度維持** | 初期データ検索止まりで未知障害を自動化できない、または古い復旧手順が無検証で自動実行され続ける | 承認解決済みの初見障害を **`AI.EMBED` 自動埋め込み列**へ自律登録して次回から自動復旧しつつ、**90 日超過の未検証 Runbook は再評価のため人間承認へ自動降格**し、却下・失敗手順は即座に自動凍結 |
 
 ---
 
@@ -118,8 +118,8 @@ pytest -v
 
 | ケース | 想定状況 | 概算コスト (USD) | 定価ベースの内訳 |
 |---|---|---:|---|
-| **① 通常実施（推奨）** | 約 4 時間実施し、終了後に第 6 章の削除手順を実行 | **約 \$0.70〜\$0.80** | GKE クラスタ管理手数料 4 時間（\$0.40）＋ GKE Pod 4 時間（\$0.13）＋ Cloud Run instance 2 時間（\$0.03）＋ Cloud Build・100 件自動ベクトル化・障害訓練 4 シナリオ分の Gemini 推論（\$0.14〜\$0.24） |
-| **② 1 ヶ月放置（未削除）** | 削除せず 730 時間稼働させたまま放置 | **約 \$108 / 月** | GKE クラスタ管理手数料（\$73.00）＋ 監視対象 GKE Autopilot Pod 2 台（\$23.25）＋ 常駐 Cloud Run instance 1 台（\$11.56）＋ Artifact Registry・Secret Manager 保管（約 \$0.20）。平時の Pub/Sub・BigQuery スキャン・Gemini 推論は \$0.00 |
+| **① 通常実施（推奨）** | 約 4 時間実施し、終了後に第 6 章の削除手順を実行 | **約 \$0.70〜\$0.85** | GKE クラスタ管理手数料 4 時間（\$0.40）＋ GKE Pod 4 時間（\$0.13）＋ Cloud NAT 4 時間（\$0.02）＋ Cloud Run instance 2 時間（\$0.03）＋ Cloud Build・100 件自動ベクトル化・障害訓練 4 シナリオ分の Gemini 推論（\$0.14〜\$0.24） |
+| **② 1 ヶ月放置（未削除）** | 削除せず 730 時間稼働させたまま放置 | **約 \$112 / 月** | GKE クラスタ管理手数料（\$73.00）＋ 監視対象 GKE Autopilot Pod 2 台（\$23.25）＋ 常駐 Cloud Run instance 1 台（\$11.56）＋ Cloud NAT 待機（約 \$4.00）＋ Artifact Registry・Secret Manager 保管（約 \$0.20）。平時の Pub/Sub・BigQuery スキャン・Gemini 推論は \$0.00 |
 
 * **無料枠に関する補足**: 上記はすべて無料枠を差し引かない定価（オンデマンド価格）です。請求先アカウントで 1 台目の GKE Autopilot クラスタ管理手数料の無料枠（月最大 \$74.40 割引）などが残っている環境では、上記から自動割引され、①通常実施時は **約 \$0.30〜\$0.40**、②1 ヶ月放置時は **約 \$35 / 月** となります。
 * **環境を残して待機課金だけ抑える方法**: 数日後に再デモしたい場合は、`gcloud beta run instances stop` と `kubectl scale deployment/order-service -n sre-demo-app --replicas=0` を実行しておくことで、Pod・インスタンスの稼働課金（月 \$34.81 相当）を停止できます。GKE クラスタ管理手数料（\$0.10/時間）まで完全に止める場合はクラスタ自体を削除してください。

@@ -13,8 +13,10 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 
 from google.adk import Agent, Runner
 from google.adk.apps import App
@@ -49,6 +51,14 @@ class RunbookKnowledgeBase(Protocol):
 
     def upsert_learned_runbook(self, entry: SynthesizedRunbookEntry) -> bool:
         """承認解決済みの新規 Runbook を冪等に登録する（新規追加時 True、既存スキップ時 False）。"""
+        ...
+
+    def refresh_runbook_verification(self, runbook_id: str) -> bool:
+        """自動復旧または人間再承認＋事後回復確認の成功時に last_verified_at と verified_count を更新する。"""
+        ...
+
+    def demote_runbook_to_approval(self, runbook_id: str) -> bool:
+        """却下（Reject）または事後回復検証 NG 時に AUTO_REMEDIATE を REQUIRE_APPROVAL へ降格する。"""
         ...
 
 
@@ -211,6 +221,21 @@ class BigQueryVectorKnowledgeBase:
         self._client = client or bigquery.Client(project=settings.project_id, location=settings.region)
         self._table_fqn = f"{settings.project_id}.{settings.bq_dataset}.{settings.bq_runbooks_table}"
 
+    def _run_dml_with_retry(self, sql: str, job_config: bigquery.QueryJobConfig) -> Any:
+        """BigQuery の並行 DML 更新競合（optimistic concurrency）に対して安全にリトライする。"""
+        for attempt in range(3):
+            try:
+                job = self._client.query(sql, job_config=job_config)
+                job.result()
+                return job
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc).lower()
+                if attempt < 2 and ("concurrent update" in msg or "serialize access" in msg):
+                    time.sleep(1.2 * (attempt + 1))
+                    continue
+                raise
+        raise RuntimeError("Unreachable DML retry state")
+
     def search_similar(self, alert: AlertEvent, top_k: int = 3) -> list[SimilarRunbookMatch]:
         query_text = build_symptom_query_text(alert)
         sql = f"""
@@ -224,9 +249,25 @@ class BigQueryVectorKnowledgeBase:
               base.remediation_steps,
               base.anti_patterns,
               base.verification_check,
+              CAST(COALESCE(base.last_verified_at, base.created_at) AS STRING) AS last_verified_at_str,
+              COALESCE(
+                ROUND(
+                  TIMESTAMP_DIFF(
+                    CURRENT_TIMESTAMP(),
+                    COALESCE(base.last_verified_at, base.created_at),
+                    HOUR
+                  ) / 24.0,
+                  1
+                ),
+                9999.0
+              ) AS verified_age_days,
               GREATEST(0.0, LEAST(1.0, 1.0 - distance)) AS similarity_score
             FROM AI.SEARCH(
-              TABLE `{self._table_fqn}`,
+              (
+                SELECT *
+                FROM `{self._table_fqn}`
+                WHERE COALESCE(lifecycle_status, 'ACTIVE') = 'ACTIVE'
+              ),
               'search_document',
               @query_text,
               distance_type => 'COSINE',
@@ -241,21 +282,29 @@ class BigQueryVectorKnowledgeBase:
             ]
         )
         rows = self._client.query(sql, job_config=job_config).result()
-        return [
-            SimilarRunbookMatch(
-                runbook_id=row.runbook_id,
-                category=row.category,
-                title=row.title,
-                root_cause=row.root_cause,
-                recommended_action=row.recommended_action,
-                remediation_type=row.remediation_type,
-                remediation_steps=row.remediation_steps,
-                anti_patterns=row.anti_patterns,
-                verification_check=row.verification_check,
-                similarity_score=round(float(row.similarity_score), 4),
+        results: list[SimilarRunbookMatch] = []
+        ttl_days = float(self._settings.runbook_freshness_ttl_days)
+        for row in rows:
+            raw_age = getattr(row, "verified_age_days", None)
+            age_days = round(float(raw_age), 1) if raw_age is not None else None
+            results.append(
+                SimilarRunbookMatch(
+                    runbook_id=row.runbook_id,
+                    category=row.category,
+                    title=row.title,
+                    root_cause=row.root_cause,
+                    recommended_action=row.recommended_action,
+                    remediation_type=row.remediation_type,
+                    remediation_steps=row.remediation_steps,
+                    anti_patterns=row.anti_patterns,
+                    verification_check=row.verification_check,
+                    similarity_score=round(float(row.similarity_score), 4),
+                    last_verified_at=getattr(row, "last_verified_at_str", None),
+                    verified_age_days=age_days,
+                    is_stale=bool(age_days is not None and age_days > ttl_days),
+                )
             )
-            for row in rows
-        ]
+        return results
 
     def upsert_learned_runbook(self, entry: SynthesizedRunbookEntry) -> bool:
         """新規 Runbook を MERGE で冪等に追加する（embedding 列は BigQuery AI.EMBED が自動生成）。"""
@@ -280,7 +329,11 @@ class BigQueryVectorKnowledgeBase:
                 anti_patterns,
                 verification_check,
                 historical_mttr_minutes,
-                search_document
+                search_document,
+                created_at,
+                last_verified_at,
+                verified_count,
+                lifecycle_status
               )
               VALUES (
                 @runbook_id,
@@ -297,7 +350,11 @@ class BigQueryVectorKnowledgeBase:
                 @anti_patterns,
                 @verification_check,
                 @historical_mttr_minutes,
-                @search_document
+                @search_document,
+                CURRENT_TIMESTAMP(),
+                CURRENT_TIMESTAMP(),
+                1,
+                'ACTIVE'
               )
         """
         job_config = bigquery.QueryJobConfig(
@@ -319,26 +376,93 @@ class BigQueryVectorKnowledgeBase:
                 bigquery.ScalarQueryParameter("search_document", "STRING", search_doc),
             ]
         )
-        job = self._client.query(sql, job_config=job_config)
-        job.result()
+        job = self._run_dml_with_retry(sql, job_config)
+        return bool(job.num_dml_affected_rows and job.num_dml_affected_rows > 0)
+
+    def refresh_runbook_verification(self, runbook_id: str) -> bool:
+        """自動復旧または人間再承認＋事後回復確認の成功時に last_verified_at と verified_count を更新する。
+
+        search_document 列を変更しないため、BigQuery AI.EMBED によるベクトル再生成は発生せず即座に完了する。
+        """
+        if not runbook_id or runbook_id == "NONE":
+            return False
+        sql = f"""
+            UPDATE `{self._table_fqn}`
+            SET
+              last_verified_at = CURRENT_TIMESTAMP(),
+              created_at = COALESCE(created_at, CURRENT_TIMESTAMP()),
+              verified_count = COALESCE(verified_count, 0) + 1,
+              lifecycle_status = COALESCE(lifecycle_status, 'ACTIVE')
+            WHERE runbook_id = @runbook_id
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("runbook_id", "STRING", runbook_id)]
+        )
+        job = self._run_dml_with_retry(sql, job_config)
+        return bool(job.num_dml_affected_rows and job.num_dml_affected_rows > 0)
+
+    def demote_runbook_to_approval(self, runbook_id: str) -> bool:
+        """人間による却下（Reject）または事後回復検証 NG 時に AUTO_REMEDIATE を REQUIRE_APPROVAL へ降格する。
+
+        lifecycle_status は ACTIVE のまま維持し、過去の障害文脈としての検索性は残しつつ無断自動実行を恒久遮断する。
+        """
+        if not runbook_id or runbook_id == "NONE":
+            return False
+        sql = f"""
+            UPDATE `{self._table_fqn}`
+            SET recommended_action = 'REQUIRE_APPROVAL'
+            WHERE runbook_id = @runbook_id
+              AND recommended_action = 'AUTO_REMEDIATE'
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("runbook_id", "STRING", runbook_id)]
+        )
+        job = self._run_dml_with_retry(sql, job_config)
         return bool(job.num_dml_affected_rows and job.num_dml_affected_rows > 0)
 
 
 class LocalJsonlKnowledgeBase:
-    """ローカル開発・単体テスト向けに `seed_runbooks_100.jsonl` を読み込み、自律追記にも対応する実装。"""
+    """ローカル開発・単体テスト向けに `seed_runbooks_100.jsonl` を読み込み、自律追記・鮮度管理にも対応する実装。"""
 
-    def __init__(self, jsonl_path: Path) -> None:
+    def __init__(self, jsonl_path: Path, freshness_ttl_days: int = 90) -> None:
         self._lock = threading.Lock()
-        self._records: list[dict] = [
-            json.loads(line)
-            for line in jsonl_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        self._freshness_ttl_days = freshness_ttl_days
+        now = datetime.now(timezone.utc)
+        self._records: list[dict[str, Any]] = []
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            age_days = float(rec.get("verified_age_days", 14.0))
+            rec["verified_age_days"] = age_days
+            rec.setdefault("verified_count", 3 if age_days <= freshness_ttl_days else 1)
+            rec.setdefault("lifecycle_status", "ACTIVE")
+            rec.setdefault("last_verified_at", (now - timedelta(days=age_days)).isoformat())
+            self._records.append(rec)
 
     @property
     def total_records(self) -> int:
         with self._lock:
             return len(self._records)
+
+    def get_runbook_record(self, runbook_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            for rec in self._records:
+                if rec["runbook_id"] == runbook_id:
+                    return dict(rec)
+            return None
+
+    def set_runbook_age_days(self, runbook_id: str, age_days: float) -> None:
+        """テスト・シミュレーション用に指定 Runbook の経過日数を変更する。"""
+        with self._lock:
+            for rec in self._records:
+                if rec["runbook_id"] == runbook_id:
+                    rec["verified_age_days"] = float(age_days)
+                    rec["last_verified_at"] = (
+                        datetime.now(timezone.utc) - timedelta(days=float(age_days))
+                    ).isoformat()
+                    return
+        raise KeyError(f"runbook_id={runbook_id!r} not found")
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
@@ -348,9 +472,9 @@ class LocalJsonlKnowledgeBase:
     def search_similar(self, alert: AlertEvent, top_k: int = 3) -> list[SimilarRunbookMatch]:
         q_tokens = self._tokenize(build_symptom_query_text(alert))
         with self._lock:
-            snapshot = list(self._records)
+            snapshot = [dict(r) for r in self._records if r.get("lifecycle_status", "ACTIVE") == "ACTIVE"]
 
-        scored: list[tuple[float, dict]] = []
+        scored: list[tuple[float, dict[str, Any]]] = []
         for rec in snapshot:
             doc_text = " ".join(
                 [
@@ -369,6 +493,7 @@ class LocalJsonlKnowledgeBase:
             scored.append((min(0.99, round(base_score, 4)), rec))
 
         scored.sort(key=lambda item: item[0], reverse=True)
+        ttl = float(self._freshness_ttl_days)
         return [
             SimilarRunbookMatch(
                 runbook_id=rec["runbook_id"],
@@ -381,6 +506,9 @@ class LocalJsonlKnowledgeBase:
                 anti_patterns=rec["anti_patterns"],
                 verification_check=rec["verification_check"],
                 similarity_score=score,
+                last_verified_at=rec.get("last_verified_at"),
+                verified_age_days=round(float(rec.get("verified_age_days", 0.0)), 1),
+                is_stale=float(rec.get("verified_age_days", 0.0)) > ttl,
             )
             for score, rec in scored[:top_k]
         ]
@@ -389,5 +517,29 @@ class LocalJsonlKnowledgeBase:
         with self._lock:
             if any(r["runbook_id"] == entry.runbook_id for r in self._records):
                 return False
-            self._records.append(entry.model_dump())
+            dumped = entry.model_dump()
+            dumped["verified_age_days"] = 0.0
+            dumped["verified_count"] = 1
+            dumped["lifecycle_status"] = "ACTIVE"
+            dumped["last_verified_at"] = datetime.now(timezone.utc).isoformat()
+            self._records.append(dumped)
             return True
+
+    def refresh_runbook_verification(self, runbook_id: str) -> bool:
+        with self._lock:
+            for rec in self._records:
+                if rec["runbook_id"] == runbook_id:
+                    rec["verified_age_days"] = 0.0
+                    rec["last_verified_at"] = datetime.now(timezone.utc).isoformat()
+                    rec["verified_count"] = int(rec.get("verified_count", 0)) + 1
+                    rec["lifecycle_status"] = rec.get("lifecycle_status", "ACTIVE")
+                    return True
+            return False
+
+    def demote_runbook_to_approval(self, runbook_id: str) -> bool:
+        with self._lock:
+            for rec in self._records:
+                if rec["runbook_id"] == runbook_id and rec["recommended_action"] == "AUTO_REMEDIATE":
+                    rec["recommended_action"] = "REQUIRE_APPROVAL"
+                    return True
+            return False

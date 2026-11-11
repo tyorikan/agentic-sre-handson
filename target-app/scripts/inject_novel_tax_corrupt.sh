@@ -33,7 +33,7 @@ kubectl run fault-injector-novel-tax \
       echo ''
     done
     echo '注文トラフィックを送信し、初見エラー TAX_RULE_CRC32_MISMATCH_500 を発火させます...'
-    for i in \$(seq 1 20); do
+    for i in \$(seq 1 35); do
       curl -s -o /dev/null -w 'req=%{http_code} ' -X POST http://${SERVICE}.${NAMESPACE}.svc.cluster.local/orders \
         -H 'Content-Type: application/json' \
         -d '{\"item_id\": \"SKU-4004\", \"quantity\": 1, \"amount_jpy\": 5500}'

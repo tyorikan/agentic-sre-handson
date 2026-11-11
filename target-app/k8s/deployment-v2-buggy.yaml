@@ -34,7 +34,9 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            # 意図的な設定欠落: PAYMENT_CURRENCY_PRECISION が定義されていない
+            # 意図的な設定欠落（空文字による設定ミス）: Strategic Merge Patch で繰り返し再注入しても確実に反映させる
+            - name: PAYMENT_CURRENCY_PRECISION
+              value: ""
           resources:
             requests:
               cpu: "250m"

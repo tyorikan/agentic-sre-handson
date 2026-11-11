@@ -61,12 +61,14 @@ flowchart LR
 ```bash
 source .env
 
+export SRE_BUILD_SA_EMAIL="sre-cloudbuild-sa@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com"
 export SRE_AGENT_SA_EMAIL="sre-autonomous-agent-sa@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com"
 export SRE_AGENT_IMAGE_URI="${GOOGLE_CLOUD_REGION}-docker.pkg.dev/${GOOGLE_CLOUD_PROJECT}/sre-handson/sre-autonomous-agent"
 
 gcloud builds submit . \
   --config=./sre-agent/cloudbuild.yaml \
   --substitutions="_IMAGE_URI=${SRE_AGENT_IMAGE_URI}:latest" \
+  --service-account="projects/${GOOGLE_CLOUD_PROJECT}/serviceAccounts/${SRE_BUILD_SA_EMAIL}" \
   --project="${GOOGLE_CLOUD_PROJECT}"
 ```
 
@@ -97,7 +99,7 @@ gcloud beta run instances deploy sre-autonomous-agent \
   --sandbox-launcher \
   --ingress=internal \
   --no-default-url \
-  --set-env-vars="^@^GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}@GOOGLE_CLOUD_REGION=${GOOGLE_CLOUD_REGION}@GOOGLE_CLOUD_LOCATION=global@GOOGLE_GENAI_USE_ENTERPRISE=True@SRE_TRIAGE_MODEL=${SRE_TRIAGE_MODEL}@SRE_EMBEDDING_MODEL=${SRE_EMBEDDING_MODEL}@ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false@ALERT_PUBSUB_SUBSCRIPTION=${ALERT_PUBSUB_SUBSCRIPTION}@BQ_DATASET=${BQ_DATASET}@BQ_CONNECTION_ID=${BQ_CONNECTION_ID:-sre_genai_conn}@ENABLE_AUTONOMOUS_KB_LEARNING=${ENABLE_AUTONOMOUS_KB_LEARNING:-true}@ALLOW_DRILL_COOLDOWN_RESET=true@GKE_CLUSTER_NAME=${GKE_CLUSTER_NAME}@GKE_CLUSTER_LOCATION=${GKE_CLUSTER_LOCATION}@ALLOWED_K8S_NAMESPACES=${ALLOWED_K8S_NAMESPACES}@SANDBOX_MODE=cloud_run@INITIAL_STABILIZATION_SECONDS=30@SESSION_BACKEND=firestore@FIRESTORE_DATABASE=(default)@SLACK_ALERT_CHANNEL_ID=${SLACK_ALERT_CHANNEL_ID}@SLACK_ALLOWED_APPROVER_IDS=${SLACK_ALLOWED_APPROVER_IDS:-}" \
+  --set-env-vars="^@^GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}@GOOGLE_CLOUD_REGION=${GOOGLE_CLOUD_REGION}@GOOGLE_CLOUD_LOCATION=global@GOOGLE_GENAI_USE_ENTERPRISE=True@SRE_TRIAGE_MODEL=${SRE_TRIAGE_MODEL}@SRE_EMBEDDING_MODEL=${SRE_EMBEDDING_MODEL}@ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false@ALERT_PUBSUB_SUBSCRIPTION=${ALERT_PUBSUB_SUBSCRIPTION}@BQ_DATASET=${BQ_DATASET}@BQ_CONNECTION_ID=${BQ_CONNECTION_ID:-sre_genai_conn}@ENABLE_AUTONOMOUS_KB_LEARNING=${ENABLE_AUTONOMOUS_KB_LEARNING:-true}@RUNBOOK_FRESHNESS_TTL_DAYS=${RUNBOOK_FRESHNESS_TTL_DAYS:-90}@ALLOW_DRILL_COOLDOWN_RESET=true@GKE_CLUSTER_NAME=${GKE_CLUSTER_NAME}@GKE_CLUSTER_LOCATION=${GKE_CLUSTER_LOCATION}@ALLOWED_K8S_NAMESPACES=${ALLOWED_K8S_NAMESPACES}@SANDBOX_MODE=cloud_run@INITIAL_STABILIZATION_SECONDS=30@SESSION_BACKEND=firestore@FIRESTORE_DATABASE=(default)@SLACK_ALERT_CHANNEL_ID=${SLACK_ALERT_CHANNEL_ID}@SLACK_ALLOWED_APPROVER_IDS=${SLACK_ALLOWED_APPROVER_IDS:-}" \
   ${SLACK_SECRET_FLAGS[@]+"${SLACK_SECRET_FLAGS[@]}"} \
   --project="${GOOGLE_CLOUD_PROJECT}"
 ```
@@ -340,11 +342,21 @@ sequenceDiagram
     end
 
     rect rgb(230, 244, 234)
-        Note over Script,Slack: 2回目: 同一の初見エラーを再注入 → 自律学習済みナレッジと一致し人間承認なしで自動復旧
+        Note over Script,Slack: ステップ C — 2回目: 自律学習済みナレッジと一致し人間承認なしで自動復旧
         Script->>GKE: クールダウン解除後に再び TAX_CACHE_CORRUPTION を注入
-        Agent->>BQ: AI.SEARCH 照合 → 自律登録済み AUTO-* が類似度 >= 0.85 で最上位一致
+        Agent->>BQ: AI.SEARCH 照合 → AUTO-* が類似度 >= 0.85 & 鮮度 <= 90日 で一致
         Agent->>GKE: 人間承認を待たず AUTO_REMEDIATE で即座にローリング再起動・回復確認
+        Agent->>BQ: 成功に伴い verified_count + 1・last_verified_at 自動更新
         Agent->>Slack: 自動復旧完了レポート通知
+    end
+
+    rect rgb(252, 232, 230)
+        Note over Script,Slack: ステップ D — 3回目: 最終検証から 120 日経過模擬 → 鮮度切れ再評価降格 → 再承認で復活
+        Script->>BQ: AUTO-* の last_verified_at を 120 日前へ更新し再注入
+        Agent->>BQ: AI.SEARCH 一致だが経過 120日 > 上限 90日 を検知
+        Agent->>Slack: 無断自動実行を停止し「鮮度期限切れ再評価」カード送信
+        Slack-->>Agent: 担当者が Approve をクリック — Reject 時は承認制へ恒久降格
+        Agent->>GKE: ローリング再起動実行 → 回復確認後に last_verified_at を現在へ復活
     end
 ```
 
@@ -398,6 +410,32 @@ bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGIO
   'SELECT created_at, incident_id, error_code, decision, remediation_type, matched_runbook_id, ROUND(similarity_score, 3) AS sim, verification_passed FROM `sre_agent_ops.incident_events` ORDER BY created_at DESC LIMIT 8'
 ```
 
+#### ステップ D：Runbook 鮮度期限切れ（90 日超過）の擬似再現 → 「再評価のための承認降格 ＆ 再承認による鮮度回復」の検証
+
+本番環境では、半年〜1 年前に自動復旧できていた手順がマイクロサービス構成や設定仕様の変化で通用しなくなることがあります。そこで、先ほど学習した `AUTO-*` Runbook の最終検証日（`last_verified_at`）を **120 日前** に擬似変更し、鮮度有効期限（`RUNBOOK_FRESHNESS_TTL_DAYS=90`）を超えた古い知識が無断で自動実行されず、**再度人間の承認を求める安全フロー**になることを確認します。
+
+```bash
+# 1. 自律登録された AUTO-* Runbook の最終検証日時を「120 日前」に擬似老化させる（search_document 不変のためベクトル再生成は不要）
+bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGION}" --use_legacy_sql=false \
+  'UPDATE `sre_agent_ops.incident_runbooks`
+   SET last_verified_at = TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 120 DAY)
+   WHERE STARTS_WITH(runbook_id, "AUTO-")'
+
+# 2. クールダウン解除後、3 回目の同一障害を注入
+./target-app/scripts/reset_fault.sh --reset-cooldown
+sleep 8
+./target-app/scripts/inject_novel_tax_corrupt.sh
+```
+
+**確認ポイント**:
+1. 類似度スコアは `0.85` 以上で `AUTO-*` に一致するにもかかわらず、安全ガードレールが「最終検証から `120.0` 日経過 ＞ 鮮度有効期限 `90` 日」を検知して `REQUIRE_APPROVAL` へ強制降格し、Slack に **`⏳ 承認待機・鮮度期限切れ再評価`** カードとボタンが届くこと。
+2. Slack で **`[Approve & Execute]`** をクリックするとローリング再起動と回復確認が実行され、`AUTO-*` の `last_verified_at` が現在時刻へ自動リフレッシュ（`verified_count` が `+1`）されて、再び今後 90 日間の自動復旧資格が回復すること（逆に手順が古くなっており **`[Reject]`** を押した場合は、`recommended_action` が自動的に `'REQUIRE_APPROVAL'` へ降格され、以後の無断自動実行が恒久凍結されます）。
+
+```bash
+bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGION}" --use_legacy_sql=false \
+  'SELECT runbook_id, recommended_action, verified_count, last_verified_at, ROUND(TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), last_verified_at, MINUTE) / 60.0, 2) AS hours_since_verified FROM `sre_agent_ops.incident_runbooks` WHERE STARTS_WITH(runbook_id, "AUTO-")'
+```
+
 ### 💡 トラブルシューティングのヒント
 
 * **単発の `McpError: Server returned an error response` がログに出る場合**: LLM がリモート MCP ツールのフィルタ引数を初回試行で誤り、サーバーが入力補正エラーを返すことがあります。ADK のツール機構がエラーメッセージをモデルへ返して自動リトライするため、後続ステップで `Gemini トリアージ推論を完了しました` と記録されていれば正常動作です。全ツール呼び出しが連続失敗する場合のみ、`roles/mcp.toolUser` と `roles/serviceusage.serviceUsageConsumer` の付与を確認してください。
@@ -410,7 +448,7 @@ bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGIO
 ```markdown
 `AGENTS.md` と `.env` を読み込み、第5章（`docs/05-deploy-cloud-run-instance-and-drills.md`）のデプロイと 4 つの障害訓練を順番に実行してください。
 - `sre-autonomous-agent` イメージのビルドと `gcloud beta run instances deploy` はコマンド全文を提示し、私の `y` 承認後に実行すること。
-- 訓練 1・訓練 2・訓練 3・訓練 4 は 1 つずつ実行し、各訓練の後に `kubectl get pods -n sre-demo-app -L version` と BigQuery `incident_events` / `incident_runbooks` テーブルの記録結果を確認して報告すること。
+- 訓練 1・訓練 2・訓練 3・訓練 4（ステップ A〜D の鮮度期限切れ再評価を含む）は 1 つずつ実行し、各訓練の後に `kubectl get pods -n sre-demo-app -L version` と BigQuery `incident_events` / `incident_runbooks` テーブルの記録結果を確認して報告すること。
 ```
 
 ---

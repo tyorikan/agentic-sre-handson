@@ -278,6 +278,7 @@ class IncidentGuardrailManager:
         proposed_decision: DecisionType,
         proposed_remediation: RemediationType,
         similarity_score: float,
+        matched_runbook_age_days: float | None = None,
         now: datetime | None = None,
     ) -> tuple[DecisionType, RemediationType, str]:
         """LLM が提案した判断に対し、決定論的ルールで安全側への降格（ダウングレード）を強制する。"""
@@ -310,7 +311,19 @@ class IncidentGuardrailManager:
                     f"復旧種別 '{proposed_remediation}' は自動実行対象外のため人間承認へ降格しました。",
                 )
 
-            # 4. サーキットブレーカー: 同一サービスへの自動復旧が直近 1 時間に上限回数に達していたら停止
+            # 4. Runbook 鮮度有効期限チェック: 最終検証日から RUNBOOK_FRESHNESS_TTL_DAYS を超過した手順は人間再評価へ降格
+            if (
+                matched_runbook_age_days is not None
+                and matched_runbook_age_days > float(self._settings.runbook_freshness_ttl_days)
+            ):
+                return (
+                    "REQUIRE_APPROVAL",
+                    proposed_remediation,
+                    f"一致した過去 Runbook の最終検証から {matched_runbook_age_days:.1f} 日が経過しており、"
+                    f"鮮度有効期限 ({self._settings.runbook_freshness_ttl_days} 日) を超過しているため人間による再評価・承認へ降格しました。",
+                )
+
+            # 5. サーキットブレーカー: 同一サービスへの自動復旧が直近 1 時間に上限回数に達していたら停止
             current = now or datetime.now(timezone.utc)
             one_hour_ago = current - timedelta(hours=1)
             auto_count = self._backend.count_auto_actions_for_service(namespace, service_name, since=one_hour_ago)

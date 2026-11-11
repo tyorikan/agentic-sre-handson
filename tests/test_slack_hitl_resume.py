@@ -519,7 +519,7 @@ async def test_autonomous_kb_learning_keeps_manual_intervention_as_require_appro
 
 
 def test_bigquery_ai_search_and_autonomous_merge_queries() -> None:
-    """BigQueryVectorKnowledgeBase が AI.SEARCH と embedding 列除外の MERGE 文を発行すること。"""
+    """BigQueryVectorKnowledgeBase が鮮度付き AI.SEARCH・MERGE・鮮度更新・自動降格 SQL を発行すること。"""
 
     class _FakeRow:
         runbook_id = "AUTO-1234ABCD"
@@ -531,6 +531,8 @@ def test_bigquery_ai_search_and_autonomous_merge_queries() -> None:
         remediation_steps = "ローリング再起動"
         anti_patterns = "無検証連打禁止"
         verification_check = "エラー率 < 1.0%"
+        last_verified_at_str = "2026-07-01 00:00:00+00"
+        verified_age_days = 120.0
         similarity_score = 0.93
 
     class _FakeJob:
@@ -550,14 +552,21 @@ def test_bigquery_ai_search_and_autonomous_merge_queries() -> None:
             return _FakeJob([_FakeRow()], affected=1)
 
     fake_bq = _FakeBqClient()
-    settings = AgentSettings(project_id="test-proj", bq_dataset="sre_agent_ops")
+    settings = AgentSettings(
+        project_id="test-proj",
+        bq_dataset="sre_agent_ops",
+        runbook_freshness_ttl_days=90,
+    )
     bq_kb = BigQueryVectorKnowledgeBase(settings, client=fake_bq)
 
     alert = AlertEvent(incident_id="BQ-1", error_code="TAX_RULE_CRC32_MISMATCH_500", summary="CRC mismatch")
     matches = bq_kb.search_similar(alert, top_k=3)
     assert len(matches) == 1
     assert matches[0].runbook_id == "AUTO-1234ABCD"
+    assert matches[0].verified_age_days == 120.0
+    assert matches[0].is_stale is True
     assert "AI.SEARCH(" in fake_bq.queries[0]
+    assert "lifecycle_status" in fake_bq.queries[0]
     assert "'search_document'" in fake_bq.queries[0]
 
     entry = synthesize_runbook_deterministic(
@@ -575,6 +584,258 @@ def test_bigquery_ai_search_and_autonomous_merge_queries() -> None:
     inserted = bq_kb.upsert_learned_runbook(entry)
     assert inserted is True
     assert "MERGE `test-proj.sre_agent_ops.incident_runbooks`" in fake_bq.queries[1]
+    assert "last_verified_at" in fake_bq.queries[1]
     assert "embedding" not in fake_bq.queries[1]
+
+    refreshed = bq_kb.refresh_runbook_verification("AUTO-1234ABCD")
+    assert refreshed is True
+    assert "UPDATE `test-proj.sre_agent_ops.incident_runbooks`" in fake_bq.queries[2]
+    assert "last_verified_at = CURRENT_TIMESTAMP()" in fake_bq.queries[2]
+    assert "search_document" not in fake_bq.queries[2]
+
+    demoted = bq_kb.demote_runbook_to_approval("AUTO-1234ABCD")
+    assert demoted is True
+    assert "SET recommended_action = 'REQUIRE_APPROVAL'" in fake_bq.queries[3]
+    assert "search_document" not in fake_bq.queries[3]
+
+
+@pytest.mark.asyncio
+async def test_stale_runbook_revalidation_refresh_and_reject_demotion(tmp_path: Path) -> None:
+    """鮮度期限切れ (age > TTL) Runbook の承認降格、再承認による鮮度回復、および却下・事後検証NGによる自動降格を検証する。"""
+    from agent_app.slack_socket import build_approval_request_blocks
+
+    db_file = tmp_path / "freshness_lifecycle.db"
+    settings = AgentSettings(
+        sandbox_mode="local_subprocess",
+        session_backend="sqlite",
+        session_db_url=f"sqlite+aiosqlite:///{db_file}",
+        enable_autonomous_kb_learning=True,
+        runbook_freshness_ttl_days=90,
+        allow_drill_cooldown_reset=True,
+        slack_allowed_approvers=("U_SRE_LEAD",),
+    )
+    store = InMemoryEventStoreBackend()
+    guardrails = IncidentGuardrailManager(settings, store)
+    k8s = FakeK8sExecutor()
+    probe_rate = [0.001]
+    remediation = SafeRemediationService(settings, k8s, post_error_rate_probe=lambda _ns, _svc: probe_rate[0])
+    kb = LocalJsonlKnowledgeBase(REPO_ROOT / "bigquery" / "seed_runbooks_100.jsonl", freshness_ttl_days=90)
+
+    async def _kb_analyzer(
+        alert: AlertEvent,
+        _stats: SandboxMetricsAnalysis,
+        matches: list[SimilarRunbookMatch],
+    ) -> TriageDecision:
+        top = matches[0]
+        if top.similarity_score >= settings.auto_remediate_similarity_threshold:
+            return TriageDecision(
+                decision=top.recommended_action,
+                remediation_type=top.remediation_type,
+                target_namespace=alert.namespace,
+                target_deployment=alert.service_name,
+                matched_runbook_id=top.runbook_id,
+                similarity_score=top.similarity_score,
+                root_cause_hypothesis=top.root_cause,
+                rationale=f"過去事例 {top.runbook_id} と一致。",
+            )
+        return TriageDecision(
+            decision="REQUIRE_APPROVAL",
+            remediation_type="RESTART_DEPLOYMENT",
+            target_namespace=alert.namespace,
+            target_deployment=alert.service_name,
+            matched_runbook_id=top.runbook_id,
+            similarity_score=top.similarity_score,
+            root_cause_hypothesis="インメモリ税率キャッシュ CRC32 不整合",
+            rationale="初見エラーのため承認後に再起動を提案します。",
+        )
+
+    orchestrator = SreIncidentOrchestrator(
+        settings=settings,
+        sandbox_runner=SandboxRunner(settings),
+        knowledge_base=kb,
+        guardrail_manager=guardrails,
+        remediation_service=remediation,
+        decision_analyzer=_kb_analyzer,
+        runbook_synthesizer=_fast_det_synthesizer,
+        session_service=DatabaseSessionService(db_url=settings.session_db_url),
+    )
+    coordinator = SlackHitlCoordinator(settings, orchestrator)
+
+    def _make_tax_alert(inc_id: str) -> AlertEvent:
+        return AlertEvent(
+            incident_id=inc_id,
+            error_code="TAX_RULE_CRC32_MISMATCH_500",
+            summary="RuntimeError: In-memory consumption tax rate lookup table CRC32 checksum mismatch",
+            error_rate_series=[0.20, 0.85, 0.93, 0.95],
+            recent_deployment_within_30m=False,
+        )
+
+    # 1. 初回承認で AUTO-* が登録される (verified_age_days=0.0, verified_count=1)
+    r1 = await orchestrator.handle_alert(_make_tax_alert("FRESH-1"))
+    await coordinator.notify_workflow_result(r1)
+    out1 = await coordinator.process_approval_decision(incident_id="FRESH-1", slack_user_id="U_SRE_LEAD", approved=True)
+    auto_id = out1.learned_runbook_id
+    assert auto_id is not None
+    rec1 = kb.get_runbook_record(auto_id)
+    assert rec1 is not None and rec1["verified_age_days"] == 0.0 and rec1["verified_count"] == 1
+
+    # 2. 120日経過に擬似老化させて再注入 -> 類似度 >= 0.85 だが鮮度切れで REQUIRE_APPROVAL へ強制降格！
+    kb.set_runbook_age_days(auto_id, 120.0)
+    guardrails.reset_all_cooldowns("Age to 120d")
+    r2 = await orchestrator.handle_alert(_make_tax_alert("FRESH-2-STALE"))
+    assert r2.paused_for_approval is True
+    assert r2.decision.decision == "REQUIRE_APPROVAL"
+    assert r2.decision.stale_revalidation_required is True
+    assert r2.decision.matched_runbook_age_days == pytest.approx(120.0)
+    approval_blocks_str = str(build_approval_request_blocks(r2))
+    assert "鮮度期限切れ再評価" in approval_blocks_str
+    assert "120日前" in approval_blocks_str
+
+    # 3. 人間が再承認 (Approve) -> 処置実行＋回復確認 OK により last_verified_at が 0.0 日前にリフレッシュされる！
+    await coordinator.notify_workflow_result(r2)
+    out2 = await coordinator.process_approval_decision(
+        incident_id="FRESH-2-STALE",
+        slack_user_id="U_SRE_LEAD",
+        approved=True,
+    )
+    assert out2.executed is True
+    assert out2.refreshed_runbook_id == auto_id
+    rec2 = kb.get_runbook_record(auto_id)
+    assert rec2 is not None and rec2["verified_age_days"] == 0.0 and rec2["verified_count"] == 2
+
+    # 4. 鮮度回復後の再発 -> 人間承認なしで AUTO_REMEDIATE が直行実行され verified_count が 3 に増える！
+    guardrails.reset_all_cooldowns("Fresh again")
+    r3 = await orchestrator.handle_alert(_make_tax_alert("FRESH-3-AUTO"))
+    assert r3.paused_for_approval is False
+    assert r3.decision.decision == "AUTO_REMEDIATE"
+    assert r3.outcome is not None and r3.outcome.refreshed_runbook_id == auto_id
+    rec3 = kb.get_runbook_record(auto_id)
+    assert rec3 is not None and rec3["verified_count"] == 3
+
+    # 5. 再び 150日経過後に人間が Reject した場合 -> Runbook 自体が REQUIRE_APPROVAL へ恒久降格される！
+    kb.set_runbook_age_days(auto_id, 150.0)
+    guardrails.reset_all_cooldowns("Age to 150d then reject")
+    r4 = await orchestrator.handle_alert(_make_tax_alert("FRESH-4-REJECT"))
+    assert r4.paused_for_approval is True
+    await coordinator.notify_workflow_result(r4)
+    out4 = await coordinator.process_approval_decision(
+        incident_id="FRESH-4-REJECT",
+        slack_user_id="U_SRE_LEAD",
+        approved=False,
+    )
+    assert out4.action_status == "REJECTED"
+    assert out4.demoted_runbook_id == auto_id
+    rec4 = kb.get_runbook_record(auto_id)
+    assert rec4 is not None and rec4["recommended_action"] == "REQUIRE_APPROVAL"
+
+    # 6. 既存の鮮度内 AUTO_REMEDIATE (INC-001) でも事後検証 NG (エラー率残存) の場合は自動で REQUIRE_APPROVAL へ降格される！
+    guardrails.reset_all_cooldowns("Post probe failure demotion")
+    probe_rate[0] = 0.45  # エラー率 45% 残存 = 事後検証 NG
+    r5 = await orchestrator.handle_alert(
+        AlertEvent(
+            incident_id="FRESH-5-PROBE-NG",
+            error_code="CONFIG_KEY_ERROR_500",
+            summary="KeyError: PAYMENT_CURRENCY_PRECISION missing after deployment rollout",
+            error_rate_series=[0.10, 0.88, 0.92],
+            recent_deployment_within_30m=True,
+        )
+    )
+    assert r5.decision.decision == "AUTO_REMEDIATE"
+    assert r5.outcome is not None and r5.outcome.verification_passed is False
+    assert r5.outcome.demoted_runbook_id == "INC-001"
+    inc001 = kb.get_runbook_record("INC-001")
+    assert inc001 is not None and inc001["recommended_action"] == "REQUIRE_APPROVAL"
+
+
+@pytest.mark.asyncio
+async def test_slack_button_click_immediately_updates_to_in_progress_and_restores_on_error(tmp_path: Path) -> None:
+    """ボタン押下直後に『⏳ 承認受付・実行中...』(ボタン消去) へ更新し、完了時に最終更新・例外時にボタン復元すること。"""
+    from types import SimpleNamespace
+
+    db_file = tmp_path / "ux_progress.db"
+    settings = AgentSettings(
+        sandbox_mode="local_subprocess",
+        session_backend="sqlite",
+        session_db_url=f"sqlite+aiosqlite:///{db_file}",
+        slack_channel_id="C_TEST_CH",
+        slack_allowed_approvers=("U_SRE_LEAD",),
+    )
+    store = InMemoryEventStoreBackend()
+    guardrails = IncidentGuardrailManager(settings, store)
+    k8s = FakeK8sExecutor()
+    remediation = SafeRemediationService(settings, k8s, post_error_rate_probe=lambda _ns, _svc: 0.0)
+    kb = LocalJsonlKnowledgeBase(REPO_ROOT / "bigquery" / "seed_runbooks_100.jsonl")
+
+    orchestrator = SreIncidentOrchestrator(
+        settings=settings,
+        sandbox_runner=SandboxRunner(settings),
+        knowledge_base=kb,
+        guardrail_manager=guardrails,
+        remediation_service=remediation,
+        decision_analyzer=_approval_required_restart_analyzer,
+        runbook_synthesizer=_fast_det_synthesizer,
+        session_service=DatabaseSessionService(db_url=settings.session_db_url),
+    )
+    coordinator = SlackHitlCoordinator(settings, orchestrator)
+
+    chat_updates: list[dict] = []
+
+    class _FakeSlackClient:
+        async def chat_postMessage(self, **kwargs):  # noqa: ANN003, N802
+            return {"channel": "C_TEST_CH", "ts": "1700000000.000100"}
+
+        async def chat_update(self, **kwargs):  # noqa: ANN003
+            # chat_update 呼び出し時点での GKE 再起動回数も一緒に記録し、実行『前』に1回目が呼ばれたことを証明する
+            chat_updates.append({"kwargs": kwargs, "restarts_at_call_time": len(k8s.restarts)})
+            return {"ok": True}
+
+    coordinator._bolt_app = SimpleNamespace(client=_FakeSlackClient())  # type: ignore[assignment]
+
+    # 1. 正常系: 1回目 chat_update (restarts=0, ⏳ 承認受付・実行中..., actions なし) -> 2回目 chat_update (restarts=1, ✅ 承認・実行完了)
+    res_ok = await orchestrator.handle_alert(
+        AlertEvent(incident_id="UX-OK-1", summary="Restart test", error_rate_series=[0.4, 0.5])
+    )
+    await coordinator.notify_workflow_result(res_ok)
+    await coordinator.process_approval_decision(incident_id="UX-OK-1", slack_user_id="U_SRE_LEAD", approved=True)
+
+    assert len(chat_updates) == 2
+    first_blocks = chat_updates[0]["kwargs"]["blocks"]
+    assert chat_updates[0]["restarts_at_call_time"] == 0
+    assert "⏳ 承認受付・実行中..." in str(first_blocks)
+    assert all(b.get("type") != "actions" for b in first_blocks)
+
+    second_blocks = chat_updates[1]["kwargs"]["blocks"]
+    assert chat_updates[1]["restarts_at_call_time"] == 1
+    assert "✅ 承認・実行完了" in str(second_blocks)
+
+    # 2. 異常系: resume_from_approval が一時例外を送出した場合、チケット解放と同時に承認ボタン付きカードへ復元されること
+    chat_updates.clear()
+    res_err = await orchestrator.handle_alert(
+        AlertEvent(incident_id="UX-ERR-2", summary="Transient error test", error_rate_series=[0.4, 0.5])
+    )
+    await coordinator.notify_workflow_result(res_err)
+
+    orig_resume = orchestrator.resume_from_approval
+
+    async def _failing_resume(**_kw):  # noqa: ANN003
+        raise RuntimeError("Transient network timeout")
+
+    orchestrator.resume_from_approval = _failing_resume  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RuntimeError, match="Transient network timeout"):
+            await coordinator.process_approval_decision(
+                incident_id="UX-ERR-2",
+                slack_user_id="U_SRE_LEAD",
+                approved=True,
+            )
+    finally:
+        orchestrator.resume_from_approval = orig_resume  # type: ignore[method-assign]
+
+    assert len(chat_updates) == 2
+    assert "⏳ 承認受付・実行中..." in str(chat_updates[0]["kwargs"]["blocks"])
+    restored_blocks = chat_updates[1]["kwargs"]["blocks"]
+    assert any(b.get("type") == "actions" for b in restored_blocks)
+
+
 
 

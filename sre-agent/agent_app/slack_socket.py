@@ -47,12 +47,20 @@ def build_report_blocks(result: WorkflowRunResult) -> list[dict[str, Any]]:
     out = result.outcome
     if dec.decision == "AUTO_REMEDIATE" and out and not out.verification_passed:
         badge = "🚨 自動復旧未回復・要オンコール対応 (事後検証 NG)"
+    elif dec.decision == "REQUIRE_APPROVAL" and dec.stale_revalidation_required:
+        badge = "⏳ 承認待機・鮮度期限切れ再評価 (REQUIRE_APPROVAL)"
     else:
         badge = {
             "OBSERVE": "🟢 静観 (OBSERVE - 一過性エラーのため変更なし)",
             "AUTO_REMEDIATE": "🛠️ 自動復旧完了 (AUTO_REMEDIATE)",
             "REQUIRE_APPROVAL": "🟠 承認待機 (REQUIRE_APPROVAL)",
         }[dec.decision]
+
+    age_suffix = (
+        f" / 最終検証 `{dec.matched_runbook_age_days:.0f}日前`"
+        if dec.matched_runbook_id != "NONE" and dec.matched_runbook_age_days >= 0.0
+        else ""
+    )
 
     blocks: list[dict[str, Any]] = [
         {
@@ -66,7 +74,7 @@ def build_report_blocks(result: WorkflowRunResult) -> list[dict[str, Any]]:
                 {"type": "mrkdwn", "text": f"*対象:*\n`{dec.target_namespace}/{dec.target_deployment}`"},
                 {
                     "type": "mrkdwn",
-                    "text": f"*類似過去事例:*\n`{dec.matched_runbook_id}` (類似度 `{dec.similarity_score:.2f}`)",
+                    "text": f"*類似過去事例:*\n`{dec.matched_runbook_id}` (類似度 `{dec.similarity_score:.2f}`{age_suffix})",
                 },
                 {"type": "mrkdwn", "text": f"*操作種別:*\n`{dec.remediation_type}`"},
             ],
@@ -83,6 +91,45 @@ def build_report_blocks(result: WorkflowRunResult) -> list[dict[str, Any]]:
             },
         },
     ]
+    if dec.stale_revalidation_required:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": (
+                            "⏳ *Runbook 鮮度再評価:* 一致した過去手順は最終検証から長期間経過しているため、無断自動実行を一時停止しました。"
+                            "手順が現在も有効であれば *Approve & Execute* で実行・鮮度更新、陳腐化していれば *Reject* で自動実行対象から除外します。"
+                        ),
+                    }
+                ],
+            }
+        )
+    if out and out.refreshed_runbook_id:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"🔄 *Runbook 鮮度更新:* `{out.refreshed_runbook_id}` の `last_verified_at` を現在時刻へ更新しました。",
+                    }
+                ],
+            }
+        )
+    if out and out.demoted_runbook_id:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"🔒 *自動実行凍結:* `{out.demoted_runbook_id}` の推奨区分を `REQUIRE_APPROVAL` へ自動降格しました。",
+                    }
+                ],
+            }
+        )
     if dec.anti_pattern_warning:
         blocks.append(
             {
@@ -233,6 +280,45 @@ class SlackHitlCoordinator:
 
         self._pending.pop(incident_id, None)
 
+        # ボタン押下直後（< 0.5秒）にボタンを消去して「承認受付・実行中...」へ即時更新し、二度押しと待機不安を防ぐ
+        if self._bolt_app and ticket.channel_id and ticket.message_ts:
+            if approved:
+                progress_label = "⏳ 承認受付・実行中..."
+                if ticket.decision.remediation_type in ("ROLLBACK_DEPLOYMENT", "RESTART_DEPLOYMENT"):
+                    progress_detail = (
+                        f"`{ticket.decision.remediation_type}` の実行と事後エラー率プローブ検証を行っています"
+                        "（完了まで約 30〜45 秒かかります。完了次第このカードが自動更新されます）..."
+                    )
+                else:
+                    progress_detail = "オンコール引き継ぎの監査記録と Runbook 鮮度更新を実行しています..."
+            else:
+                progress_label = "⏳ 却下受付・手動対応へ切替中..."
+                progress_detail = "自動処置を中止し、監査ログおよび知識ベースの更新を実行しています..."
+
+            await self._bolt_app.client.chat_update(
+                channel=ticket.channel_id,
+                ts=ticket.message_ts,
+                text=f"[{incident_id}] {progress_label} by <@{slack_user_id}>",
+                blocks=[
+                    {
+                        "type": "header",
+                        "text": {"type": "plain_text", "text": f"SRE Agent Report [{incident_id}]"},
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": (
+                                f"*{progress_label}* (操作者: <@{slack_user_id}>)\n"
+                                f"*対象:* `{ticket.decision.target_namespace}/{ticket.decision.target_deployment}`  |  "
+                                f"*操作種別:* `{ticket.decision.remediation_type}`\n"
+                                f"*進行状況:* {progress_detail}"
+                            ),
+                        },
+                    },
+                ],
+            )
+
         try:
             outcome = await self._orchestrator.resume_from_approval(
                 alert=ticket.alert,
@@ -243,8 +329,30 @@ class SlackHitlCoordinator:
                 approved=approved,
                 approver_id=slack_user_id,
             )
-        except Exception:
+        except Exception as exc:
             await self._ticket_store.release_ticket(incident_id)
+            if self._bolt_app and ticket.channel_id and ticket.message_ts:
+                restore_blocks = build_approval_request_blocks(
+                    WorkflowRunResult(
+                        alert=ticket.alert,
+                        session_id=ticket.session_id,
+                        invocation_id=ticket.invocation_id,
+                        decision=ticket.decision,
+                        paused_for_approval=True,
+                        confirmation_call_id=ticket.confirmation_call_id,
+                        outcome=RemediationOutcome(
+                            executed=False,
+                            action_status="AWAITING_APPROVAL",
+                            detail_message=f"⚠️ 再開処理中に一時エラーが発生したため承認待ち状態へ戻しました: {exc}",
+                        ),
+                    )
+                )
+                await self._bolt_app.client.chat_update(
+                    channel=ticket.channel_id,
+                    ts=ticket.message_ts,
+                    text=f"[{incident_id}] 承認待ち状態へ復元しました",
+                    blocks=restore_blocks,
+                )
             raise
 
         await self._ticket_store.delete_ticket(incident_id)
@@ -257,11 +365,27 @@ class SlackHitlCoordinator:
                 if outcome.learned_runbook_id
                 else ""
             )
+            refresh_note = (
+                f"\n🔄 *Runbook 鮮度更新:* `{outcome.refreshed_runbook_id}` の `last_verified_at` を現在時刻へ更新しました"
+                f"（今後 {self._settings.runbook_freshness_ttl_days} 日間有効）"
+                if outcome.refreshed_runbook_id
+                else ""
+            )
+            demote_note = (
+                f"\n🔒 *自動実行凍結:* `{outcome.demoted_runbook_id}` の推奨区分を `REQUIRE_APPROVAL` へ降格しました"
+                "（今後の無断自動実行を抑止）"
+                if outcome.demoted_runbook_id
+                else ""
+            )
             await self._bolt_app.client.chat_update(
                 channel=ticket.channel_id,
                 ts=ticket.message_ts,
                 text=f"[{incident_id}] {action_label} by <@{slack_user_id}>",
                 blocks=[
+                    {
+                        "type": "header",
+                        "text": {"type": "plain_text", "text": f"SRE Agent Report [{incident_id}]"},
+                    },
                     {
                         "type": "section",
                         "text": {
@@ -270,10 +394,10 @@ class SlackHitlCoordinator:
                                 f"*{action_label}* (操作者: <@{slack_user_id}>)\n"
                                 f"*対象:* `{ticket.decision.target_namespace}/{ticket.decision.target_deployment}`\n"
                                 f"*結果:* {outcome.detail_message}"
-                                f"{kb_note}"
+                                f"{kb_note}{refresh_note}{demote_note}"
                             ),
                         },
-                    }
+                    },
                 ],
             )
         return outcome

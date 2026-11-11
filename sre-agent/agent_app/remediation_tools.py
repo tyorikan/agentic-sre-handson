@@ -77,33 +77,62 @@ class GkeAppsV1RemediationExecutor:
         return k8s_client.AppsV1Api(k8s_client.ApiClient(cfg))
 
     def has_recent_deployment(self, namespace: str, deployment_name: str, *, within_minutes: int = 30) -> bool:
-        """直近 within_minutes 以内に新しいロールアウト (revision >= 2) が発生したか確認する。"""
+        """直近 within_minutes 以内に新しいリリースのロールアウトが発生したか確認する。
+
+        自動ロールバック（古い正常 ReplicaSet の再有効化）や `restartedAt` による
+        ローリング再起動は「新規コードリリースの混入」ではないため False として区別する。
+        """
         apps_v1 = self._build_apps_v1_client()
         dep = apps_v1.read_namespaced_deployment(name=deployment_name, namespace=namespace)
         dep_uid = getattr(dep.metadata, "uid", None)
-        match_labels = dep.spec.selector.match_labels or {}
+        dep_annotations = (dep.metadata.annotations or {}) if dep.metadata else {}
+        change_cause = dep_annotations.get("kubernetes.io/change-cause", "")
+        if change_cause.startswith("SRE-Agent Automated"):
+            return False
+
+        match_labels = (dep.spec.selector.match_labels or {}) if dep.spec and dep.spec.selector else {}
         label_selector = ",".join(f"{k}={v}" for k, v in match_labels.items())
-        rs_list = apps_v1.list_namespaced_replica_set(namespace=namespace, label_selector=label_selector).items
+        raw_rs_list = apps_v1.list_namespaced_replica_set(namespace=namespace, label_selector=label_selector).items
+        owned_rs = [
+            rs
+            for rs in raw_rs_list
+            if not (dep_uid and rs.metadata and rs.metadata.owner_references)
+            or any(ref.uid == dep_uid for ref in rs.metadata.owner_references)
+        ]
+
+        def _rev(rs: k8s_client.V1ReplicaSet) -> int:
+            ann = ((rs.metadata.annotations or {}) if rs.metadata else {}).get("deployment.kubernetes.io/revision", "0")
+            return int(ann) if ann.isdigit() else 0
+
+        active_rs_list = [rs for rs in owned_rs if (rs.spec.replicas or 0) > 0]
+        if not active_rs_list:
+            return False
+
+        active_rs = max(active_rs_list, key=_rev)
+        if _rev(active_rs) < 2:
+            return False
+
+        tpl_meta = (
+            active_rs.spec.template.metadata
+            if active_rs.spec and active_rs.spec.template and active_rs.spec.template.metadata
+            else None
+        )
+        tpl_annotations = (tpl_meta.annotations or {}) if tpl_meta else {}
+        if tpl_annotations.get("kubectl.kubernetes.io/restartedAt"):
+            return False
 
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=within_minutes)
-        dep_ann = (dep.metadata.annotations or {}).get("deployment.kubernetes.io/revision", "0")
-        dep_rev = int(dep_ann) if dep_ann.isdigit() else 0
-        if dep_rev >= 2 and dep.status and dep.status.conditions:
-            for cond in dep.status.conditions:
-                if cond.type == "Progressing" and cond.last_update_time and cond.last_update_time >= cutoff:
-                    return True
+        active_created = active_rs.metadata.creation_timestamp if active_rs.metadata else None
+        if active_created is None or active_created < cutoff:
+            return False
 
-        for rs in rs_list:
-            if dep_uid and rs.metadata.owner_references:
-                if not any(ref.uid == dep_uid for ref in rs.metadata.owner_references):
-                    continue
-            ann = (rs.metadata.annotations or {}).get("deployment.kubernetes.io/revision", "0")
-            rev = int(ann) if ann.isdigit() else 0
-            replicas = rs.spec.replicas or 0
-            created = rs.metadata.creation_timestamp
-            if rev >= 2 and replicas > 0 and created is not None and created >= cutoff:
-                return True
-        return False
+        # 稼働中 RS よりも後に作成された縮退済み RS が存在する場合はロールバック済み状態とみなす
+        for rs in owned_rs:
+            if (rs.spec.replicas or 0) == 0 and rs.metadata and rs.metadata.creation_timestamp:
+                if rs.metadata.creation_timestamp > active_created:
+                    return False
+
+        return True
 
     def wait_deployment_ready(
         self,
@@ -161,8 +190,34 @@ class GkeAppsV1RemediationExecutor:
         labels = template_dict.get("metadata", {}).get("labels", {})
         labels.pop("pod-template-hash", None)
 
-        patch_body = [{"op": "replace", "path": "/spec/template", "value": template_dict}]
-        apps_v1.patch_namespaced_deployment(name=deployment_name, namespace=namespace, body=patch_body)
+        patch_ops: list[dict[str, object]] = [
+            {"op": "replace", "path": "/spec/template", "value": template_dict},
+        ]
+        rollback_cause = f"SRE-Agent Automated Rollback to revision {previous_rev}"
+        if dep.metadata and dep.metadata.annotations is not None:
+            patch_ops.append(
+                {
+                    "op": "add",
+                    "path": "/metadata/annotations/kubernetes.io~1change-cause",
+                    "value": rollback_cause,
+                }
+            )
+            if "kubectl.kubernetes.io/last-applied-configuration" in dep.metadata.annotations:
+                patch_ops.append(
+                    {
+                        "op": "remove",
+                        "path": "/metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration",
+                    }
+                )
+        else:
+            patch_ops.append(
+                {
+                    "op": "add",
+                    "path": "/metadata/annotations",
+                    "value": {"kubernetes.io/change-cause": rollback_cause},
+                }
+            )
+        apps_v1.patch_namespaced_deployment(name=deployment_name, namespace=namespace, body=patch_ops)
         return (
             f"Deployment {namespace}/{deployment_name} を revision {current_rev} から "
             f"直前の正常 revision {previous_rev} ({previous_rs.metadata.name}) へロールバックしました。"

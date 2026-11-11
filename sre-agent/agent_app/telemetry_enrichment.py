@@ -45,15 +45,13 @@ def compute_error_rate_series_from_logs(
         if severity.upper() in ERROR_SEVERITIES:
             errors[idx] += 1
 
-    # 先頭のログ未発生バケットを除外しつつ、中間〜末尾の通信実績バケットは保持する
+    # 無通信バケット (total == 0) は「エラー率 0% の正常通信」とは異なるため除外し、
+    # 実トラフィックが発生したバケットのエラー率推移のみを返す
     rates: list[float] = []
-    started = False
     for total, err in zip(totals, errors):
-        if total == 0 and not started:
+        if total == 0:
             continue
-        started = True
-        rate = round(err / total, 4) if total > 0 else 0.0
-        rates.append(rate)
+        rates.append(round(err / total, 4))
     return rates
 
 

@@ -33,12 +33,15 @@ CREATE OR REPLACE TABLE `sre_agent_ops.incident_runbooks_raw` (
   remediation_steps STRING NOT NULL OPTIONS (description = '具体的な復旧手順または承認後の作業内容'),
   anti_patterns STRING NOT NULL OPTIONS (description = '絶対に実行してはいけない誤対応とその技術的理由'),
   verification_check STRING NOT NULL OPTIONS (description = '処置後に回復したと判定するための確認指標'),
-  historical_mttr_minutes INT64 NOT NULL OPTIONS (description = '過去発生時の平均復旧時間（分）')
+  historical_mttr_minutes INT64 NOT NULL OPTIONS (description = '過去発生時の平均復旧時間（分）'),
+  verified_age_days INT64 NOT NULL OPTIONS (description = 'シードデータ投入時点からの最終検証経過日数（鮮度TTL検証用）')
 );
 
--- 2. 自律埋め込み生成（Autonomous Embedding Generation）有効化の過去インシデント知識ベース表
+-- 2. 自律埋め込み生成（Autonomous Embedding Generation）＋鮮度ライフサイクル管理付きの過去インシデント知識ベース表
 --    search_document 列に行が追加・更新されると、BigQuery がバックグラウンドで自動的に
 --    gemini-embedding-2 エンドポイントを呼び出して embedding 列を生成・維持します。
+--    なお last_verified_at / verified_count / recommended_action のみを UPDATE する際は
+--    search_document が不変のためベクトル再生成は走らず、検索空白ゼロで即座に更新されます。
 CREATE TABLE IF NOT EXISTS `sre_agent_ops.incident_runbooks` (
   runbook_id STRING NOT NULL,
   category STRING NOT NULL,
@@ -55,6 +58,10 @@ CREATE TABLE IF NOT EXISTS `sre_agent_ops.incident_runbooks` (
   verification_check STRING NOT NULL,
   historical_mttr_minutes INT64 NOT NULL,
   search_document STRING NOT NULL OPTIONS (description = 'AI.EMBED が自動ベクトル化する統合検索テキスト'),
+  created_at TIMESTAMP OPTIONS (description = 'Runbook 初回登録日時 (UTC)'),
+  last_verified_at TIMESTAMP OPTIONS (description = '直近の自動復旧成功または人間再承認により有効性が実証された日時 (UTC)'),
+  verified_count INT64 OPTIONS (description = '有効性が実証された累計回数'),
+  lifecycle_status STRING OPTIONS (description = 'ライフサイクル状態: ACTIVE (有効) | DEPRECATED (廃止・検索除外)'),
   embedding STRUCT<result ARRAY<FLOAT64>, status STRING>
     GENERATED ALWAYS AS (
       AI.EMBED(

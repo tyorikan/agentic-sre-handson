@@ -19,13 +19,13 @@ flowchart LR
     Alert["アラート・異常ログ検知<br/>Pub/Sub ストリーム受信"] --> Dedup{"クールダウン判定<br/>直近15分以内か?"}
     Dedup -->|"はい"| Skip["重複排除スキップ<br/>LLM 呼び出し 0 回"]
     Dedup -->|"いいえ"| Parallel["テレメトリ補完 & 並列診断<br/>1. ログ時系列エラー率・デプロイ履歴補完<br/>2. 隔離 sandbox 減衰傾き計算<br/>3. BigQuery 過去障害100件照合 + 公式 MCP"]
-    Parallel --> Guard{"安全ガードレール検証<br/>許可NS・類似度・回数上限"}
+    Parallel --> Guard{"安全ガードレール検証<br/>許可NS・類似度・鮮度90日・回数上限"}
 
     Guard -->|"一過性エラー・自然減衰中"| S1["シナリオ 1: 静観 OBSERVE<br/>操作せず Slack へ根拠通知"]
-    Guard -->|"既知バグ 類似度>=0.85<br/>かつ 1時間以内初回"| S2["シナリオ 2: 自動復旧 AUTO_REMEDIATE<br/>Deployment ロールバック実行<br/>+ エラー率 < 1.0% 回復確認"]
-    Guard -->|"未知の DB 障害 / 低確信度<br/>または回数上限到達"| S3["シナリオ 3: 人間承認待ち REQUIRE_APPROVAL<br/>Firestore 保存・ADK 一時停止<br/>Slack Approve / Reject ボタン送信"]
-    S3 -->|"Approve 押下"| Resume["ADK 再開・処置実行<br/>初見回復時は BigQuery へ自動ナレッジ昇格"]
-    S3 -->|"Reject 押下"| Manual["手動調査へ引き継ぎ"]
+    Guard -->|"既知バグ 類似度>=0.85<br/>鮮度90日内 & 1時間初回"| S2["シナリオ 2: 自動復旧 AUTO_REMEDIATE<br/>Deployment ロールバック実行<br/>+ 回復確認 < 1.0%・鮮度更新"]
+    Guard -->|"未知の障害 / 鮮度90日超過<br/>または回数上限到達"| S3["シナリオ 3・4: 人間承認待ち REQUIRE_APPROVAL<br/>Firestore 保存・ADK 一時停止<br/>Slack Approve / Reject ボタン送信"]
+    S3 -->|"Approve 押下"| Resume["ADK 再開・処置実行<br/>初見は自動ナレッジ昇格 / 既知は鮮度復活"]
+    S3 -->|"Reject 押下"| Manual["手動調査へ引継 & 承認制へ自動降格"]
 
     classDef base fill:#ffffff,stroke:#4285F4,stroke-width:1.5px,color:#202124;
     classDef mute fill:#f8f9fa,stroke:#9aa0a6,stroke-width:1.5px,color:#202124;
@@ -93,6 +93,7 @@ flowchart LR
 | `roles/datastore.owner` | 第 0 章：Firestore `(default)` Native データベースの作成 |
 | `roles/artifactregistry.admin` | 第 1・6 章：コンテナイメージ用リポジトリの作成・削除 |
 | `roles/cloudbuild.builds.editor` / `roles/storage.admin` | 第 1・5 章：`gcloud builds submit` によるソース転送とコンテナビルド |
+| `roles/compute.networkAdmin` | 第 1・6 章：専用カスタム VPC・サブネット・Cloud NAT の作成と削除 |
 | `roles/container.admin` | 第 1・5・6 章：GKE Autopilot 作成・削除、`Role` / `RoleBinding` 作成、権限検証 |
 | `roles/pubsub.admin` | 第 1・6 章：トピック・サブスクリプション作成、Log Sink Writer への権限付与 |
 | `roles/logging.admin` | 第 1・5・6 章：Cloud Logging エラーシンク作成・削除、エージェント構造化ログ閲覧 |
@@ -114,6 +115,7 @@ for ROLE in \
   roles/artifactregistry.admin \
   roles/cloudbuild.builds.editor \
   roles/storage.admin \
+  roles/compute.networkAdmin \
   roles/container.admin \
   roles/pubsub.admin \
   roles/logging.admin \
@@ -150,6 +152,7 @@ GKE、Cloud Run、BigQuery、Firestore、Pub/Sub、Observability、Artifact Regi
 
 ```bash
 gcloud services enable \
+  compute.googleapis.com \
   container.googleapis.com \
   run.googleapis.com \
   bigquery.googleapis.com \
@@ -173,19 +176,68 @@ if ! gcloud firestore databases describe --database="(default)" --project="${GOO
 fi
 ```
 
-### Step 2.3 常駐 SRE エージェント専用のサービスアカウント作成
+### Step 2.3 最小権限で分離した 3 つの専用サービスアカウント作成
 
-プロジェクト Owner のような過剰な権限は付与せず、ログ・メトリクス閲覧、リモート MCP 呼び出し（`roles/mcp.toolUser`）、BigQuery 読み書き、Firestore 読み書き（`roles/datastore.user`）、Pub/Sub 購読、モデル推論、および GKE API 到達に必要な最小ロールのみを付与します（GKE 内の具体的な操作範囲は次の第 1 章で Kubernetes RBAC により `sre-demo-app` Namespace のみに絞り込みます）。
+新規組織で既定の Compute Engine サービスアカウントが無効化・権限削除されている環境でもそのまま動作し、かつ過剰な権限（`roles/editor` 等）を一切使わないよう、用途別に以下の **3 つの専用サービスアカウント** を作成します。
+
+1. **`sre-cloudbuild-sa`**（コンテナビルド専用）：ソースアーカイブ読取・Artifact Registry への Push・ビルドログ出力のみ
+2. **`sre-gke-node-sa`**（監視対象 GKE Autopilot ノード専用）：ノードからのログ・メトリクス送信と Artifact Registry からのイメージ Pull のみ
+3. **`sre-autonomous-agent-sa`**（常駐 SRE エージェント専用）：観測読取、リモート MCP 呼び出し、BigQuery・Firestore 読み書き、Pub/Sub 購読、モデル推論、GKE クラスタ到達のみ（GKE 内の具体的な変更範囲は第 1 章の Kubernetes RBAC で `sre-demo-app` Namespace のみに絞り込みます）
 
 ```bash
+export SRE_BUILD_SA_NAME="sre-cloudbuild-sa"
+export SRE_BUILD_SA_EMAIL="${SRE_BUILD_SA_NAME}@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com"
+export GKE_NODE_SA_NAME="sre-gke-node-sa"
+export GKE_NODE_SA_EMAIL="${GKE_NODE_SA_NAME}@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com"
 export SRE_AGENT_SA_NAME="sre-autonomous-agent-sa"
 export SRE_AGENT_SA_EMAIL="${SRE_AGENT_SA_NAME}@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com"
+
+gcloud iam service-accounts create "${SRE_BUILD_SA_NAME}" \
+  --display-name="Cloud Build Least-Privilege SA" \
+  --project="${GOOGLE_CLOUD_PROJECT}"
+
+gcloud iam service-accounts create "${GKE_NODE_SA_NAME}" \
+  --display-name="GKE Autopilot Node Least-Privilege SA" \
+  --project="${GOOGLE_CLOUD_PROJECT}"
 
 gcloud iam service-accounts create "${SRE_AGENT_SA_NAME}" \
   --display-name="Autonomous SRE Agent Service Account" \
   --project="${GOOGLE_CLOUD_PROJECT}"
 
-for ROLE in \
+# SA 作成直後の IAM 伝播待ち（数秒以内に連続実行すると does not exist になる場合があるため待機＋リトライ）
+sleep 10
+
+grant_roles() {
+  local sa_email="$1"
+  shift
+  for role in "$@"; do
+    for attempt in 1 2 3 4 5; do
+      if gcloud projects add-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
+        --member="serviceAccount:${sa_email}" \
+        --role="${role}" \
+        --condition=None \
+        --quiet >/dev/null; then
+        break
+      fi
+      echo "IAM 伝播待機中 (${sa_email} -> ${role}, attempt=${attempt})..."
+      sleep 5
+    done
+  done
+}
+
+# 1. Cloud Build 専用 SA への最小ロール付与
+grant_roles "${SRE_BUILD_SA_EMAIL}" \
+  roles/storage.objectViewer \
+  roles/artifactregistry.writer \
+  roles/logging.logWriter
+
+# 2. GKE Autopilot ノード専用 SA への最小ロール付与
+grant_roles "${GKE_NODE_SA_EMAIL}" \
+  roles/container.defaultNodeServiceAccount \
+  roles/artifactregistry.reader
+
+# 3. 常駐 SRE エージェント専用 SA への最小ロール付与
+grant_roles "${SRE_AGENT_SA_EMAIL}" \
   roles/monitoring.viewer \
   roles/logging.viewer \
   roles/mcp.toolUser \
@@ -197,13 +249,7 @@ for ROLE in \
   roles/pubsub.subscriber \
   roles/aiplatform.user \
   roles/container.clusterViewer \
-  roles/secretmanager.secretAccessor; do
-  gcloud projects add-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
-    --member="serviceAccount:${SRE_AGENT_SA_EMAIL}" \
-    --role="${ROLE}" \
-    --condition=None \
-    --quiet
-done
+  roles/secretmanager.secretAccessor
 ```
 
 ### 動作確認

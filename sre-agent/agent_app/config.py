@@ -44,6 +44,9 @@ class AgentSettings:
     enable_autonomous_kb_learning: bool = field(
         default_factory=lambda: _parse_bool(os.getenv("ENABLE_AUTONOMOUS_KB_LEARNING", "true"))
     )
+    runbook_freshness_ttl_days: int = field(
+        default_factory=lambda: int(os.getenv("RUNBOOK_FRESHNESS_TTL_DAYS", "90"))
+    )
 
     # GKE クラスタと復旧操作の安全境界
     gke_cluster_name: str = field(default_factory=lambda: os.getenv("GKE_CLUSTER_NAME", "sre-demo-cluster"))

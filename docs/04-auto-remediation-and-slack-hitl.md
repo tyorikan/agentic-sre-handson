@@ -65,14 +65,14 @@ flowchart TD
     S --> P2["@node: search_similar_incidents<br/>BigQuery AI.SEARCH 上位3件照合"]
     P1 & P2 --> J["JoinNode: join_diagnostics<br/>両方の診断完了を待機・合流"]
     J --> LLM["@node: correlate_and_decide<br/>gemini-3.8-flash + 公式リモート MCP<br/>TriageDecision 構造化出力"]
-    LLM --> Router["@node: enforce_guardrails_and_route<br/>ガードレール検査・3分岐ルーティング"]
+    LLM --> Router["@node: enforce_guardrails_and_route<br/>許可NS・類似度・鮮度90日・1回/h検査"]
 
     Router -->|"route = OBSERVE"| N1["@node: observe_node<br/>変更操作なし・静観記録"]
-    Router -->|"route = AUTO_REMEDIATE"| N2["@node: auto_remediate_node<br/>即時 Rollback / Restart + 事後回復確認"]
+    Router -->|"route = AUTO_REMEDIATE"| N2["@node: auto_remediate_node<br/>即時復旧 + 回復確認・鮮度更新 / NG時降格"]
     Router -->|"route = REQUIRE_APPROVAL"| N3["@node: approved_remediate_node<br/>require_confirmation=True で自動一時停止"]
 
-    N3 -.->|"Slack で Approve 押下"| Exec["Firestore 復元・処置実行<br/>初見回復時は AUTO-* Runbook を自動登録"]
-    N3 -.->|"Slack で Reject 押下"| Cancel["実行スキップ・手動引き継ぎ"]
+    N3 -.->|"Slack で Approve 押下"| Exec["Firestore 復元・処置実行<br/>初見は AUTO-* 登録 / 既知は鮮度更新"]
+    N3 -.->|"Slack で Reject 押下"| Cancel["実行スキップ・手動引継・承認制へ降格"]
 
     classDef nodeBox fill:#ffffff,stroke:#4285F4,stroke-width:1.5px,color:#202124;
     classDef ok fill:#e6f4ea,stroke:#137333,stroke-width:2px,color:#202124;
@@ -88,9 +88,15 @@ flowchart TD
 
 </details>
 
-### 安全ガードレールによる自動降格（サーキットブレーカー）
+### 安全ガードレールによる自動降格（鮮度有効期限チェック ＆ サーキットブレーカー）
 
-LLM が仮に `AUTO_REMEDIATE` を提案した場合でも、`enforce_guardrails_and_route` ノード内の決定論的チェックが以下の状態遷移に従って安全側（`REQUIRE_APPROVAL`）へ強制降格させます。
+LLM が仮に `AUTO_REMEDIATE` を提案した場合でも、`enforce_guardrails_and_route` ノード内の決定論的チェックが以下の 5 条件を順番に検証し、1 つでも満たさない場合は安全側（`REQUIRE_APPROVAL`）へ強制降格させます。
+
+1. **許可 Namespace 境界**: `ALLOWED_K8S_NAMESPACES`（既定：`sre-demo-app`）以外は無断変更を禁止。
+2. **類似度下限**: 過去事例とのコサイン類似度が `AUTO_REMEDIATE_SIMILARITY_THRESHOLD`（既定：`0.85`）未満なら人間承認へ降格。
+3. **型付き操作限定**: `ROLLBACK_DEPLOYMENT` / `RESTART_DEPLOYMENT` 以外の操作種別は自動実行を禁止。
+4. **Runbook 鮮度有効期限（`RUNBOOK_FRESHNESS_TTL_DAYS`、既定：`90` 日）**: 過去に自動復旧実績がある Runbook であっても、最終検証日時（`last_verified_at`）から 90 日を超過している場合はアーキテクチャ変更で手順が陳腐化している恐れがあるため、**「鮮度期限切れ再評価」として強制的に Slack 人間承認へ降格**します。
+5. **1 時間あたり回数上限（`MAX_AUTO_ACTIONS_PER_HOUR`、既定：`1` 回）**: 同一サービスへの連続ロールバック・再起動ループを遮断。
 
 ![安全ガードレールによる承認待機への自動降格条件と事後エラー率検証フロー図](images/04-03-guardrail-downgrade-and-probe.png)
 
@@ -103,12 +109,13 @@ flowchart LR
 
     Start -->|"対象が許可 Namespace 外"| Downgrade["REQUIRE_APPROVAL へ強制降格<br/>Slack 承認ボタン待ちへ移行"]
     Start -->|"類似度スコア 0.85 未満"| Downgrade
+    Start -->|"最終検証から 90 日超過"| Downgrade
     Start -->|"1時間以内に自動復旧実施済み"| Downgrade
-    Start -->|"全 3 条件をクリア"| Exec["型付き Kubernetes AppsV1 API 実行<br/>Deployment Rollback / Restart"]
+    Start -->|"全 4 条件をクリア"| Exec["型付き Kubernetes AppsV1 API 実行<br/>Deployment Rollback / Restart"]
 
     Exec --> Probe{"事後回復プローブ検証<br/>直近エラー率を再計測"}
-    Probe -->|"エラー率 < 1.0%"| Resolved["自動復旧完了<br/>Slack へ完了レポート通知"]
-    Probe -->|"エラー率 >= 1.0%"| Escalate["要オンコール対応通知<br/>1時間1回上限により無限再実行を防止"]
+    Probe -->|"エラー率 < 1.0%"| Resolved["自動復旧完了<br/>last_verified_at 更新 + Slack 完了通知"]
+    Probe -->|"エラー率 >= 1.0%"| Escalate["要オンコール対応通知<br/>Runbook を REQUIRE_APPROVAL へ自動降格"]
 
     classDef prop fill:#fef7e0,stroke:#b06000,stroke-width:2px,color:#202124;
     classDef act fill:#e8f0fe,stroke:#1967d2,stroke-width:2px,color:#202124;
@@ -146,7 +153,7 @@ flowchart LR
 ## 4. Slack Socket Mode と Firestore 永続化による「公開 URL ゼロ＆再起動耐性」承認シーケンス
 
 通常の HTTP Webhook で Slack のボタン操作を受け取ろうとすると、Slack サーバーは Google Cloud の IAM トークンを付与できないため、未認証でも到達できる公開 URL を用意する必要が生じます。  
-本設計では常駐型の Cloud Run instance から **Slack Socket Mode（外向き TLS WebSocket）** を張ることで公開 URL を完全にゼロにし、さらに中断中の ADK セッション（`FirestoreSessionService`）と承認待ちチケット（[ticket_store.py](../sre-agent/agent_app/ticket_store.py) の `FirestoreApprovalTicketStore`）の両方を **Cloud Firestore** に保存します。
+本設計では常駐型の Cloud Run instance から **Slack Socket Mode（外向き TLS WebSocket）** を張ることで公開 URL を完全にゼロにし、さらに中断中の ADK セッション（`FirestoreSessionService`）と承認待ちチケット（[ticket_store.py](../sre-agent/agent_app/ticket_store.py) の `FirestoreApprovalTicketStore`）の両方を **Cloud Firestore** に保存します。また、承認・却下ボタン押下直後にボタンを消去して **`⏳ 承認受付・実行中...`** へ即時更新（例外発生時はボタンを自動復元）することで、ローリング再起動待機中の二度押しを防ぎます。
 
 > [!IMPORTANT]
 > **なぜローカルの `/tmp` SQLite ではなく Firestore を使うのか？**  
@@ -179,31 +186,33 @@ sequenceDiagram
     end
 
     rect rgb(230, 244, 234)
-        Note over WF,GKE: フェーズ 2: WebSocket 承認受信・ADK 再開・初見事象の自律ナレッジ昇格登録
-        Slack-->>Bolt: 担当者が Approve をクリックし WebSocket 経由で受信
+        Note over WF,GKE: フェーズ 2: WebSocket 承認受信・即時実行中表示・ADK 再開・自律ナレッジ / 鮮度更新
+        Slack-->>Bolt: 担当者が Approve / Reject をクリックし WebSocket 経由で受信
         Bolt->>Bolt: 押下者の Slack User ID が許可リスト内か検証
         Bolt->>DB: Firestore トランザクションでチケット取得・ロック
-        Bolt->>WF: resume_from_approval confirmed=True, invocation_id=...
+        Bolt->>Slack: 即時 chat.update — ボタン消去し「承認受付・実行中」表示へ切替
+        Bolt->>WF: resume_from_approval confirmed=True/False, invocation_id=...
         WF->>DB: 中断箇所から ADK セッション復元
-        WF->>GKE: 型付き復旧 + 事後検証を実行 / 手動引継時は記録のみ
-        WF->>DB: 初見かつ事後回復確認 OK 時は AUTO-* Runbook を MERGE 登録し AI.EMBED 自動生成
-        WF-->>Bolt: RemediationOutcome 返却 learned_runbook_id 付き
+        WF->>GKE: Approve 時は型付き復旧 + 事後検証を実行
+        WF->>DB: 初見時 AUTO-* 登録 / 再承認時 last_verified_at 更新 / 却下・未回復時 降格
+        WF-->>Bolt: RemediationOutcome 返却 learned / refreshed / demoted ID 付き
         Bolt->>DB: 完了済み承認チケット削除
-        Bolt->>Slack: 元メッセージを「承認・実行完了 + 自律ナレッジ登録」表示へ更新
+        Bolt->>Slack: 元カードを最終結果「承認・実行完了 + 知識/鮮度更新」へ更新
     end
 ```
 
 </details>
 
-### 承認解決時の自律ナレッジ昇格ルール（誤学習防止ガードレール）
+### 承認解決時の自律ナレッジ昇格と鮮度ライフサイクル管理ルール
 
-運用を続けるほど人手を減らしていくため、[workflow.py](../sre-agent/agent_app/workflow.py) の `resume_from_approval` と [vector_kb.py](../sre-agent/agent_app/vector_kb.py) の `determine_promoted_action` では、以下の厳格な条件を満たした場合に限り新規 Runbook（`AUTO-<fingerprint先頭8文字>`）を合成して BigQuery `incident_runbooks` へ `MERGE` 登録します。
+運用を続けるほど人手を減らしつつ、**古い知識による誤った自動操作（ドリフト事故）を防ぐ**ため、[workflow.py](../sre-agent/agent_app/workflow.py) と [vector_kb.py](../sre-agent/agent_app/vector_kb.py) では以下のライフサイクル遷移を自動適用します。
 
-| 判定条件・復旧種別 | 知識ベースへの登録有無 | 次回発生時の `recommended_action` | 設計上の理由 |
+| 事象・判定ケース | `incident_runbooks` への更新内容 | 次回発生時の挙動 | 設計上の理由 |
 |---|---|---|---|
-| **Slack で `Reject` された場合、または処置後にエラー率 `1.0%` 未満へ回復しなかった場合** | **登録しない** | — | 誤判断や未解決の手順が知識ベースに混入して次回以降の自動復旧を汚染する事態を防ぐため |
-| **初見（類似度 `0.85` 未満）かつ `Approve` 承認後に `ROLLBACK` / `RESTART` で回復確認できた場合** | **自動 `MERGE` 登録**（BigQuery `AI.EMBED` が裏側で自動ベクトル化） | **`AUTO_REMEDIATE` へ昇格** | 人間が承認し実環境で回復が実証された安全な型付き復旧であるため、2 回目以降はオンコール担当者を起こさず即座に自動復旧させるため |
-| **初見かつ `Approve` されたが `MANUAL_INTERVENTION`［DB ロック調査等］である場合** | **自動 `MERGE` 登録** | **`REQUIRE_APPROVAL` を維持** | 原因分析や禁止事項の知見は蓄積して次回の調査を高速化しつつ、DB 操作等の高リスク手順が無断自動実行されるのを防ぐため |
+| **初見（類似度 `0.85` 未満）かつ Slack `Approve` 後に `ROLLBACK` / `RESTART` で回復確認できた場合** | 新規 `AUTO-*` を自動 `MERGE` 登録・`last_verified_at = NOW`・`verified_count = 1` | **`AUTO_REMEDIATE` へ昇格**［今後 90 日間有効］ | 人間が承認し実環境で回復が実証された型付き復旧であるため、2 回目以降は即座に自動復旧させるため |
+| **初見かつ `Approve` されたが `MANUAL_INTERVENTION`［DB ロック調査等］である場合** | 新規 `AUTO-*` を自動 `MERGE` 登録 | **`REQUIRE_APPROVAL` を維持** | 原因分析や禁止事項の知見は蓄積しつつ、DB 操作等の高リスク手順が無断実行されるのを防ぐため |
+| **鮮度内（90 日以内）の自動復旧成功、または鮮度切れ（90 日超過）Runbook を人間が再 `Approve` して回復確認できた場合** | `last_verified_at = NOW`・`verified_count + 1` を `UPDATE`［ベクトル再生成なし］ | **さらに 90 日間 `AUTO_REMEDIATE` 資格を継続・復活** | 現在も有効であることが実証された手順の鮮度を自動延長し、長期間未発生だった手順だけ人間に再確認させるため |
+| **既存 `AUTO_REMEDIATE` Runbook が Slack で `Reject` された場合、または処置後の事後検証が NG だった場合** | `recommended_action = 'REQUIRE_APPROVAL'` へ自動降格［`lifecycle_status = 'ACTIVE'` は維持］ | **以後の無断自動実行を恒久凍結**［毎回人間承認を要求］ | 検索時の過去文脈は残しつつ、効かなくなった古い復旧手順が二度と自動実行されないよう安全側に固定するため |
 
 ---
 
@@ -287,6 +296,8 @@ tests/test_slack_hitl_resume.py::test_build_session_service_firestore_returns_ad
 tests/test_slack_hitl_resume.py::test_autonomous_kb_learning_promotes_novel_restart_to_auto_remediate PASSED
 tests/test_slack_hitl_resume.py::test_autonomous_kb_learning_keeps_manual_intervention_as_require_approval PASSED
 tests/test_slack_hitl_resume.py::test_bigquery_ai_search_and_autonomous_merge_queries PASSED
+tests/test_slack_hitl_resume.py::test_stale_runbook_revalidation_refresh_and_reject_demotion PASSED
+tests/test_slack_hitl_resume.py::test_slack_button_click_immediately_updates_to_in_progress_and_restores_on_error PASSED
 ```
 
 ---
@@ -295,7 +306,7 @@ tests/test_slack_hitl_resume.py::test_bigquery_ai_search_and_autonomous_merge_qu
 
 ```markdown
 `AGENTS.md` を読み込み、第4章（`docs/04-auto-remediation-and-slack-hitl.md`）のテスト検証を実行してください。
-- `.venv` 環境で `pytest -v` を実行し、全 19 件のテスト（重複排除、サンドボックス隔離、100件検索、Workflow 3分岐、事後検証未回復時通知、Slack 承認者検証、インスタンス再起動後の Resume 復旧、および解決ナレッジ自律昇格）が PASS することを確認して報告すること。
+- `.venv` 環境で `pytest -v` を実行し、全 22 件のテスト（重複排除、サンドボックス隔離、100件検索、Workflow 3分岐、事後検証未回復時通知、Slack 承認者検証と即時状態更新、インスタンス再起動後の Resume 復旧、解決ナレッジ自律昇格、および鮮度有効期限超過時の降格・再承認更新・却下凍結）が PASS することを確認して報告すること。
 - Secret Manager への Slack トークン登録は私が手元でトークンを入力して行うため、実行用コマンドのみ案内すること。
 ```
 

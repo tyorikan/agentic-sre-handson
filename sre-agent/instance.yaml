@@ -53,6 +53,8 @@ spec:
           value: "sre_genai_conn"
         - name: ENABLE_AUTONOMOUS_KB_LEARNING
           value: "true"
+        - name: RUNBOOK_FRESHNESS_TTL_DAYS
+          value: "90"
         - name: ALLOW_DRILL_COOLDOWN_RESET
           value: "false"
         - name: GKE_CLUSTER_NAME

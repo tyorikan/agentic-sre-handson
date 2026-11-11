@@ -90,13 +90,28 @@ def test_guardrail_downgrades_disallowed_namespace_and_circuit_breaker() -> None
     assert dec_sim == "REQUIRE_APPROVAL"
     assert "0.72" in note_sim
 
-    # 3. 条件を満たす初回は AUTO_REMEDIATE が通過
+    # 3. Runbook 最終検証日が鮮度有効期限 (90日) を超過している場合 (120日経過) は再評価のため強制降格
+    dec_stale, _, note_stale = mgr.enforce_safety_guardrails(
+        namespace="sre-demo-app",
+        service_name="order-service",
+        proposed_decision="AUTO_REMEDIATE",
+        proposed_remediation="ROLLBACK_DEPLOYMENT",
+        similarity_score=0.95,
+        matched_runbook_age_days=120.0,
+        now=t0,
+    )
+    assert dec_stale == "REQUIRE_APPROVAL"
+    assert "120.0" in note_stale
+    assert "90 日" in note_stale
+
+    # 4. 条件（鮮度 12日 <= 90日 を含む）をすべて満たす初回は AUTO_REMEDIATE が通過
     dec_ok, rem_ok, note_ok = mgr.enforce_safety_guardrails(
         namespace="sre-demo-app",
         service_name="order-service",
         proposed_decision="AUTO_REMEDIATE",
         proposed_remediation="ROLLBACK_DEPLOYMENT",
         similarity_score=0.93,
+        matched_runbook_age_days=12.0,
         now=t0,
     )
     assert dec_ok == "AUTO_REMEDIATE"
@@ -216,6 +231,19 @@ def test_atomic_claim_and_log_binning_decay_detection() -> None:
     assert stats.is_naturally_decaying is True
     assert stats.linear_slope < -0.02
 
+    # 障害発生後にトラフィック自体が途絶えた（末尾バケットが無通信 total=0）ケースを 0% 正常回復と誤認しないこと
+    stalled_entries = [
+        (end - timedelta(seconds=52), "INFO"),
+        (end - timedelta(seconds=48), "CRITICAL"),
+        (end - timedelta(seconds=32), "CRITICAL"),
+        (end - timedelta(seconds=25), "CRITICAL"),
+        # 直近 18 秒間はリクエスト 0 件（無通信）
+    ]
+    stalled_series = compute_error_rate_series_from_logs(stalled_entries, window_end=end, bucket_seconds=18, num_buckets=5)
+    assert stalled_series[-1] > 0.0
+    stalled_stats = SandboxRunner(settings).analyze_error_series(stalled_series)
+    assert stalled_stats.is_naturally_decaying is False
+
 
 def test_remediation_failure_returns_failed_outcome() -> None:
     """復旧実行器が例外を送出した場合でも未捕捉クラッシュせず FAILED ステータスで返ること。"""
@@ -238,3 +266,67 @@ def test_remediation_failure_returns_failed_outcome() -> None:
     assert outcome.action_status == "FAILED"
     assert outcome.verification_passed is False
     assert "前リビジョンがありません" in outcome.detail_message
+
+
+def test_has_recent_deployment_ignores_rolled_back_and_restarted_revisions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """自動ロールバック後の古い RS 再有効化や restartedAt 再起動を新規リリース直後と誤認しないこと。"""
+    from types import SimpleNamespace
+    from agent_app.remediation_tools import GkeAppsV1RemediationExecutor
+
+    now = datetime.now(timezone.utc)
+    # Rev 1 (1時間前作成・現在稼働中 = ロールバック先) と Rev 2 (10分前作成・replicas=0 = バグ版)
+    rs_v1_active = SimpleNamespace(
+        metadata=SimpleNamespace(
+            annotations={"deployment.kubernetes.io/revision": "3"},
+            creation_timestamp=now - timedelta(minutes=60),
+            owner_references=[SimpleNamespace(uid="dep-1")],
+        ),
+        spec=SimpleNamespace(
+            replicas=2,
+            template=SimpleNamespace(metadata=SimpleNamespace(annotations={})),
+        ),
+    )
+    rs_v2_scaled_down = SimpleNamespace(
+        metadata=SimpleNamespace(
+            annotations={"deployment.kubernetes.io/revision": "2"},
+            creation_timestamp=now - timedelta(minutes=10),
+            owner_references=[SimpleNamespace(uid="dep-1")],
+        ),
+        spec=SimpleNamespace(
+            replicas=0,
+            template=SimpleNamespace(metadata=SimpleNamespace(annotations={})),
+        ),
+    )
+    fake_dep = SimpleNamespace(
+        metadata=SimpleNamespace(uid="dep-1", annotations={"deployment.kubernetes.io/revision": "3"}),
+        spec=SimpleNamespace(selector=SimpleNamespace(match_labels={"app": "order-service"})),
+    )
+
+    class FakeAppsV1:
+        def __init__(self, items: list) -> None:
+            self._items = items
+
+        def read_namespaced_deployment(self, name: str, namespace: str):
+            return fake_dep
+
+        def list_namespaced_replica_set(self, namespace: str, label_selector: str):
+            return SimpleNamespace(items=self._items)
+
+    ex = GkeAppsV1RemediationExecutor(AgentSettings())
+    monkeypatch.setattr(ex, "_build_apps_v1_client", lambda: FakeAppsV1([rs_v1_active, rs_v2_scaled_down]))
+    assert ex.has_recent_deployment("sre-demo-app", "order-service", within_minutes=30) is False
+
+    # 新規リリース直後 (最新 RS が 5 分前に作成され稼働中) は True になること
+    rs_v4_fresh = SimpleNamespace(
+        metadata=SimpleNamespace(
+            annotations={"deployment.kubernetes.io/revision": "4"},
+            creation_timestamp=now - timedelta(minutes=5),
+            owner_references=[SimpleNamespace(uid="dep-1")],
+        ),
+        spec=SimpleNamespace(
+            replicas=2,
+            template=SimpleNamespace(metadata=SimpleNamespace(annotations={})),
+        ),
+    )
+    monkeypatch.setattr(ex, "_build_apps_v1_client", lambda: FakeAppsV1([rs_v2_scaled_down, rs_v4_fresh]))
+    assert ex.has_recent_deployment("sre-demo-app", "order-service", within_minutes=30) is True

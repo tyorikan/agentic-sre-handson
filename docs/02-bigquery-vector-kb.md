@@ -95,7 +95,14 @@ flowchart LR
 
 </details>
 
-各レコードには文章だけでなく、決定論的な制御に使える構造化カラム（`recommended_action`、`remediation_type`、`anti_patterns`［やってはいけない誤対応］、`verification_check`［回復判定条件］）を持たせています。
+各レコードには文章だけでなく、決定論的な制御と**情報の鮮度管理（Trust-Decay Lifecycle）**に使える以下の構造化カラムを持たせています。
+
+* **対応方針・安全境界カラム**: `recommended_action`、`remediation_type`、`anti_patterns`［やってはいけない誤対応］、`verification_check`［回復判定条件］
+* **鮮度・有効性ライフサイクル管理カラム**:
+  * `created_at` / `last_verified_at`: Runbook の初回登録日時と、**直近で自動復旧または人間承認により実環境での回復が実証された日時**。初期シード JSONL では相対経過日数 `verified_age_days`（現役 88 件：`3〜60` 日、休眠 12 件：`120〜240` 日）から投入時点基準で自動算出するため、いつハンズオンを実施しても陳腐化しません。
+  * `verified_count`: 実環境で回復確認に成功した累計回数。
+  * `lifecycle_status`: `'ACTIVE'`（検索対象）または `'DEPRECATED'`（廃止済み・`AI.SEARCH` の事前フィルタで検索対象から除外）。
+* **ベクトル再生成ゼロでの鮮度更新**: BigQuery の生成列（`AI.EMBED(search_document, ...)`）は `search_document` 列が変更されたときのみ再計算されます。そのため、復旧成功時に `last_verified_at` や `verified_count`、`recommended_action` だけを `UPDATE` しても埋め込みベクトルの再計算コストや検索空白は一切発生しません。
 
 ### 手動バッチ埋め込みと `GENERATED ALWAYS AS (AI.EMBED(...))` の違い
 
@@ -216,7 +223,7 @@ bq query \
    FROM AI.SEARCH(
      TABLE `sre_agent_ops.incident_runbooks`,
      "search_document",
-     "新リビジョンデプロイ直後から KeyError 環境変数未設定で HTTP 500 が急増",
+     "サービス: order-service / エラーコード: CONFIG_KEY_ERROR_500 / KeyError: PAYMENT_CURRENCY_PRECISION 環境変数未設定でデプロイ直後から HTTP 500 が急増",
      distance_type => "COSINE",
      top_k => 3
    )
@@ -230,7 +237,7 @@ bq query \
 
 上記コマンドの実行結果として、以下が確認できれば成功です。
 1. `埋め込み完了件数: 100 / 100` に到達していること（`embedding.status` が空文字列 `""` であれば正常完了）。
-2. `AI.SEARCH` の最上位に `INC-001`（`AUTO_REMEDIATE` / `ROLLBACK_DEPLOYMENT`）が高い類似度スコア（`0.85` 以上）でヒットすること。
+2. `AI.SEARCH` の最上位に `INC-001`（`AUTO_REMEDIATE` / `ROLLBACK_DEPLOYMENT`）が高い類似度スコア（`0.80` 以上、エージェント本体の構造化クエリ実行時は約 `0.88`）でヒットすること。
 
 ---
 
