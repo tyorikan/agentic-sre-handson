@@ -85,6 +85,10 @@ CREATE TABLE IF NOT EXISTS `sre_agent_ops.incident_events` (
   matched_runbook_id STRING OPTIONS (description = '最も類似度が高かった過去インシデント ID、または自律登録した AUTO-* ID'),
   similarity_score FLOAT64 OPTIONS (description = 'コサイン類似度スコア (0.0〜1.0)'),
   verification_passed BOOL OPTIONS (description = '復旧後のメトリクス回復確認結果'),
+  mttr_seconds FLOAT64 OPTIONS (description = '異常発生検知から事後回復確認完了までの実測所要秒数'),
+  estimated_manual_mttr_minutes FLOAT64 OPTIONS (description = '人間オンコール手動対応時の比較基準 MTTR（分）'),
+  saved_error_budget_minutes FLOAT64 OPTIONS (description = '自動復旧または迅速な承認復旧によって温存できた Error Budget 時間（分）'),
+  slo_budget_remaining_pct FLOAT64 OPTIONS (description = '記録時点の Cloud Monitoring 日次 99.0% SLO Error Budget 残量（%）'),
   summary STRING OPTIONS (description = 'エージェントが作成した原因分析・処置要約・学習結果'),
   created_at TIMESTAMP NOT NULL OPTIONS (description = '記録時刻 (UTC)')
 )

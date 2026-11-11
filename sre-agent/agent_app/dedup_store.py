@@ -35,6 +35,10 @@ class IncidentEventRecord:
     verification_passed: bool
     summary: str
     created_at: datetime
+    mttr_seconds: float | None = None
+    estimated_manual_mttr_minutes: float | None = None
+    saved_error_budget_minutes: float | None = None
+    slo_budget_remaining_pct: float | None = None
 
 
 class EventStoreBackend(Protocol):
@@ -171,26 +175,36 @@ class BigQueryEventStoreBackend:
         return int(row.cnt)
 
     def append_event(self, record: IncidentEventRecord) -> None:
-        errors = self._client.insert_rows_json(
-            self._table_fqn,
-            [
-                {
-                    "event_id": record.event_id,
-                    "incident_id": record.incident_id,
-                    "fingerprint": record.fingerprint,
-                    "namespace": record.namespace,
-                    "service_name": record.service_name,
-                    "error_code": record.error_code,
-                    "decision": record.decision,
-                    "remediation_type": record.remediation_type,
-                    "matched_runbook_id": record.matched_runbook_id,
-                    "similarity_score": record.similarity_score,
-                    "verification_passed": record.verification_passed,
-                    "summary": record.summary,
-                    "created_at": record.created_at.isoformat(),
-                }
-            ],
-        )
+        base_row: dict[str, object] = {
+            "event_id": record.event_id,
+            "incident_id": record.incident_id,
+            "fingerprint": record.fingerprint,
+            "namespace": record.namespace,
+            "service_name": record.service_name,
+            "error_code": record.error_code,
+            "decision": record.decision,
+            "remediation_type": record.remediation_type,
+            "matched_runbook_id": record.matched_runbook_id,
+            "similarity_score": record.similarity_score,
+            "verification_passed": record.verification_passed,
+            "summary": record.summary,
+            "created_at": record.created_at.isoformat(),
+        }
+        slo_fields: dict[str, object] = {}
+        if record.mttr_seconds is not None:
+            slo_fields["mttr_seconds"] = record.mttr_seconds
+        if record.estimated_manual_mttr_minutes is not None:
+            slo_fields["estimated_manual_mttr_minutes"] = record.estimated_manual_mttr_minutes
+        if record.saved_error_budget_minutes is not None:
+            slo_fields["saved_error_budget_minutes"] = record.saved_error_budget_minutes
+        if record.slo_budget_remaining_pct is not None:
+            slo_fields["slo_budget_remaining_pct"] = record.slo_budget_remaining_pct
+
+        full_row = {**base_row, **slo_fields}
+        errors = self._client.insert_rows_json(self._table_fqn, [full_row])
+        if errors and slo_fields and "no such field" in str(errors).lower():
+            # 旧スキーマの既存テーブル環境でも監査書き込みを落とさないためのフォールバック
+            errors = self._client.insert_rows_json(self._table_fqn, [base_row])
         if errors:
             raise RuntimeError(f"BigQuery 監査イベントの書き込みに失敗しました: {errors}")
 
@@ -347,6 +361,10 @@ class IncidentGuardrailManager:
         similarity_score: float,
         verification_passed: bool,
         summary: str,
+        mttr_seconds: float | None = None,
+        estimated_manual_mttr_minutes: float | None = None,
+        saved_error_budget_minutes: float | None = None,
+        slo_budget_remaining_pct: float | None = None,
         now: datetime | None = None,
     ) -> IncidentEventRecord:
         """最終判断と処置結果を追記テーブルへ記録する。"""
@@ -364,6 +382,10 @@ class IncidentGuardrailManager:
             verification_passed=verification_passed,
             summary=summary,
             created_at=now or datetime.now(timezone.utc),
+            mttr_seconds=mttr_seconds,
+            estimated_manual_mttr_minutes=estimated_manual_mttr_minutes,
+            saved_error_budget_minutes=saved_error_budget_minutes,
+            slo_budget_remaining_pct=slo_budget_remaining_pct,
         )
         self._backend.append_event(record)
         with self._lock:

@@ -31,6 +31,7 @@ from .remediation_tools import (
 )
 from .sandbox_runner import SandboxRunner
 from .slack_socket import SlackHitlCoordinator
+from .slo_metrics import CloudMonitoringSloReader
 from .telemetry_enrichment import CloudTelemetryEnricher
 from .vector_kb import BigQueryVectorKnowledgeBase
 from .workflow import SreIncidentOrchestrator
@@ -64,15 +65,19 @@ def parse_pubsub_payload(raw_bytes: bytes) -> AlertEvent:
     if "jsonPayload" in data and isinstance(data["jsonPayload"], dict):
         jp = data["jsonPayload"]
         res_labels = data.get("resource", {}).get("labels", {})
-        return AlertEvent(
-            incident_id=data.get("insertId", f"log-{uuid.uuid4().hex[:8]}"),
-            namespace=jp.get("namespace") or res_labels.get("namespace_name", "sre-demo-app"),
-            service_name=jp.get("service") or res_labels.get("container_name", "order-service"),
-            error_code=jp.get("error_code", "STRUCTURED_LOG_ERROR"),
-            severity=str(data.get("severity", jp.get("severity", "ERROR"))).upper(),
-            summary=jp.get("message", "Error log routed via Log Sink"),
-            recent_deployment_within_30m=bool(jp.get("introduced_in")),
-        )
+        raw_ts = data.get("timestamp") or jp.get("timestamp")
+        event_kwargs: dict[str, Any] = {
+            "incident_id": data.get("insertId", f"log-{uuid.uuid4().hex[:8]}"),
+            "namespace": jp.get("namespace") or res_labels.get("namespace_name", "sre-demo-app"),
+            "service_name": jp.get("service") or res_labels.get("container_name", "order-service"),
+            "error_code": jp.get("error_code", "STRUCTURED_LOG_ERROR"),
+            "severity": str(data.get("severity", jp.get("severity", "ERROR"))).upper(),
+            "summary": jp.get("message", "Error log routed via Log Sink"),
+            "recent_deployment_within_30m": bool(jp.get("introduced_in")),
+        }
+        if isinstance(raw_ts, str) and raw_ts.strip():
+            event_kwargs["observed_at"] = raw_ts.strip()
+        return AlertEvent(**event_kwargs)
 
     # 3. Cloud Logging 汎用テキスト/構造化形式 (textPayload / resource のみの場合)
     if "insertId" in data and ("textPayload" in data or "resource" in data):
@@ -159,6 +164,7 @@ async def run_daemon(settings: AgentSettings) -> None:
     telemetry_enricher = CloudTelemetryEnricher(settings, deployment_checker=gke_executor)
     post_probe = build_live_post_remediation_probe(settings, gke_executor)
     remediation_service = SafeRemediationService(settings, gke_executor, post_error_rate_probe=post_probe)
+    slo_reader = CloudMonitoringSloReader(settings)
 
     orchestrator = SreIncidentOrchestrator(
         settings=settings,
@@ -167,6 +173,7 @@ async def run_daemon(settings: AgentSettings) -> None:
         guardrail_manager=guardrails,
         remediation_service=remediation_service,
         telemetry_enricher=telemetry_enricher.enrich_alert,
+        slo_reader=slo_reader,
     )
     slack_coordinator = SlackHitlCoordinator(settings, orchestrator)
 

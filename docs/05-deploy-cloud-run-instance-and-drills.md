@@ -1,13 +1,13 @@
-# 第 5 章：Cloud Run instances への閉域常駐デプロイと 4 大障害訓練 (`05-deploy-cloud-run-instance-and-drills.md`)
+# 第 5 章：閉域常駐デプロイ・4 大障害訓練・Error Budget 温存効果の実測 (`05-deploy-cloud-run-instance-and-drills.md`)
 
-**所要時間**: 約 45 分  
-**到達目標**: 常駐 SRE エージェントを **Cloud Run instances**（`--sandbox-launcher --ingress internal --no-default-url`）へデプロイし、GKE 上の監視対象アプリに 4 種類の本番想定障害を注入して「静観」「自動ロールバック＋回復確認」「高リスク DB 障害の人間承認」「初見障害の自律ナレッジ学習と 2 回目の全自動復旧」を一気通貫で検証する。
+**所要時間**: 約 50 分  
+**到達目標**: 常駐 SRE エージェントを **Cloud Run instances**（`--sandbox-launcher --ingress internal --no-default-url`）へデプロイし、4 種類の本番想定障害を通して「静観」「自動ロールバック」「高リスク DB 障害の人間承認引継」「初見障害の自律学習と鮮度再評価」、および**訓練前後の Error Budget 消費比較と温存効果の定量証明**を一気通貫で検証する。
 
 ---
 
 ## 1. この章で作る場所と通信境界（現在地マップ）
 
-ついにすべての部品を結合し、**Cloud Run instances 上の完全閉域・常駐エージェント** を本稼働させます。
+すべての構成要素を結合し、**公開 URL を一切持たない閉域・常駐エージェント**を稼働させます。
 
 ![Cloud Run instance の着信遮断と外向き TLS/WSS のみによる閉域通信構成図](images/05-01-closed-network-topology.png)
 
@@ -42,21 +42,15 @@ flowchart LR
 
 </details>
 
-### なぜ Cloud Run Services ではなく Cloud Run instances なのか？
-
-* **Cloud Run Services** は着信 HTTP リクエストに応じてオートスケール・スケールトゥゼロする設計のため、リクエストが来ない夜間などにバックグラウンドの WebSocket（Slack Socket Mode）や StreamingPull を維持し続けるシングルトン常駐プロセスには向きません。
-* **Cloud Run instances** はサーバーレスの運用手軽さを保ったまま、軽量 VM のように `create` / `stop` / `start` で単一コンテナを常時稼働でき、さらに `--sandbox-launcher` によって隔離サブサンドボックスをミリ秒起動できます。
-
-> [!WARNING]
-> Cloud Run instances は `us-central1`・`us-east1`・`europe-west1` では利用できません。必ず `.env` の `GOOGLE_CLOUD_REGION` が `asia-northeast1` などの対応リージョンになっていることを確認してください。
+* **なぜ Cloud Run Services ではなく Cloud Run instances なのか**: リクエスト駆動でスケールトゥゼロする Cloud Run Services と異なり、Cloud Run instances は単一コンテナを常時稼働させて Pub/Sub StreamingPull と Slack Socket Mode WebSocket を維持でき、さらに `--sandbox-launcher` で隔離サンドボックスを即起動できます。
 
 ---
 
-## 2. SRE エージェントのコンテナビルドと Cloud Run instance 作成
+## 2. SRE エージェントのコンテナビルドと閉域インスタンス起動
 
 ### Step 2.1 コンテナイメージのビルド
 
-リポジトリルートから [sre-agent/cloudbuild.yaml](../sre-agent/cloudbuild.yaml) と [sre-agent/Dockerfile](../sre-agent/Dockerfile) を使ってビルドし、Artifact Registry へ登録します（`.gcloudignore` により `.venv` や `.env` はアップロードから自動除外されます）。
+リポジトリルートから [sre-agent/cloudbuild.yaml](../sre-agent/cloudbuild.yaml) でビルドし、Artifact Registry へ登録します。
 
 ```bash
 source .env
@@ -72,15 +66,11 @@ gcloud builds submit . \
   --project="${GOOGLE_CLOUD_PROJECT}"
 ```
 
-### Step 2.2 完全閉域・サンドボックス有効化設定でのインスタンス起動
+### Step 2.2 閉域・サンドボックス有効化設定でのインスタンスデプロイ
 
-`--sandbox-launcher`、`--ingress internal`、`--no-default-url` をすべて指定してインスタンスを作成します（`gcloud beta` コンポーネントが未導入の場合は事前に `gcloud components install beta --quiet` を実行してください）。
-
-> [!NOTE]
-> Cloud Run instances の仕様上、`--ingress=internal` を指定する場合はコンテナに待受ポート（`--port=8080`）が必須となるため、`agent_app/main.py` にはコマンド実行や変更機能を持たない読み取り専用の `/healthz` 応答エンドポイントのみを最小実装しています。
+`--sandbox-launcher`・`--ingress=internal`・`--no-default-url` を指定して起動します。`INITIAL_STABILIZATION_SECONDS=30` により一過性スパイクと持続障害を正確に識別し、訓練の連続実行用に `ALLOW_DRILL_COOLDOWN_RESET=true` を有効化します（本番運用時は `false` に戻してください）。
 
 ```bash
-# Slack トークンを Secret Manager に登録済みの場合は --set-secrets を付与します
 SLACK_SECRET_FLAGS=()
 if gcloud secrets describe sre-slack-bot-token --project="${GOOGLE_CLOUD_PROJECT}" >/dev/null 2>&1; then
   SLACK_SECRET_FLAGS=(
@@ -99,44 +89,44 @@ gcloud beta run instances deploy sre-autonomous-agent \
   --sandbox-launcher \
   --ingress=internal \
   --no-default-url \
-  --set-env-vars="^@^GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}@GOOGLE_CLOUD_REGION=${GOOGLE_CLOUD_REGION}@GOOGLE_CLOUD_LOCATION=global@GOOGLE_GENAI_USE_ENTERPRISE=True@SRE_TRIAGE_MODEL=${SRE_TRIAGE_MODEL}@SRE_EMBEDDING_MODEL=${SRE_EMBEDDING_MODEL}@ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false@ALERT_PUBSUB_SUBSCRIPTION=${ALERT_PUBSUB_SUBSCRIPTION}@BQ_DATASET=${BQ_DATASET}@BQ_CONNECTION_ID=${BQ_CONNECTION_ID:-sre_genai_conn}@ENABLE_AUTONOMOUS_KB_LEARNING=${ENABLE_AUTONOMOUS_KB_LEARNING:-true}@RUNBOOK_FRESHNESS_TTL_DAYS=${RUNBOOK_FRESHNESS_TTL_DAYS:-90}@ALLOW_DRILL_COOLDOWN_RESET=true@GKE_CLUSTER_NAME=${GKE_CLUSTER_NAME}@GKE_CLUSTER_LOCATION=${GKE_CLUSTER_LOCATION}@ALLOWED_K8S_NAMESPACES=${ALLOWED_K8S_NAMESPACES}@SANDBOX_MODE=cloud_run@INITIAL_STABILIZATION_SECONDS=30@SESSION_BACKEND=firestore@FIRESTORE_DATABASE=(default)@SLACK_ALERT_CHANNEL_ID=${SLACK_ALERT_CHANNEL_ID}@SLACK_ALLOWED_APPROVER_IDS=${SLACK_ALLOWED_APPROVER_IDS:-}" \
+  --set-env-vars="^@^GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}@GOOGLE_CLOUD_REGION=${GOOGLE_CLOUD_REGION}@GOOGLE_CLOUD_LOCATION=global@GOOGLE_GENAI_USE_ENTERPRISE=True@SRE_TRIAGE_MODEL=${SRE_TRIAGE_MODEL}@SRE_EMBEDDING_MODEL=${SRE_EMBEDDING_MODEL}@ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false@ALERT_PUBSUB_SUBSCRIPTION=${ALERT_PUBSUB_SUBSCRIPTION}@BQ_DATASET=${BQ_DATASET}@BQ_CONNECTION_ID=${BQ_CONNECTION_ID:-sre_genai_conn}@ENABLE_AUTONOMOUS_KB_LEARNING=${ENABLE_AUTONOMOUS_KB_LEARNING:-true}@RUNBOOK_FRESHNESS_TTL_DAYS=${RUNBOOK_FRESHNESS_TTL_DAYS:-90}@ALLOW_DRILL_COOLDOWN_RESET=true@GKE_CLUSTER_NAME=${GKE_CLUSTER_NAME}@GKE_CLUSTER_LOCATION=${GKE_CLUSTER_LOCATION}@ALLOWED_K8S_NAMESPACES=${ALLOWED_K8S_NAMESPACES}@SANDBOX_MODE=cloud_run@INITIAL_STABILIZATION_SECONDS=30@SLO_SERVICE_ID=${SLO_SERVICE_ID:-order-service-slo}@SLO_DAILY_ID=${SLO_DAILY_ID:-order-availability-daily-99}@SLO_MONTHLY_ID=${SLO_MONTHLY_ID:-order-availability-monthly-999}@MANUAL_BASELINE_MTTR_MINUTES=${MANUAL_BASELINE_MTTR_MINUTES:-30.0}@SESSION_BACKEND=firestore@FIRESTORE_DATABASE=(default)@SLACK_ALERT_CHANNEL_ID=${SLACK_ALERT_CHANNEL_ID}@SLACK_ALLOWED_APPROVER_IDS=${SLACK_ALLOWED_APPROVER_IDS:-}" \
   ${SLACK_SECRET_FLAGS[@]+"${SLACK_SECRET_FLAGS[@]}"} \
   --project="${GOOGLE_CLOUD_PROJECT}"
 ```
 
-> [!TIP]
-> `INITIAL_STABILIZATION_SECONDS=30` を設定することで、単発のエラーログが Pub/Sub に到着した直後に即断せず、30 秒間の観測ウィンドウで直近のエラー率バケット推移を集計して「一時的スパイクの自然減衰」と「持続障害」を高精度に区別します。また、ハンズオン訓練で同一シナリオを待たずに連続再検証できるよう `ALLOW_DRILL_COOLDOWN_RESET=true` を有効化しています（本番環境では既定値 `false` に戻してください）。
-
-### デプロイ設定の確認（Verification）
-
-以下のコマンドで、`sandboxLauncher: true` が有効化され、かつ公開 URL が無効化されていることを確認します。
+### デプロイとエージェント構造化ログの確認
 
 ```bash
 gcloud beta run instances describe sre-autonomous-agent \
   --region="${GOOGLE_CLOUD_REGION}" \
   --project="${GOOGLE_CLOUD_PROJECT}"
-```
 
-また、別ターミナルでエージェントの構造化ログを表示しておくと、以降の障害訓練の動きをリアルタイムに追跡できます。
-
-```bash
+# 判定ステップの構造化 JSON ログを確認するコマンド
 gcloud logging read \
   'resource.labels.instance_name="sre-autonomous-agent" AND NOT jsonPayload.message:"重複排除スキップ"' \
-  --limit=25 \
+  --limit=20 \
   --project="${GOOGLE_CLOUD_PROJECT}" \
-  --format='table(timestamp,severity,jsonPayload.incident_id,jsonPayload.decision,jsonPayload.matched_runbook_id,jsonPayload.message,textPayload)'
+  --format='table(timestamp,severity,jsonPayload.incident_id,jsonPayload.decision,jsonPayload.matched_runbook_id,jsonPayload.message)'
 ```
-
-> [!NOTE]
-> `agent_app/main.py` と `workflow.py` はステップ経過を標準出力（JSON 構造化ログ）へ出力するため、`gcloud beta run instances logs read` のデフォルト表示では `jsonPayload` 行が空行に見えることがあります。上記の `gcloud logging read` を使うと、判定結果や Runbook 一致情報を一覧で確認できます。
 
 ---
 
-## 3. 実戦障害訓練（4 大シナリオの検証）
+## 3. 実戦障害訓練（4 大シナリオと Error Budget 前後比較）
+
+### Step 3.0 訓練開始前の SLO・Error Budget ベースライン保存
+
+第 1 章で起動した定常トラフィックにより健全なベースライン（Error Budget 残量 `100.00%`）が形成されていることを確認し、スナップショットを保存します。あわせて Google Cloud コンソールの **Monitoring → Services → `Order Service`** 画面を開いておくと、以降の訓練中の V 字回復グラフをリアルタイムで観察できます。
+
+```bash
+source .venv/bin/activate
+python3 ./target-app/scripts/check_slo_budget.py --save-baseline /tmp/slo_before_drills.json
+```
+
+---
 
 ### 訓練 1：一時的な下流ネットワーク瞬断 → 「静観（OBSERVE）」の検証
 
-事前ベースラインリクエストの後、15 秒間だけ下流決済ゲートウェイの TLS 瞬断（`UPSTREAM_CONN_RESET_503`）を発生させ、自然回復を確認するシナリオを注入します。
+15 秒間だけ下流決済ゲートウェイの TLS 瞬断（`UPSTREAM_CONN_RESET_503`）を注入します。
 
 ![シナリオ 1: 一過性ネットワーク瞬断に対する静観判定シーケンス図](images/05-02-drill1-observe-sequence.png)
 
@@ -179,14 +169,13 @@ sequenceDiagram
 ```
 
 **確認ポイント**:
-* Slack（または Cloud Logging）に `decision: "OBSERVE"`・類似事例 `INC-013` のレポートが出力されること。
-* `kubectl rollout history deployment/order-service -n sre-demo-app` のリビジョンが変わっておらず、無駄な再起動が行われていないこと。
+* Slack（または Cloud Logging）に `OBSERVE`（類似事例 `INC-013`）と「不要な Pod 再起動による二次障害・追加バジェット流出を防止」のレポートが届き、Deployment リビジョンが変化していないこと。
 
 ---
 
-### 訓練 2：既知の設定欠落バグを含む `v2` デプロイ → 「自動ロールバック＋回復確認」の検証
+### 訓練 2：バグ入り `v2` デプロイ → 「自動ロールバック ＆ Error Budget 温存効果」の検証
 
-必須環境変数 `PAYMENT_CURRENCY_PRECISION` が漏れた `v2.0.0-buggy` を GKE にロールアウトし、HTTP 500（`CONFIG_KEY_ERROR_500`）を発生させます。
+必須環境変数 `PAYMENT_CURRENCY_PRECISION` が欠落した `v2.0.0-buggy` をデプロイし、持続的な HTTP 500（`CONFIG_KEY_ERROR_500`）を発生させます。
 
 ![シナリオ 2: バグ版デプロイに対する自動ロールバックと事後回復確認シーケンス図](images/05-03-drill2-auto-rollback-sequence.png)
 
@@ -208,7 +197,7 @@ sequenceDiagram
         GKE->>Agent: Pub/Sub 経由で CONFIG_KEY_ERROR_500 通知
     end
 
-    rect rgb(232, 240, 254)
+    rect rgb(232, 240, 244)
         Note over Agent,BQ: 2. 直近デプロイ検知・知識ベース高類似度一致・安全ガード検証
         Agent->>Agent: 直近30分以内の新規 ReplicaSet ロールアウトと高止まりエラー率を確認
         Agent->>BQ: AI.SEARCH により INC-001 必須環境変数欠落が類似度 >= 0.85 で一致
@@ -216,11 +205,11 @@ sequenceDiagram
     end
 
     rect rgb(230, 244, 234)
-        Note over GKE,Slack: 3. 型付き API 自動ロールバックと事後回復プローブ検証
+        Note over GKE,Slack: 3. 型付き API 自動ロールバック・回復確認・Saved Error Budget 記録
         Agent->>GKE: AppsV1 API で直前の正常リビジョン v1.0.0 へ自動ロールバック
         Agent->>GKE: 事後回復プローブでエラー率 < 1.0% への回復を確認
-        Agent->>BQ: incident_events に AUTO_REMEDIATE 完了を監査記録
-        Agent->>Slack: 自動復旧完了レポート通知
+        Agent->>BQ: 実測 MTTR・温存 Error Budget 分数・SLO 残量を incident_events へ記録
+        Agent->>Slack: 自動復旧完了レポート + Saved Error Budget 効果を通知
     end
 ```
 
@@ -229,22 +218,22 @@ sequenceDiagram
 ```bash
 export TARGET_APP_IMAGE_URI="${GOOGLE_CLOUD_REGION}-docker.pkg.dev/${GOOGLE_CLOUD_PROJECT}/sre-handson/order-service"
 ./target-app/scripts/inject_buggy_release.sh
+
+# 自動ロールバック完了と Cloud Monitoring の 1 分集計窓反映を待ってから前後比較を実行
+sleep 90
+kubectl get pods -n sre-demo-app -L version
+python3 ./target-app/scripts/check_slo_budget.py --compare-baseline /tmp/slo_before_drills.json
 ```
 
 **確認ポイント**:
-* 約 30〜60 秒後に `kubectl get pods -n sre-demo-app -L version` を実行すると、エージェントによって自動的に `version=v1.0.0` の正常 Pod へロールバックされていること！
-* BigQuery の監査テーブルにも記録が残っていることを確認します。
-
-```bash
-bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGION}" --use_legacy_sql=false \
-  'SELECT created_at, incident_id, error_code, decision, remediation_type, matched_runbook_id, ROUND(similarity_score, 3) AS sim, verification_passed FROM `sre_agent_ops.incident_events` ORDER BY created_at DESC LIMIT 5'
-```
+* `order-service` が自動的に `version=v1.0.0` へロールバックされ、実測 MTTR 約 70〜90 秒（約 1.3 分）で回復していること。
+* `check_slo_budget.py --compare-baseline` および Slack 完了カードにおいて、**手動対応 30 分なら月次 99.9% バジェット（43.2 分）の約 70% を失っていたところを数 % の消費に抑え、約 27〜28 分の Error Budget を温存できたこと**が確認できること。
 
 ---
 
-### 訓練 3：未知・高リスクの DB ロック競合 → 「一時停止 ＆ Slack 承認ボタン連携」の検証
+### 訓練 3：高リスク DB ロック競合 → 「自動一時停止 ＆ Slack 承認引継」の検証
 
-DB コネクションスロット枯渇と行ロック待ち（`DB_CONN_SLOTS_EXHAUSTED_500`）を注入します。アプリを勝手に再起動すると DB がダウンする危険な事象です。
+DB コネクションスロット枯渇と行ロック待ち（`DB_CONN_SLOTS_EXHAUSTED_500`）を注入します。
 
 ![シナリオ 3: 高リスク DB 枯渇障害における自動一時停止と Slack 人間承認再開シーケンス図](images/05-04-drill3-approval-sequence.png)
 
@@ -287,16 +276,8 @@ sequenceDiagram
 ```
 
 **確認ポイント**:
-* エージェントが勝手に Deployment を変更せず一時停止し、Firestore の `adk-session` と `sre_pending_approval_tickets` へ中断状態が永続化されること（待機中にインスタンスを再起動しても途中再開可能）。
-* Slack 上に `[Approve & Execute]` と `[Reject (Manual Triage)]` ボタンが届き、許可されたユーザー ID がボタンを押すと即座に ADK セッションが再開されてメッセージが `✅ 承認・実行完了` へ更新されること（なお `INC-025` は `MANUAL_INTERVENTION` 種別の DB 障害であるため GKE への無断再起動は行わず、オンコール担当者の手動調査引き継ぎ確認として記録されます。中リスクの Deployment 再起動等であれば承認後に型付き復旧が実行されます）。
-* BigQuery `sre_agent_ops.incident_events` に `REQUIRE_APPROVAL` に続いて `APPROVED_EXECUTED` の監査行が追記されること。
-
-```bash
-bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGION}" --use_legacy_sql=false \
-  'SELECT created_at, incident_id, error_code, decision, remediation_type, matched_runbook_id, ROUND(similarity_score, 3) AS sim, verification_passed FROM `sre_agent_ops.incident_events` ORDER BY created_at DESC LIMIT 6'
-```
-
-* 訓練 3 の確認が完了したら、擬似障害フラグを正常状態へ戻します。
+* エージェントが無断再起動を行わず一時停止し、Slack で `[Approve & Execute]` を押した瞬間に `⏳ 承認受付・実行中...` → `✅ 承認・実行完了` へ更新されること（`MANUAL_INTERVENTION` のため架空の復旧時間は計上せず、手動調査引継として記録されます）。
+* 確認後、擬似障害を解除します。
 
 ```bash
 ./target-app/scripts/reset_fault.sh
@@ -304,12 +285,9 @@ bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGIO
 
 ---
 
-### 訓練 4：初見のインメモリ税率テーブル破損 → 「1 回目 Slack 承認＆自律ナレッジ登録 → 2 回目全自動復旧」の検証
+### 訓練 4：初見の税率キャッシュ破損 → 「1 回目承認学習 → 2 回目全自動復旧 → 鮮度再評価」の検証
 
-最後に、初期シード 100 件には存在しない**まったく初見の障害**（インメモリ消費税ルックアップテーブルの CRC32 チェックサム破損：`TAX_RULE_CRC32_MISMATCH_500`）を注入し、**人間が 1 度承認して解決した障害をエージェントが自律学習し、2 回目から人間介入ゼロで自動復旧させる自己成長ループ**を検証します。
-
-> [!IMPORTANT]
-> 訓練 4 では Slack の `[Approve & Execute]` ボタン押下をトリガーとして再開・ナレッジ昇格を行うため、第 4 章 Step 5 の Slack App 連携が設定済みであることを前提とします。
+初期シード 100 件に未登録の初見障害（`TAX_RULE_CRC32_MISMATCH_500`）を注入し、**1 回目の人間承認解決から自律学習して 2 回目に MTTR と Error Budget 消費をさらに短縮する進化**と、**90 日超過時の安全降格**を検証します。
 
 ![シナリオ 4: 初見エラーの 1 回目承認解決から自律ナレッジ登録・2 回目全自動復旧への進化シーケンス図](images/05-05-drill4-self-learning-sequence.png)
 
@@ -346,8 +324,8 @@ sequenceDiagram
         Script->>GKE: クールダウン解除後に再び TAX_CACHE_CORRUPTION を注入
         Agent->>BQ: AI.SEARCH 照合 → AUTO-* が類似度 >= 0.85 & 鮮度 <= 90日 で一致
         Agent->>GKE: 人間承認を待たず AUTO_REMEDIATE で即座にローリング再起動・回復確認
-        Agent->>BQ: 成功に伴い verified_count + 1・last_verified_at 自動更新
-        Agent->>Slack: 自動復旧完了レポート通知
+        Agent->>BQ: verified_count + 1・last_verified_at 更新 + 1回目より短縮された MTTR を記録
+        Agent->>Slack: 自動復旧完了 + Saved Error Budget 拡大を通知
     end
 
     rect rgb(252, 232, 230)
@@ -362,93 +340,79 @@ sequenceDiagram
 
 </details>
 
-#### ステップ A：1 回目の注入（初見エラーのため Slack 承認待ち → ローリング再起動 → 自律ナレッジ登録）
+#### ステップ A：1 回目の注入（Slack 承認 → ローリング再起動 → `AUTO-*` 自律登録）
 
 ```bash
 ./target-app/scripts/inject_novel_tax_corrupt.sh
+# Slack に届いたカードで [Approve & Execute] をクリックします
 ```
 
-1. 既存 100 件との類似度スコアが `0.85` 未満となるため、安全ガードレールが自動的に `REQUIRE_APPROVAL` へ振り分け、Slack に調査レポートと `[Approve & Execute]` ボタンを投稿します。
-2. Slack で **`[Approve & Execute]`** をクリックすると、エージェントは `RESTART_DEPLOYMENT`（ゼロダウンタイムのローリング再起動）を実行して破損したインメモリキャッシュをクリアし、事後エラー率が `1.0%` 未満へ回復したことを確認します。
-3. 回復確認の直後、エージェントが自動的に `AUTO-*` ID の構造化 Runbook を BigQuery `incident_runbooks` へ `MERGE` 登録し、Slack メッセージ末尾に `🧠 自律ナレッジ登録完了` と表示されます。
-
-#### ステップ B：BigQuery `AI.EMBED` バックグラウンド埋め込み完了の確認とクールダウン解除
-
-新規追加された `AUTO-*` レコードに対して、BigQuery の自動埋め込み生成が完了（`embedding.status = ''`）したことを確認してから、連続検証用にクールダウンを解除します。
+#### ステップ B：`AI.EMBED` 自動埋め込み完了の確認とクールダウン解除
 
 ```bash
-# 1. 自律登録された AUTO-* Runbook と AI.EMBED ベクトル生成完了（embedded = true）の確認（約 15〜45 秒）
 for i in $(seq 1 8); do
   bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGION}" --use_legacy_sql=false \
-    'SELECT
-       runbook_id,
-       recommended_action,
-       remediation_type,
-       (embedding IS NOT NULL AND embedding.status = "") AS embedded,
-       SUBSTR(title, 1, 45) AS title_preview
-     FROM `sre_agent_ops.incident_runbooks`
-     WHERE STARTS_WITH(runbook_id, "AUTO-")'
+    'SELECT runbook_id, recommended_action, (embedding IS NOT NULL AND embedding.status = "") AS embedded, verified_count FROM `sre_agent_ops.incident_runbooks` WHERE STARTS_WITH(runbook_id, "AUTO-")'
   sleep 8
 done
 
-# 2. embedded = true になったことを確認したら、訓練用の 15 分クールダウン・1 時間上限を即時解除
 ./target-app/scripts/reset_fault.sh --reset-cooldown
 ```
 
-#### ステップ C：2 回目の同一障害注入（人間承認ゼロでの `AUTO_REMEDIATE` 自動復旧を確認）
+#### ステップ C：2 回目の同一障害注入（人間待ちゼロで `AUTO_REMEDIATE` ＆ MTTR さらなる短縮）
 
 ```bash
+python3 ./target-app/scripts/check_slo_budget.py --save-baseline /tmp/slo_before_drill4_auto.json
 ./target-app/scripts/inject_novel_tax_corrupt.sh
+sleep 90
+python3 ./target-app/scripts/check_slo_budget.py --compare-baseline /tmp/slo_before_drill4_auto.json
 ```
 
-**確認ポイント**:
-* 今度は BigQuery `AI.SEARCH` が先ほど自律登録された `AUTO-*` Runbook を類似度 `0.85` 以上で最上位ヒットさせるため、**Slack の承認ボタンを待たずに `AUTO_REMEDIATE` ルートへ直行**し、自動的に Pod がローリング再起動されて回復すること！
-* `incident_events` 監査テーブルで、1 回目の `REQUIRE_APPROVAL` → `APPROVED_EXECUTED` から、2 回目の `AUTO_REMEDIATE`（`matched_runbook_id = "AUTO-..."`）へ進化した履歴を確認します。
+#### ステップ D：Runbook 鮮度期限切れ（120 日経過）模擬と再承認リフレッシュ
 
 ```bash
-bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGION}" --use_legacy_sql=false \
-  'SELECT created_at, incident_id, error_code, decision, remediation_type, matched_runbook_id, ROUND(similarity_score, 3) AS sim, verification_passed FROM `sre_agent_ops.incident_events` ORDER BY created_at DESC LIMIT 8'
-```
-
-#### ステップ D：Runbook 鮮度期限切れ（90 日超過）の擬似再現 → 「再評価のための承認降格 ＆ 再承認による鮮度回復」の検証
-
-本番環境では、半年〜1 年前に自動復旧できていた手順がマイクロサービス構成や設定仕様の変化で通用しなくなることがあります。そこで、先ほど学習した `AUTO-*` Runbook の最終検証日（`last_verified_at`）を **120 日前** に擬似変更し、鮮度有効期限（`RUNBOOK_FRESHNESS_TTL_DAYS=90`）を超えた古い知識が無断で自動実行されず、**再度人間の承認を求める安全フロー**になることを確認します。
-
-```bash
-# 1. 自律登録された AUTO-* Runbook の最終検証日時を「120 日前」に擬似老化させる（search_document 不変のためベクトル再生成は不要）
 bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGION}" --use_legacy_sql=false \
   'UPDATE `sre_agent_ops.incident_runbooks`
    SET last_verified_at = TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 120 DAY)
    WHERE STARTS_WITH(runbook_id, "AUTO-")'
 
-# 2. クールダウン解除後、3 回目の同一障害を注入
 ./target-app/scripts/reset_fault.sh --reset-cooldown
 sleep 8
 ./target-app/scripts/inject_novel_tax_corrupt.sh
+# Slack に「⏳ 承認待機・鮮度期限切れ再評価」が届くことを確認し、[Approve & Execute] で鮮度を復活させます
 ```
 
-**確認ポイント**:
-1. 類似度スコアは `0.85` 以上で `AUTO-*` に一致するにもかかわらず、安全ガードレールが「最終検証から `120.0` 日経過 ＞ 鮮度有効期限 `90` 日」を検知して `REQUIRE_APPROVAL` へ強制降格し、Slack に **`⏳ 承認待機・鮮度期限切れ再評価`** カードとボタンが届くこと。
-2. Slack で **`[Approve & Execute]`** をクリックするとローリング再起動と回復確認が実行され、`AUTO-*` の `last_verified_at` が現在時刻へ自動リフレッシュ（`verified_count` が `+1`）されて、再び今後 90 日間の自動復旧資格が回復すること（逆に手順が古くなっており **`[Reject]`** を押した場合は、`recommended_action` が自動的に `'REQUIRE_APPROVAL'` へ降格され、以後の無断自動実行が恒久凍結されます）。
+---
+
+## 4. 全訓練を通じた Error Budget 温存効果の総括集計（BigQuery 監査 SQL）
+
+最後に、BigQuery `incident_events` に蓄積された全インシデントの実測 MTTR と温存できた合計 Error Budget 分数（Saved Error Budget）を集計します。
 
 ```bash
 bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGION}" --use_legacy_sql=false \
-  'SELECT runbook_id, recommended_action, verified_count, last_verified_at, ROUND(TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), last_verified_at, MINUTE) / 60.0, 2) AS hours_since_verified FROM `sre_agent_ops.incident_runbooks` WHERE STARTS_WITH(runbook_id, "AUTO-")'
+  'SELECT
+     created_at,
+     incident_id,
+     error_code,
+     decision,
+     matched_runbook_id,
+     ROUND(mttr_seconds, 1) AS mttr_sec,
+     ROUND(saved_error_budget_minutes, 2) AS saved_budget_min,
+     ROUND(slo_budget_remaining_pct, 1) AS daily_slo_rem_pct
+   FROM `sre_agent_ops.incident_events`
+   WHERE decision != "ADMIN_RESET"
+   ORDER BY created_at DESC
+   LIMIT 10'
 ```
-
-### 💡 トラブルシューティングのヒント
-
-* **単発の `McpError: Server returned an error response` がログに出る場合**: LLM がリモート MCP ツールのフィルタ引数を初回試行で誤り、サーバーが入力補正エラーを返すことがあります。ADK のツール機構がエラーメッセージをモデルへ返して自動リトライするため、後続ステップで `Gemini トリアージ推論を完了しました` と記録されていれば正常動作です。全ツール呼び出しが連続失敗する場合のみ、`roles/mcp.toolUser` と `roles/serviceusage.serviceUsageConsumer` の付与を確認してください。
-* **訓練直後に同じ訓練をすぐ再実行したい場合**: `ALLOW_DRILL_COOLDOWN_RESET=true` を設定した検証環境では `./target-app/scripts/reset_fault.sh --reset-cooldown` を実行することで、15 分間のクールダウンと 1 時間 1 回上限を即時リセットできます。
 
 ---
 
 ## 🤖 AI コーディングエージェントを使う場合の指示プロンプト
 
 ```markdown
-`AGENTS.md` と `.env` を読み込み、第5章（`docs/05-deploy-cloud-run-instance-and-drills.md`）のデプロイと 4 つの障害訓練を順番に実行してください。
-- `sre-autonomous-agent` イメージのビルドと `gcloud beta run instances deploy` はコマンド全文を提示し、私の `y` 承認後に実行すること。
-- 訓練 1・訓練 2・訓練 3・訓練 4（ステップ A〜D の鮮度期限切れ再評価を含む）は 1 つずつ実行し、各訓練の後に `kubectl get pods -n sre-demo-app -L version` と BigQuery `incident_events` / `incident_runbooks` テーブルの記録結果を確認して報告すること。
+`AGENTS.md` と `.env` を読み込み、第5章（`docs/05-deploy-cloud-run-instance-and-drills.md`）のデプロイ・4 大障害訓練・Error Budget 比較を順番に実行してください。
+- ビルドと `gcloud beta run instances deploy` はコマンド全文を提示し、私の `y` 承認後に実行すること。
+- 訓練開始前に `check_slo_budget.py --save-baseline` を実行し、訓練 1〜4 の実施後に `--compare-baseline` の実測差分と BigQuery `incident_events` の `mttr_sec`・`saved_budget_min` 一覧を表形式で報告すること。
 ```
 
 ---
@@ -457,5 +421,6 @@ bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGIO
 
 * [Configure sandboxes for instances (Cloud Run)](https://docs.cloud.google.com/run/docs/configuring/instances/sandboxes) — `--sandbox-launcher` 設定ガイド
 * [Restrict network endpoint ingress for Cloud Run](https://docs.cloud.google.com/run/docs/securing/ingress) — `--ingress=internal` と `--no-default-url` の組み合わせ仕様
+* [Alerting on your burn rate (Cloud Monitoring)](https://docs.cloud.google.com/stackdriver/docs/solutions/slo-monitoring/alerting-on-budget-burn-rate) — Error Budget 燃焼率の評価と運用ガイド
 
 次へ進む 👉 [第 6 章：【任意ステップアップ】GKE Sandbox (microVM)・Model Armor・反復評価とクリーンアップ](06-optional-hardening-and-cleanup.md)

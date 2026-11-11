@@ -72,6 +72,14 @@ class AgentSettings:
         default_factory=lambda: int(os.getenv("INITIAL_STABILIZATION_SECONDS", "0"))
     )
 
+    # Cloud Monitoring SLO モニタリング & Error Budget 温存効果算出設定
+    slo_service_id: str = field(default_factory=lambda: os.getenv("SLO_SERVICE_ID", "order-service-slo"))
+    slo_daily_id: str = field(default_factory=lambda: os.getenv("SLO_DAILY_ID", "order-availability-daily-99"))
+    slo_monthly_id: str = field(default_factory=lambda: os.getenv("SLO_MONTHLY_ID", "order-availability-monthly-999"))
+    manual_baseline_mttr_minutes: float = field(
+        default_factory=lambda: float(os.getenv("MANUAL_BASELINE_MTTR_MINUTES", "30.0"))
+    )
+
     # Slack Socket Mode 設定
     slack_bot_token: str = field(default_factory=lambda: os.getenv("SLACK_BOT_TOKEN", ""))
     slack_app_token: str = field(default_factory=lambda: os.getenv("SLACK_APP_TOKEN", ""))

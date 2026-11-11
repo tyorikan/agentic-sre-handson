@@ -1,0 +1,56 @@
+# 定常ベースライン注文トラフィック生成 Deployment (order-traffic-generator)
+# 役割:
+#   - 5 秒に 1 回（毎分 12 件）order-service の POST /orders へ注文リクエストを送信し、
+#     Cloud Monitoring の 1 分窓可用性 SLO と Error Budget の連続時系列グラフを形成します。
+#   - 平常時は severity="INFO" の構造化ログのみ出力されるため、Cloud Logging エラーシンクでは除外され、
+#     Pub/Sub 配信および Gemini 推論トークン費用は一切発生しません。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-traffic-generator
+  namespace: sre-demo-app
+  labels:
+    app: order-traffic-generator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order-traffic-generator
+  template:
+    metadata:
+      labels:
+        app: order-traffic-generator
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: traffic-generator
+          image: curlimages/curl:8.10.1
+          command:
+            - sh
+            - -c
+            - |
+              echo "Starting steady baseline order traffic (1 req / 5s)..."
+              while true; do
+                curl -s -o /dev/null --max-time 4 \
+                  -X POST "http://order-service.sre-demo-app.svc.cluster.local/orders" \
+                  -H "Content-Type: application/json" \
+                  -d '{"item_id": "SKU-STEADY-100", "quantity": 1, "amount_jpy": 4800}' || true
+                sleep 5
+              done
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"

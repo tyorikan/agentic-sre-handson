@@ -67,6 +67,14 @@ spec:
           value: "cloud_run"
         - name: INITIAL_STABILIZATION_SECONDS
           value: "30"
+        - name: SLO_SERVICE_ID
+          value: "order-service-slo"
+        - name: SLO_DAILY_ID
+          value: "order-availability-daily-99"
+        - name: SLO_MONTHLY_ID
+          value: "order-availability-monthly-999"
+        - name: MANUAL_BASELINE_MTTR_MINUTES
+          value: "30.0"
         - name: SESSION_BACKEND
           value: "firestore"
         - name: FIRESTORE_DATABASE

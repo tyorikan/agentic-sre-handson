@@ -48,6 +48,7 @@ from .models import (
 )
 from .remediation_tools import SafeRemediationService
 from .sandbox_runner import SandboxRunner
+from .slo_metrics import SloReader, calculate_error_budget_impact
 from .vector_kb import (
     RunbookKnowledgeBase,
     RunbookSynthesizerFn,
@@ -199,6 +200,7 @@ class SreIncidentOrchestrator:
         telemetry_enricher: TelemetryEnricherFn | None = None,
         runbook_synthesizer: RunbookSynthesizerFn | None = None,
         session_service: BaseSessionService | None = None,
+        slo_reader: SloReader | None = None,
     ) -> None:
         self._settings = settings
         self._sandbox = sandbox_runner
@@ -209,8 +211,41 @@ class SreIncidentOrchestrator:
         self._enricher = telemetry_enricher
         self._synthesizer = runbook_synthesizer or build_llm_runbook_synthesizer(settings)
         self._sessions = session_service or build_session_service(settings)
+        self._slo_reader = slo_reader
         self._app = self._build_adk_app()
         self._runner = Runner(app=self._app, session_service=self._sessions)
+
+    async def _enrich_outcome_with_slo(
+        self,
+        alert: AlertEvent,
+        decision_label: str,
+        outcome: RemediationOutcome,
+    ) -> RemediationOutcome:
+        """処置結果に実測 MTTR・Saved Error Budget・現在の Cloud Monitoring SLO 残量を付与する。"""
+        snapshot = (
+            await asyncio.to_thread(self._slo_reader.read_current_snapshot)
+            if self._slo_reader is not None
+            else None
+        )
+        impact = calculate_error_budget_impact(
+            alert=alert,
+            decision=decision_label,
+            outcome=outcome,
+            manual_baseline_mttr_minutes=self._settings.manual_baseline_mttr_minutes,
+            slo_snapshot=snapshot,
+        )
+        return outcome.model_copy(
+            update={
+                "mttr_seconds": impact.mttr_seconds,
+                "estimated_manual_mttr_minutes": impact.estimated_manual_mttr_minutes,
+                "saved_error_budget_minutes": impact.saved_error_budget_minutes,
+                "monthly_budget_saved_pct": impact.monthly_budget_saved_pct,
+                "slo_daily_budget_remaining_pct": impact.daily_budget_remaining_pct,
+                "slo_monthly_budget_remaining_pct": impact.monthly_budget_remaining_pct,
+                "slo_burn_rate_10m": impact.burn_rate_10m,
+                "slo_impact_summary": impact.impact_summary,
+            }
+        )
 
     def _build_adk_app(self) -> App:
         settings = self._settings
@@ -346,6 +381,7 @@ class SreIncidentOrchestrator:
                 detail_message="一過性事象または静観対象と判定されたため、Pod 再起動・ロールバックを行わず静観しました。",
                 verification_passed=True,
             )
+            outcome = await self._enrich_outcome_with_slo(alert, "OBSERVE", outcome)
             await asyncio.to_thread(
                 guardrails.record_outcome,
                 alert=alert,
@@ -355,6 +391,10 @@ class SreIncidentOrchestrator:
                 similarity_score=decision.similarity_score,
                 verification_passed=True,
                 summary=decision.rationale,
+                mttr_seconds=outcome.mttr_seconds,
+                estimated_manual_mttr_minutes=outcome.estimated_manual_mttr_minutes,
+                saved_error_budget_minutes=outcome.saved_error_budget_minutes,
+                slo_budget_remaining_pct=outcome.slo_daily_budget_remaining_pct,
             )
             ctx.state["outcome"] = outcome.model_dump()
             return outcome.model_dump()
@@ -408,6 +448,7 @@ class SreIncidentOrchestrator:
                         }
                     )
 
+            outcome = await self._enrich_outcome_with_slo(alert, "AUTO_REMEDIATE", outcome)
             await asyncio.to_thread(
                 guardrails.record_outcome,
                 alert=alert,
@@ -417,6 +458,10 @@ class SreIncidentOrchestrator:
                 similarity_score=decision.similarity_score,
                 verification_passed=outcome.verification_passed,
                 summary=f"{decision.rationale} | {outcome.detail_message}",
+                mttr_seconds=outcome.mttr_seconds,
+                estimated_manual_mttr_minutes=outcome.estimated_manual_mttr_minutes,
+                saved_error_budget_minutes=outcome.saved_error_budget_minutes,
+                slo_budget_remaining_pct=outcome.slo_daily_budget_remaining_pct,
             )
             ctx.state["outcome"] = outcome.model_dump()
             return outcome.model_dump()
@@ -442,6 +487,7 @@ class SreIncidentOrchestrator:
                     verification_passed=True,
                 )
 
+            outcome = await self._enrich_outcome_with_slo(alert, "APPROVED_EXECUTED", outcome)
             await asyncio.to_thread(
                 guardrails.record_outcome,
                 alert=alert,
@@ -451,6 +497,10 @@ class SreIncidentOrchestrator:
                 similarity_score=decision.similarity_score,
                 verification_passed=outcome.verification_passed,
                 summary=f"[人間承認済み] {outcome.detail_message}",
+                mttr_seconds=outcome.mttr_seconds,
+                estimated_manual_mttr_minutes=outcome.estimated_manual_mttr_minutes,
+                saved_error_budget_minutes=outcome.saved_error_budget_minutes,
+                slo_budget_remaining_pct=outcome.slo_daily_budget_remaining_pct,
             )
             ctx.state["outcome"] = outcome.model_dump()
             return outcome.model_dump()

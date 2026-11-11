@@ -89,6 +89,14 @@ spec:
               value: "local_subprocess"
             - name: INITIAL_STABILIZATION_SECONDS
               value: "30"
+            - name: SLO_SERVICE_ID
+              value: "order-service-slo"
+            - name: SLO_DAILY_ID
+              value: "order-availability-daily-99"
+            - name: SLO_MONTHLY_ID
+              value: "order-availability-monthly-999"
+            - name: MANUAL_BASELINE_MTTR_MINUTES
+              value: "30.0"
             - name: ALLOWED_K8S_NAMESPACES
               value: "sre-demo-app"
             - name: SESSION_BACKEND

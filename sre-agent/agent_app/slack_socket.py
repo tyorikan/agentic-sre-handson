@@ -130,6 +130,23 @@ def build_report_blocks(result: WorkflowRunResult) -> list[dict[str, Any]]:
                 ],
             }
         )
+    if not result.paused_for_approval and out and out.slo_impact_summary:
+        slo_gauge = (
+            f" / 日次99.0%残量 `{out.slo_daily_budget_remaining_pct:.1f}%`"
+            if out.slo_daily_budget_remaining_pct is not None
+            else ""
+        )
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"📊 *SLO & Error Budget 効果:* {out.slo_impact_summary}{slo_gauge}",
+                    }
+                ],
+            }
+        )
     if dec.anti_pattern_warning:
         blocks.append(
             {
@@ -377,6 +394,16 @@ class SlackHitlCoordinator:
                 if outcome.demoted_runbook_id
                 else ""
             )
+            slo_gauge_suffix = (
+                f" / 日次99.0%残量 `{outcome.slo_daily_budget_remaining_pct:.1f}%`"
+                if outcome.slo_daily_budget_remaining_pct is not None
+                else ""
+            )
+            slo_note = (
+                f"\n📊 *SLO & Error Budget 効果:* {outcome.slo_impact_summary}{slo_gauge_suffix}"
+                if outcome.slo_impact_summary
+                else ""
+            )
             await self._bolt_app.client.chat_update(
                 channel=ticket.channel_id,
                 ts=ticket.message_ts,
@@ -394,7 +421,7 @@ class SlackHitlCoordinator:
                                 f"*{action_label}* (操作者: <@{slack_user_id}>)\n"
                                 f"*対象:* `{ticket.decision.target_namespace}/{ticket.decision.target_deployment}`\n"
                                 f"*結果:* {outcome.detail_message}"
-                                f"{kb_note}{refresh_note}{demote_note}"
+                                f"{slo_note}{kb_note}{refresh_note}{demote_note}"
                             ),
                         },
                     },

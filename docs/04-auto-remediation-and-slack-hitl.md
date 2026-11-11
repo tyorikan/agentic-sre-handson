@@ -1,13 +1,13 @@
-# 第 4 章：ADK 2.x ワークフロー・型付き GKE 自動復旧・Slack Socket Mode 承認連携 (`04-auto-remediation-and-slack-hitl.md`)
+# 第 4 章：ADK 2.x ワークフロー・型付き自動復旧・Slack 連携・Error Budget 効果計測 (`04-auto-remediation-and-slack-hitl.md`)
 
 **所要時間**: 約 45 分  
-**到達目標**: ADK Python 2.x のグラフワークフロー（`Workflow` / `JoinNode` / `@node(require_confirmation=True)`）による 3 分岐制御、安全な型付き GKE 復旧と事後検証、公開 URL を一切開けない Slack Socket Mode 双方向承認、および**承認解決した初見インシデントを次回から自動復旧へ昇格させる自律学習機構**を理解し、Slack App を準備する。
+**到達目標**: ADK Python 2.x のグラフワークフロー（`Workflow` / `JoinNode` / `@node(require_confirmation=True)`）による 3 分岐制御、型付き GKE 復旧と事後検証、公開 URL ゼロの Slack Socket Mode 双方向承認、Runbook 鮮度ライフサイクル、および **Saved Error Budget（温存エラーバジェット）算出ロジック**を理解し、Slack App を準備する。
 
 ---
 
-## 1. この章で作る場所（現在地マップ）
+## 1. この章で確認・設定する場所（現在地マップ）
 
-色が付いている **ADK 2.x ワークフロー制御層**、**型付き GKE 復旧層**、および **Slack Socket Mode 連携層** を確認・設定します。
+**ADK 2.x グラフ制御層**、**型付き GKE 復旧・SLO 効果算出層**、および **Slack Socket Mode 連携層** を確認・設定します。
 
 ![第 4 章で実装する ADK 2.x ワークフロー・型付き復旧・Slack HITL 連携図](images/04-01-chapter4-scope.png)
 
@@ -21,7 +21,7 @@ flowchart LR
     end
 
     subgraph Now["本章の対象: 意思決定・安全復旧・Slack 双方向 HITL"]
-        WF["workflow.py<br/>ADK 2.x Workflow & JoinNode"]
+        WF["workflow.py / slo_metrics.py<br/>ADK 2.x Workflow & Saved Budget 算出"]
         Rem["remediation_tools.py<br/>型付き Rollback / Restart + 事後検証"]
         SlackMod["slack_socket.py / ticket_store.py<br/>Socket Mode 外向き WSS"]
         DB["Firestore 本番 / SQLite 単体<br/>ADK セッション + 承認チケット永続化"]
@@ -49,9 +49,9 @@ flowchart LR
 
 ---
 
-## 2. ADK 2.x グラフワークフローの構造 (`workflow.py`)
+## 2. ADK 2.x グラフワークフローと 5 重の安全ガードレール (`workflow.py`)
 
-従来の対話型エージェントのように「次の手順を毎回すべて LLM の自由裁量に任せる」構造にすると、手順飛ばしや無限ループが起きやすくなります。[sre-agent/agent_app/workflow.py](../sre-agent/agent_app/workflow.py) では、ADK 2.x の `Workflow` を使って**処理順序と分岐条件をコードの有向グラフとして明示固定**しています。
+手順の進行をすべて LLM の自由裁量に任せると手順飛ばしや再起動ループが起きるため、[sre-agent/agent_app/workflow.py](../sre-agent/agent_app/workflow.py) では ADK 2.x の `Workflow` で実行順序と分岐条件を有向グラフとして明示固定しています。
 
 ![ADK 2.x Workflow・JoinNode・require_confirmation によるインシデント処理グラフ構造図](images/04-02-adk-workflow-graph.png)
 
@@ -88,15 +88,15 @@ flowchart TD
 
 </details>
 
-### 安全ガードレールによる自動降格（鮮度有効期限チェック ＆ サーキットブレーカー）
+### 安全ガードレールによる自動降格と事後回復プローブ
 
-LLM が仮に `AUTO_REMEDIATE` を提案した場合でも、`enforce_guardrails_and_route` ノード内の決定論的チェックが以下の 5 条件を順番に検証し、1 つでも満たさない場合は安全側（`REQUIRE_APPROVAL`）へ強制降格させます。
+LLM が `AUTO_REMEDIATE` を提案しても、`enforce_guardrails_and_route` が以下の 5 条件を決定論的に検証し、1 つでも外れれば `REQUIRE_APPROVAL`（人間承認待ち）へ強制降格します。
 
-1. **許可 Namespace 境界**: `ALLOWED_K8S_NAMESPACES`（既定：`sre-demo-app`）以外は無断変更を禁止。
-2. **類似度下限**: 過去事例とのコサイン類似度が `AUTO_REMEDIATE_SIMILARITY_THRESHOLD`（既定：`0.85`）未満なら人間承認へ降格。
-3. **型付き操作限定**: `ROLLBACK_DEPLOYMENT` / `RESTART_DEPLOYMENT` 以外の操作種別は自動実行を禁止。
-4. **Runbook 鮮度有効期限（`RUNBOOK_FRESHNESS_TTL_DAYS`、既定：`90` 日）**: 過去に自動復旧実績がある Runbook であっても、最終検証日時（`last_verified_at`）から 90 日を超過している場合はアーキテクチャ変更で手順が陳腐化している恐れがあるため、**「鮮度期限切れ再評価」として強制的に Slack 人間承認へ降格**します。
-5. **1 時間あたり回数上限（`MAX_AUTO_ACTIONS_PER_HOUR`、既定：`1` 回）**: 同一サービスへの連続ロールバック・再起動ループを遮断。
+1. **許可 Namespace 境界**: `ALLOWED_K8S_NAMESPACES`（既定：`sre-demo-app`）以外は変更不可。
+2. **類似度下限**: コサイン類似度が `AUTO_REMEDIATE_SIMILARITY_THRESHOLD`（既定：`0.85`）未満なら降格。
+3. **型付き操作限定**: [remediation_tools.py](../sre-agent/agent_app/remediation_tools.py) の `rollback_deployment` と `restart_deployment` 以外は自動実行不可。
+4. **Runbook 鮮度有効期限**: 最終検証日（`last_verified_at`）から `RUNBOOK_FRESHNESS_TTL_DAYS`（既定：`90` 日）を超過した手順は再評価のため降格。
+5. **1 時間あたり回数上限**: `MAX_AUTO_ACTIONS_PER_HOUR`（既定：`1` 回）を超える連続実行を遮断。
 
 ![安全ガードレールによる承認待機への自動降格条件と事後エラー率検証フロー図](images/04-03-guardrail-downgrade-and-probe.png)
 
@@ -129,35 +129,23 @@ flowchart LR
 
 </details>
 
-### 事後検証でエラー率が 1.0% 未満に回復しなかった場合（フェイルセーフ）
-
-直前リビジョンへのロールバック後もエラー率が `1.0%` 未満へ下がらない場合、原因はアプリ直近変更ではなく **DB 状態・外部依存・データ不整合** である可能性が高いため、エージェントは追加の連鎖ロールバックや再起動ループを行わず人間へ引き継ぎます。
-
-1. **連鎖操作を行わない**: `verification_passed=False` として 1 回の変更で終了し、さらなる過去リビジョンへの自動巻き戻しによる二次障害を防ぎます。
-2. **Slack 警告エスカレーションと監査記録**: ヘッダを `🚨 自動復旧未回復・要オンコール対応 (事後検証 NG)` に切り替え、BigQuery `incident_events` へ `verification_passed=false` を追記します。
-3. **サーキットブレーカーによる再試行遮断**: 当該実行が「直近 1 時間に 1 回の上限」にカウントされるため、障害継続で後続アラートが届いても強制的に `REQUIRE_APPROVAL` へ降格して停止します。
+さらに処置後は `SafeRemediationService.execute_and_verify` が新リビジョン Ready 到達後のエラー率を実測し、**`1.0%` 未満への回復を確認できた場合のみ成功と判定**します。未回復時は連鎖操作を行わず、該当 Runbook を承認制へ自動降格したうえでオンコール担当者へ警告通知します。
 
 ---
 
-## 3. なぜ自由な `kubectl` 生成を禁止し「型付き復旧関数」にするのか？
+## 3. Error Budget 温存効果（Saved Error Budget）の定量算出 (`slo_metrics.py`)
 
-[sre-agent/agent_app/remediation_tools.py](../sre-agent/agent_app/remediation_tools.py) には、任意のシェルコマンドを実行する関数は存在しません。用意されているのは以下の 2 つの型付きメソッドのみです。
+[sre-agent/agent_app/slo_metrics.py](../sre-agent/agent_app/slo_metrics.py) は、異常ログ発生時刻（`alert.observed_at`）から事後回復プローブ完了時刻までの実測所要時間 $\text{MTTR}_{\text{actual}}$（分）を計測し、Cloud Monitoring API から現在の日次 99.0% / 月次 99.9% SLO 残量を読み取って Slack 完了カードと BigQuery `incident_events` へ記録します。
 
-1. `rollback_deployment(namespace, deployment_name)`: Kubernetes `AppsV1Api` で ReplicaSet のリビジョン履歴を取得し、1 つ前のリビジョンの PodTemplate で Deployment をパッチ更新します。
-2. `restart_deployment(namespace, deployment_name)`: PodTemplate に `kubectl.kubernetes.io/restartedAt` アノテーションを付与し、ゼロダウンタイムのローリング再起動を開始します。
+$$\text{Saved Budget (min)} = \max\left(0,\; \text{MTTR}_{\text{manual}} - \text{MTTR}_{\text{actual}}\right), \qquad \text{Monthly 99.9\% Saved (\%)} = \frac{\text{Saved Budget (min)}}{43.2} \times 100$$
 
-さらに `SafeRemediationService.execute_and_verify` は、API 呼び出し成功後にエラー率プローブを確認し、**実際にエラー率が 1% 未満へ下がったかを検証してから結果を返す**ため、「コマンドは投げたが障害が直っていないのに『復旧完了』と誤報する問題」を防ぎます。
+* **誠実な計上ルール**: `Saved Budget` と実測 `mttr_seconds` は、**型付き復旧（Rollback / Restart）を実行して事後エラー率 `< 1.0%` への回復が実証されたケースのみ計上**します。一過性エラーの静観（`OBSERVE`）や、オンコール担当者へ手動調査を引き継いだケース（`MANUAL_INTERVENTION`）では、架空の短縮分数を計上せず二次障害回避として区別記録します。
 
 ---
 
-## 4. Slack Socket Mode と Firestore 永続化による「公開 URL ゼロ＆再起動耐性」承認シーケンス
+## 4. Slack Socket Mode・即時 UX 更新・Runbook 鮮度ライフサイクル
 
-通常の HTTP Webhook で Slack のボタン操作を受け取ろうとすると、Slack サーバーは Google Cloud の IAM トークンを付与できないため、未認証でも到達できる公開 URL を用意する必要が生じます。  
-本設計では常駐型の Cloud Run instance から **Slack Socket Mode（外向き TLS WebSocket）** を張ることで公開 URL を完全にゼロにし、さらに中断中の ADK セッション（`FirestoreSessionService`）と承認待ちチケット（[ticket_store.py](../sre-agent/agent_app/ticket_store.py) の `FirestoreApprovalTicketStore`）の両方を **Cloud Firestore** に保存します。また、承認・却下ボタン押下直後にボタンを消去して **`⏳ 承認受付・実行中...`** へ即時更新（例外発生時はボタンを自動復元）することで、ローリング再起動待機中の二度押しを防ぎます。
-
-> [!IMPORTANT]
-> **なぜローカルの `/tmp` SQLite ではなく Firestore を使うのか？**  
-> Cloud Run instance のローカルディスク（`/tmp` 等）およびプロセス内メモリはエフェメラルであり、コンテナ再起動・停止・リビジョン更新時に消滅します。承認ボタン押下待ちの間にインスタンスが再起動しても途中から安全に再開（Resume）できるよう、本番デプロイ時（`SESSION_BACKEND=firestore`）は Firestore へ永続化し、ローカル開発やクラウド未接続の `pytest` 実行時のみ `SESSION_BACKEND=sqlite` で完結できるハイブリッド構造にしています。
+常駐 Cloud Run instance から **Slack Socket Mode（外向き TLS WebSocket）** で接続することで公開 URL をゼロにし、中断セッションと承認チケットを **Cloud Firestore** に保存してインスタンス再起動耐性を確保します。また、担当者がボタンを押した直後（0.5 秒以内）にボタンを消去して **`⏳ 承認受付・実行中...`** へ切り替える 2 段階更新により、GKE ロールアウト待機中の二度押しを防ぎます。
 
 ![Slack Socket Mode と Cloud Firestore による一時停止・承認再開シーケンス図](images/04-04-slack-hitl-resume-sequence.png)
 
@@ -203,27 +191,22 @@ sequenceDiagram
 
 </details>
 
-### 承認解決時の自律ナレッジ昇格と鮮度ライフサイクル管理ルール
+### 自律ナレッジ昇格と鮮度ライフサイクル遷移表
 
-運用を続けるほど人手を減らしつつ、**古い知識による誤った自動操作（ドリフト事故）を防ぐ**ため、[workflow.py](../sre-agent/agent_app/workflow.py) と [vector_kb.py](../sre-agent/agent_app/vector_kb.py) では以下のライフサイクル遷移を自動適用します。
-
-| 事象・判定ケース | `incident_runbooks` への更新内容 | 次回発生時の挙動 | 設計上の理由 |
-|---|---|---|---|
-| **初見（類似度 `0.85` 未満）かつ Slack `Approve` 後に `ROLLBACK` / `RESTART` で回復確認できた場合** | 新規 `AUTO-*` を自動 `MERGE` 登録・`last_verified_at = NOW`・`verified_count = 1` | **`AUTO_REMEDIATE` へ昇格**［今後 90 日間有効］ | 人間が承認し実環境で回復が実証された型付き復旧であるため、2 回目以降は即座に自動復旧させるため |
-| **初見かつ `Approve` されたが `MANUAL_INTERVENTION`［DB ロック調査等］である場合** | 新規 `AUTO-*` を自動 `MERGE` 登録 | **`REQUIRE_APPROVAL` を維持** | 原因分析や禁止事項の知見は蓄積しつつ、DB 操作等の高リスク手順が無断実行されるのを防ぐため |
-| **鮮度内（90 日以内）の自動復旧成功、または鮮度切れ（90 日超過）Runbook を人間が再 `Approve` して回復確認できた場合** | `last_verified_at = NOW`・`verified_count + 1` を `UPDATE`［ベクトル再生成なし］ | **さらに 90 日間 `AUTO_REMEDIATE` 資格を継続・復活** | 現在も有効であることが実証された手順の鮮度を自動延長し、長期間未発生だった手順だけ人間に再確認させるため |
-| **既存 `AUTO_REMEDIATE` Runbook が Slack で `Reject` された場合、または処置後の事後検証が NG だった場合** | `recommended_action = 'REQUIRE_APPROVAL'` へ自動降格［`lifecycle_status = 'ACTIVE'` は維持］ | **以後の無断自動実行を恒久凍結**［毎回人間承認を要求］ | 検索時の過去文脈は残しつつ、効かなくなった古い復旧手順が二度と自動実行されないよう安全側に固定するため |
+| 判定・処置ケース | `incident_runbooks` の更新 | 次回発生時の挙動 |
+|---|---|---|
+| **初見（類似度 `< 0.85`）で `Approve` 後に型付き復旧で回復確認** | 新規 `AUTO-*` を `MERGE` 登録・`verified_count = 1` | **`AUTO_REMEDIATE` へ昇格**［今後 90 日間有効］ |
+| **初見で `Approve` されたが `MANUAL_INTERVENTION` 種別** | 新規 `AUTO-*` を `MERGE` 登録 | **`REQUIRE_APPROVAL` を維持**［DB 等の無断操作を抑止］ |
+| **鮮度内の自動復旧成功、または 90 日超過手順の再 `Approve` 回復成功** | `last_verified_at = NOW`・`verified_count + 1`［ベクトル再計算なし］ | **さらに 90 日間 `AUTO_REMEDIATE` 資格を継続・復活** |
+| **既存 `AUTO_REMEDIATE` 手順が `Reject` された、または事後検証 NG** | `recommended_action = 'REQUIRE_APPROVAL'` へ更新 | **以後の無断自動実行を恒久凍結**［毎回承認を要求］ |
 
 ---
 
 ## 5. Slack App の作成と Secret Manager へのトークン登録
 
-Slack ワークスペースへの権限をお持ちの場合は、以下の **App Manifest** を使うことで 1 分で Socket Mode 対応アプリを作成できます（Slack 環境がない場合でも、エージェントは自動的にコンソール構造化ログ出力モードで動作するため第 5 章へ進めます）。
+Slack ワークスペースをお持ちの場合は、以下の App Manifest で Socket Mode 対応アプリを作成します（未設定環境でもコンソール構造化ログ出力モードでそのまま第 5 章へ進めます）。
 
-### Step 5.1 Slack App マニフェストの適用
-
-1. [Slack API: Your Apps](https://api.slack.com/apps) を開き、**Create New App** → **From an app manifest** を選択します。
-2. 対象ワークスペースを選び、YAML タブに以下を貼り付けて作成します。
+1. [Slack API: Your Apps](https://api.slack.com/apps) → **Create New App** → **From an app manifest** で以下を貼り付けます。
 
 ```yaml
 display_information:
@@ -246,18 +229,12 @@ settings:
   token_rotation_enabled: false
 ```
 
-3. **Basic Information** → **App-Level Tokens** で `connections:write` スコープ付きのトークンを生成し、`xapp-...` で始まる **App Token** を控えます。
-4. **Install to Workspace** を実行し、`xoxb-...` で始まる **Bot User OAuth Token** を控えます。
-5. 通知先 Slack チャンネルで `/invite @sre-agent` を実行し、チャンネル詳細下部に表示されるチャンネル ID（`C...`）を `.env` の `SLACK_ALERT_CHANNEL_ID` に設定します。あわせて、承認を許可するご自身のプロフィール画面（その他 → メンバー ID をコピー）から `U...` 形式の User ID を取得し、`SLACK_ALLOWED_APPROVER_IDS` に設定します。
-
-### Step 5.2 Secret Manager への安全な格納
-
-トークン文字列をコンテナイメージやマニフェストに直書きしないよう、Secret Manager に登録します。
+2. **Basic Information** → **App-Level Tokens** で `connections:write` スコープのトークン（`xapp-...`）を発行し、**Install to Workspace** で Bot Token（`xoxb-...`）を取得します。
+3. 対象チャンネルで `/invite @sre-agent` を実行し、チャンネル ID（`C...`）を `.env` の `SLACK_ALERT_CHANNEL_ID` に、ご自身のメンバー ID（`U...`）を `SLACK_ALLOWED_APPROVER_IDS` に設定してから Secret Manager へ格納します。
 
 ```bash
 source .env
 
-# Bot Token (xoxb-...) の登録
 read -rsp "Slack Bot Token (xoxb-...) を入力: " INPUT_BOT_TOKEN && echo ""
 printf "%s" "${INPUT_BOT_TOKEN}" | gcloud secrets create sre-slack-bot-token \
   --data-file=- \
@@ -265,7 +242,6 @@ printf "%s" "${INPUT_BOT_TOKEN}" | gcloud secrets create sre-slack-bot-token \
   --project="${GOOGLE_CLOUD_PROJECT}"
 unset INPUT_BOT_TOKEN
 
-# App-Level Token (xapp-...) の登録
 read -rsp "Slack App Token (xapp-...) を入力: " INPUT_APP_TOKEN && echo ""
 printf "%s" "${INPUT_APP_TOKEN}" | gcloud secrets create sre-slack-app-token \
   --data-file=- \
@@ -276,28 +252,24 @@ unset INPUT_APP_TOKEN
 
 ---
 
-## 6. ワークフロー 3 分岐と承認再開のローカルテスト確認
+## 6. 全テストスイート（26 件）のローカル実行確認
+
+ワークフロー 3 分岐、Slack 再開・即時状態更新、鮮度ライフサイクル、および Error Budget 温存計算を含む全 26 件のテストを実行します。
 
 ```bash
 source .venv/bin/activate
-pytest tests/test_workflow_routing.py tests/test_slack_hitl_resume.py -v
+pytest -v
 ```
 
-### 期待される出力
+### 期待される出力（全 26 件 PASS）
 
 ```text
-tests/test_workflow_routing.py::test_workflow_three_scenarios_end_to_end PASSED
-tests/test_slack_hitl_resume.py::test_slack_hitl_authorization_approve_and_reject_resume PASSED
-tests/test_slack_hitl_resume.py::test_pass_hat_k_blocks_flaky_agent PASSED
-tests/test_slack_hitl_resume.py::test_slack_report_highlights_failed_post_verification PASSED
-tests/test_slack_hitl_resume.py::test_resume_survives_instance_restart_via_persistent_ticket_and_session PASSED
-tests/test_slack_hitl_resume.py::test_build_session_service_rejects_unknown_backend PASSED
-tests/test_slack_hitl_resume.py::test_build_session_service_firestore_returns_adk_service PASSED
-tests/test_slack_hitl_resume.py::test_autonomous_kb_learning_promotes_novel_restart_to_auto_remediate PASSED
-tests/test_slack_hitl_resume.py::test_autonomous_kb_learning_keeps_manual_intervention_as_require_approval PASSED
-tests/test_slack_hitl_resume.py::test_bigquery_ai_search_and_autonomous_merge_queries PASSED
-tests/test_slack_hitl_resume.py::test_stale_runbook_revalidation_refresh_and_reject_demotion PASSED
-tests/test_slack_hitl_resume.py::test_slack_button_click_immediately_updates_to_in_progress_and_restores_on_error PASSED
+tests/test_dedup_and_guardrails.py ... (6 passed)
+tests/test_sandbox_runner.py ......... (4 passed)
+tests/test_slack_hitl_resume.py ...... (11 passed)
+tests/test_slo_metrics.py ............ (4 passed)
+tests/test_workflow_routing.py ....... (1 passed)
+============================== 26 passed ==============================
 ```
 
 ---
@@ -306,8 +278,8 @@ tests/test_slack_hitl_resume.py::test_slack_button_click_immediately_updates_to_
 
 ```markdown
 `AGENTS.md` を読み込み、第4章（`docs/04-auto-remediation-and-slack-hitl.md`）のテスト検証を実行してください。
-- `.venv` 環境で `pytest -v` を実行し、全 22 件のテスト（重複排除、サンドボックス隔離、100件検索、Workflow 3分岐、事後検証未回復時通知、Slack 承認者検証と即時状態更新、インスタンス再起動後の Resume 復旧、解決ナレッジ自律昇格、および鮮度有効期限超過時の降格・再承認更新・却下凍結）が PASS することを確認して報告すること。
-- Secret Manager への Slack トークン登録は私が手元でトークンを入力して行うため、実行用コマンドのみ案内すること。
+- `.venv` 環境で `pytest -v` を実行し、全 26 件のテスト（重複排除、サンドボックス隔離、Workflow 3分岐、Slack 再開と即時状態更新、自律ナレッジ昇格、鮮度管理、および Error Budget 温存計算）が PASS することを確認して報告すること。
+- Secret Manager への Slack トークン登録は私が手元で入力するため、コマンドのみ案内すること。
 ```
 
 ---
@@ -315,7 +287,8 @@ tests/test_slack_hitl_resume.py::test_slack_button_click_immediately_updates_to_
 ## Links and References
 
 * [Human input for agent workflows (ADK)](https://adk.dev/graphs/human-input/) — ADK 2.x グラフワークフローにおける Human-in-the-Loop 一時停止・再開仕様
-* [Slack Socket Mode documentation](https://api.slack.com/apis/connections/socket) — 外向き WebSocket によるイベント・Interactivity 受信仕様
+* [Retrieving SLO data with time-series selectors](https://docs.cloud.google.com/stackdriver/docs/solutions/slo-monitoring/api/timeseries-selectors) — `select_slo_budget_fraction`・`select_slo_burn_rate` の公式仕様
+* [Slack Socket Mode documentation](https://api.slack.com/apis/connections/socket) — 外向き WebSocket による Interactivity 受信仕様
 * [Secret Manager overview](https://docs.cloud.google.com/secret-manager/docs/overview) — シークレットの安全な管理と Cloud Run 連携
 
-次へ進む 👉 [第 5 章：Cloud Run instances への閉域常駐デプロイと 4 大障害訓練](05-deploy-cloud-run-instance-and-drills.md)
+次へ進む 👉 [第 5 章：閉域常駐デプロイ・4 大障害訓練・Error Budget 温存効果の実測](05-deploy-cloud-run-instance-and-drills.md)

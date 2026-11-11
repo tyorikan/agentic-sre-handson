@@ -168,3 +168,35 @@ class RemediationOutcome(BaseModel):
         default=None,
         description="人間による却下または事後検証 NG により REQUIRE_APPROVAL へ降格された既存 Runbook ID",
     )
+    mttr_seconds: float | None = Field(
+        default=None,
+        description="異常発生検知から事後回復プローブ確認までの実測所要秒数",
+    )
+    estimated_manual_mttr_minutes: float | None = Field(
+        default=None,
+        description="人間オンコール手動対応時の比較基準 MTTR（分）",
+    )
+    saved_error_budget_minutes: float | None = Field(
+        default=None,
+        description="早期の自動復旧・承認復旧によって消費を回避できた Error Budget 分数",
+    )
+    monthly_budget_saved_pct: float | None = Field(
+        default=None,
+        description="月次 99.9% 可用性 SLO の許容枠 43.2 分に対する温存割合（%）",
+    )
+    slo_daily_budget_remaining_pct: float | None = Field(
+        default=None,
+        description="記録時点の Cloud Monitoring 日次 99.0% SLO Error Budget 残量（%）",
+    )
+    slo_monthly_budget_remaining_pct: float | None = Field(
+        default=None,
+        description="記録時点の Cloud Monitoring 月次 99.9% SLO Error Budget 残量（%）",
+    )
+    slo_burn_rate_10m: float | None = Field(
+        default=None,
+        description="記録時点の直近 10 分間 Error Budget 燃焼率倍率",
+    )
+    slo_impact_summary: str = Field(
+        default="",
+        description="Slack 通知および監査記録用の Error Budget 効果要約文",
+    )

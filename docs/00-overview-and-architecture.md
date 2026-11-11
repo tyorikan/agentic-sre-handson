@@ -1,13 +1,13 @@
 # 第 0 章：全体アーキテクチャと事前準備 (`00-overview-and-architecture.md`)
 
 **所要時間**: 約 20 分  
-**到達目標**: 本ワークショップで作る常駐自律型 SRE エージェントの全体像と設計根拠（「なぜ機能するのか」「何が不向きなのか」）を理解し、検証用 Google Cloud プロジェクトの API と IAM を準備する。
+**到達目標**: 本ワークショップで作る常駐自律型 SRE エージェントの全体像と適用境界を理解し、検証用 Google Cloud プロジェクトの API と最小権限サービスアカウントを準備する。
 
 ---
 
 ## 1. このワークショップで体験する自律運用と自己成長ループ
 
-本番システムの運用では、「すべてのアラートで Pod を再起動すればよい」わけではありません。誤った自動操作は障害をかえって拡大させます。本ハンズオンでは、以下の判断フローと解決ナレッジ自律蓄積ループをゼロから構築します。
+本番システムの運用では「すべてのアラートで Pod を再起動すればよい」わけではありません。誤った自動再起動は障害をかえって拡大させます。本ハンズオンでは、以下の判断フロー・解決ナレッジ自律蓄積・Error Budget 温存計測をゼロから構築します。
 
 ![アラート検知から 3 分岐・Slack 承認再開までの意思決定フロー図](images/00-01-triage-routing-flow.png)
 
@@ -43,17 +43,18 @@ flowchart LR
 
 </details>
 
-### なぜこの設計が本番で機能するのか／何ができない・不向きなのか
+### なぜこの設計が本番で機能するのか／何が不向きなのか
 
-* **本番で機能する理由**:
-  1. **Out-of-Band（帯域外）常駐監視**: 監視対象の GKE クラスタとは独立した **Cloud Run instances** 上でエージェントを動かすため、GKE 側がノード枯渇や障害に陥ってもエージェントは巻き込まれず外部から復旧 API を実行できます。
-  2. **攻撃対象面ゼロの双方向通信**: Cloud Run instance には `--ingress internal` と `--no-default-url` を設定し、インターネットからの着信を完全遮断します。Pub/Sub StreamingPull と Slack Socket Mode はどちらも**コンテナからの外向き TLS 通信**であるため、公開 URL を一切開けずにリアルタイム監視と承認ボタン連携が成立します。
-  3. **調査の柔軟性と変更の厳格性の分離**: メトリクス統計計算などの動的スクリプトは外向き通信・認証情報を遮断した **Cloud Run sandboxes（`sandbox do`）** 内で実行し、GKE の変更操作は Namespace 固定・回数上限付きの型付き Python 関数のみに限定します。
-  4. **検証済み解決策のみを蓄積する自律成長型知識ベース**: 初見の障害は安全ガードレールで人間承認に回し、担当者が承認して**事後エラー率 1.0% 未満への回復が実証された場合のみ**、解決内容を構造化 Runbook として BigQuery へ `MERGE` 登録します。テーブルの `GENERATED ALWAYS AS (AI.EMBED(...))` 定義により BigQuery が裏側で自動的にベクトル化するため、再学習バッチ不要で次回から `AI.SEARCH` による自動復旧対象に昇格します。未検証の推測や回復失敗ケースは登録しないため、誤った対処法で知識ベースが汚染されることもありません。
+* **本番で機能する 5 つの理由**:
+  1. **Out-of-Band（帯域外）常駐監視**: 監視対象の GKE とは独立した **Cloud Run instances** 上で稼働するため、GKE 側が障害に陥っても外部から復旧 API を実行できます。
+  2. **着信公開 URL ゼロの双方向通信**: `--ingress internal` と `--no-default-url` で外部からの着信を完全遮断します。Pub/Sub StreamingPull と Slack Socket Mode はどちらもコンテナからの外向き TLS 通信であるため、公開 URL なしで監視と承認ボタン連携が成立します。
+  3. **調査の柔軟性と変更の厳格性の分離**: 統計計算スクリプトは外向き通信・認証情報を遮断した **Cloud Run sandboxes（`sandbox do`）** 内で実行し、GKE の変更は Namespace 固定・回数上限付きの型付き関数のみに限定します。
+  4. **鮮度管理付きの自律成長型知識ベース**: 初見障害は人間承認を経て**事後エラー率 1.0% 未満への回復が実証された場合のみ** BigQuery `incident_runbooks` へ自動登録し、`AI.EMBED` 生成列で自動ベクトル化します。一方、90 日以上未検証の手順は人間再承認へ自動降格し、却下・未回復手順は自動凍結します。
+  5. **Error Budget 温存効果の定量証明**: Cloud Monitoring の公式 SLO モニタリングと連動し、約 1〜2 分の自動復旧によって「従来の人間手動対応（例: 30 分）と比べてどれだけ Error Budget を守れたか」を数値で証明できます。
 * **できないこと・不向きなこと（設計上の明確な境界線）**:
-  1. **全量アクセスログの直接 LLM 監視には不向き**: 毎秒数千行の生ログをすべて LLM に読ませるとコストと遅延が破綻します。一次検知は必ず Cloud Monitoring アラートや Cloud Logging のエラーフィルタシンクで行います。
-  2. **DB スキーマ破損やロック競合の無断自動修復は行わない**: ステートフルな DB 障害でアプリを無断再起動するとロールバック負荷と再接続ラッシュで被害が拡大します。本設計ではこれらを自動的に `REQUIRE_APPROVAL` へ振り分け、1 分以内に診断証跡を揃えて人間へ判断を委ねます。
-  3. **リージョンと製品ステージの制約**: Cloud Run instances および Cloud Run sandboxes は Preview 機能であり、`us-central1`・`us-east1`・`europe-west1` では利用できません。本ハンズオンでは対応リージョンである **`asia-northeast1`（東京）** を使用します。
+  1. **全量生ログの直接 LLM 監視には不向き**: 平常時の大量ログを LLM に直接読ませるとコストと遅延が破綻します。一次抽出は必ず Cloud Logging シンクやアラートで行います。
+  2. **DB スキーマ破損やロック競合の無断自動修復は行わない**: ステートフルな DB 障害でアプリを無断再起動すると被害が拡大するため、自動的に `REQUIRE_APPROVAL` へ振り分けて人間へ判断を委ねます。
+  3. **リージョンと製品ステージの制約**: Cloud Run instances および sandboxes は Preview 機能であり、`us-central1`・`us-east1`・`europe-west1` では利用できません。本手順では対応リージョンである **`asia-northeast1`（東京）** を使用します。
 
 ---
 
@@ -79,30 +80,31 @@ flowchart LR
 
 ### Step 2.0 実施者（作業ユーザー）に必要な Google Cloud IAM ロールの確認
 
-本ハンズオンではサービスアカウントへの IAM 付与や Kubernetes RBAC の作成を行うため、基本ロールの **編集者（`roles/editor`）だけでは途中で権限エラーになります**。実施者の Google アカウントに以下のいずれかが付与されていることを確認してください。
+本ハンズオンではサービスアカウントへの IAM 付与、Kubernetes RBAC、および SLO 作成を行うため、**編集者（`roles/editor`）だけでは途中で権限不足になります**。以下のいずれかが付与されていることを確認してください。
 
 * **方法 A（個人検証プロジェクト向け・最短）**: 対象プロジェクトの **オーナー（`roles/owner`）**
-* **方法 B（組織ポリシー等で `roles/owner` を使わない場合の事前定義ロール一式）**: プロジェクト管理者に依頼し、実施ユーザーへ以下のロールを付与します。
+* **方法 B（最小権限の事前定義ロール一式を使う場合）**: プロジェクト管理者に以下のロール付与を依頼します。
 
-| 事前定義ロール | 使用する章と主な用途 |
+| 事前定義ロール | 使用する章と用途 |
 |---|---|
-| `roles/serviceusage.serviceUsageAdmin` | 第 0 章：各種 Google Cloud API の有効化と利用 |
-| `roles/iam.serviceAccountAdmin` | 第 0・6 章：エージェント専用サービスアカウントの作成・削除 |
+| `roles/serviceusage.serviceUsageAdmin` | 第 0 章：Google Cloud API の有効化と利用 |
+| `roles/iam.serviceAccountAdmin` | 第 0・6 章：専用サービスアカウントの作成・削除 |
 | `roles/iam.serviceAccountUser` | 第 1・5 章：Cloud Build 実行および Cloud Run instance への SA アタッチ |
-| `roles/resourcemanager.projectIamAdmin` | 第 0・2 章：SA への最小権限付与、BigQuery Cloud Resource Connection 用 SA への推論権限付与 |
+| `roles/resourcemanager.projectIamAdmin` | 第 0・2 章：各専用 SA および BigQuery Connection SA への最小権限付与 |
 | `roles/datastore.owner` | 第 0 章：Firestore `(default)` Native データベースの作成 |
 | `roles/artifactregistry.admin` | 第 1・6 章：コンテナイメージ用リポジトリの作成・削除 |
-| `roles/cloudbuild.builds.editor` / `roles/storage.admin` | 第 1・5 章：`gcloud builds submit` によるソース転送とコンテナビルド |
-| `roles/compute.networkAdmin` | 第 1・6 章：専用カスタム VPC・サブネット・Cloud NAT の作成と削除 |
-| `roles/container.admin` | 第 1・5・6 章：GKE Autopilot 作成・削除、`Role` / `RoleBinding` 作成、権限検証 |
-| `roles/pubsub.admin` | 第 1・6 章：トピック・サブスクリプション作成、Log Sink Writer への権限付与 |
-| `roles/logging.admin` | 第 1・5・6 章：Cloud Logging エラーシンク作成・削除、エージェント構造化ログ閲覧 |
-| `roles/bigquery.admin` | 第 2・5・6 章：データセット・Cloud Resource Connection・`AI.EMBED` 自動埋め込みテーブル作成と削除 |
+| `roles/cloudbuild.builds.editor` / `roles/storage.admin` | 第 1・5 章：`gcloud builds submit` によるコンテナビルド |
+| `roles/compute.networkAdmin` | 第 1・6 章：専用カスタム VPC・サブネット・Cloud NAT の作成・削除 |
+| `roles/container.admin` | 第 1・5・6 章：GKE Autopilot 作成・削除、`Role` / `RoleBinding` 作成 |
+| `roles/pubsub.admin` | 第 1・6 章：Pub/Sub トピック・サブスクリプション作成、Sink 権限付与 |
+| `roles/logging.admin` | 第 1・5・6 章：Logging シンクおよびログベースメトリクス作成・ログ閲覧 |
+| `roles/monitoring.editor` | 第 1・5・6 章：Service Monitoring サービス・可用性 SLO の作成と残量照会 |
+| `roles/bigquery.admin` | 第 2・5・6 章：データセット・Cloud Resource Connection・`AI.EMBED` テーブル管理 |
 | `roles/run.admin` | 第 5・6 章：Cloud Run instance のデプロイ・停止・削除 |
-| `roles/secretmanager.admin` | 第 4・6 章：Slack 連携を行う場合のトークン登録・削除（Slack 省略時は不要） |
+| `roles/secretmanager.admin` | 第 4・6 章：Slack 連携トークンの登録・削除（Slack 省略時は不要） |
 
 ```bash
-# （方法 B の場合のみ）プロジェクト管理者がハンズオン実施ユーザーへ最小ロール一式を付与するコマンド例
+# 方法 B の場合のみ：プロジェクト管理者がハンズオン実施ユーザーへ最小ロール一式を付与するコマンド例
 export HANDSON_USER_EMAIL="your-email@example.com"
 export GOOGLE_CLOUD_PROJECT="your-handson-project-id"
 
@@ -119,6 +121,7 @@ for ROLE in \
   roles/container.admin \
   roles/pubsub.admin \
   roles/logging.admin \
+  roles/monitoring.editor \
   roles/bigquery.admin \
   roles/run.admin \
   roles/secretmanager.admin; do
@@ -135,7 +138,6 @@ done
 検証用の Google Cloud プロジェクト ID を指定して `.env` を作成します（本番プロジェクトは指定しないでください）。
 
 ```bash
-# HTTPS でクローンする場合（Private 運用中かつ SSH 鍵設定済みの場合は git@github.com:tyorikan/agentic-sre-handson.git）
 git clone "https://github.com/tyorikan/agentic-sre-handson.git"
 cd agentic-sre-handson
 
@@ -146,9 +148,9 @@ source .env
 gcloud config set project "${GOOGLE_CLOUD_PROJECT}"
 ```
 
-### Step 2.2 必要な Google Cloud API の有効化と Firestore 作成
+### Step 2.2 Google Cloud API の有効化と Firestore 作成
 
-GKE、Cloud Run、BigQuery、Firestore、Pub/Sub、Observability、Artifact Registry、Secret Manager、および Gemini Enterprise Agent Platform（`aiplatform.googleapis.com`）を有効化し、ADK セッション・承認待ちチケット用の Firestore Native データベース（`(default)`）を作成します。
+必要な API を一括有効化し、ADK セッション・承認チケット永続化用の Firestore Native データベース（`(default)`）を作成します。
 
 ```bash
 gcloud services enable \
@@ -167,7 +169,6 @@ gcloud services enable \
   secretmanager.googleapis.com \
   --project="${GOOGLE_CLOUD_PROJECT}"
 
-# (default) データベースが未作成の場合のみ作成（既存プロジェクトでは既定 DB が既に存在する場合があります）
 if ! gcloud firestore databases describe --database="(default)" --project="${GOOGLE_CLOUD_PROJECT}" >/dev/null 2>&1; then
   gcloud firestore databases create \
     --location="${GOOGLE_CLOUD_REGION}" \
@@ -176,13 +177,13 @@ if ! gcloud firestore databases describe --database="(default)" --project="${GOO
 fi
 ```
 
-### Step 2.3 最小権限で分離した 3 つの専用サービスアカウント作成
+### Step 2.3 用途別に分離した 3 つの最小権限サービスアカウント作成
 
-新規組織で既定の Compute Engine サービスアカウントが無効化・権限削除されている環境でもそのまま動作し、かつ過剰な権限（`roles/editor` 等）を一切使わないよう、用途別に以下の **3 つの専用サービスアカウント** を作成します。
+既定の Compute Engine サービスアカウントが無効化された組織環境でも動作し、かつ過剰権限（`roles/editor` 等）を排除するため、用途別に 3 つの専用サービスアカウントを作成します。
 
-1. **`sre-cloudbuild-sa`**（コンテナビルド専用）：ソースアーカイブ読取・Artifact Registry への Push・ビルドログ出力のみ
-2. **`sre-gke-node-sa`**（監視対象 GKE Autopilot ノード専用）：ノードからのログ・メトリクス送信と Artifact Registry からのイメージ Pull のみ
-3. **`sre-autonomous-agent-sa`**（常駐 SRE エージェント専用）：観測読取、リモート MCP 呼び出し、BigQuery・Firestore 読み書き、Pub/Sub 購読、モデル推論、GKE クラスタ到達のみ（GKE 内の具体的な変更範囲は第 1 章の Kubernetes RBAC で `sre-demo-app` Namespace のみに絞り込みます）
+1. **`sre-cloudbuild-sa`**（コンテナビルド専用）：ソース取得・Artifact Registry 書込・ビルドログ出力のみ
+2. **`sre-gke-node-sa`**（GKE ノード専用）：ノードからのログ・メトリクス送信とイメージ取得のみ
+3. **`sre-autonomous-agent-sa`**（常駐 SRE エージェント専用）：観測・SLO 読取、リモート MCP 呼び出し、BigQuery・Firestore 読み書き、Pub/Sub 購読、モデル推論、GKE クラスタ到達のみ（GKE 内の変更範囲は第 1 章の Kubernetes RBAC で `sre-demo-app` のみに限定）
 
 ```bash
 export SRE_BUILD_SA_NAME="sre-cloudbuild-sa"
@@ -204,7 +205,7 @@ gcloud iam service-accounts create "${SRE_AGENT_SA_NAME}" \
   --display-name="Autonomous SRE Agent Service Account" \
   --project="${GOOGLE_CLOUD_PROJECT}"
 
-# SA 作成直後の IAM 伝播待ち（数秒以内に連続実行すると does not exist になる場合があるため待機＋リトライ）
+# SA 作成直後の IAM 伝播待ち（即時実行時の does not exist エラーを防ぐため待機＋リトライ）
 sleep 10
 
 grant_roles() {
@@ -225,18 +226,15 @@ grant_roles() {
   done
 }
 
-# 1. Cloud Build 専用 SA への最小ロール付与
 grant_roles "${SRE_BUILD_SA_EMAIL}" \
   roles/storage.objectViewer \
   roles/artifactregistry.writer \
   roles/logging.logWriter
 
-# 2. GKE Autopilot ノード専用 SA への最小ロール付与
 grant_roles "${GKE_NODE_SA_EMAIL}" \
   roles/container.defaultNodeServiceAccount \
   roles/artifactregistry.reader
 
-# 3. 常駐 SRE エージェント専用 SA への最小ロール付与
 grant_roles "${SRE_AGENT_SA_EMAIL}" \
   roles/monitoring.viewer \
   roles/logging.viewer \
@@ -254,7 +252,7 @@ grant_roles "${SRE_AGENT_SA_EMAIL}" \
 
 ### 動作確認
 
-以下のコマンドでサービスアカウントと付与ロールが正しく表示されれば準備完了です。
+以下のコマンドでサービスアカウントに最小ロール一式が付与されていれば準備完了です。
 
 ```bash
 gcloud projects get-iam-policy "${GOOGLE_CLOUD_PROJECT}" \
@@ -267,12 +265,10 @@ gcloud projects get-iam-policy "${GOOGLE_CLOUD_PROJECT}" \
 
 ## 🤖 AI コーディングエージェントを使う場合の指示プロンプト
 
-Google Antigravity / Claude Code / Gemini CLI を使って本章を実行する場合は、以下をそのまま渡してください。
-
 ```markdown
 `AGENTS.md` と `.env` を読み込み、第0章（`docs/00-overview-and-architecture.md`）の事前準備を実行してください。
 - 対象プロジェクトが `.env` の `GOOGLE_CLOUD_PROJECT` であることを最初に表示して確認すること。
-- API 有効化と `sre-autonomous-agent-sa` サービスアカウント作成・IAM 付与のコマンドを実行前に提示し、私の `y` 承認を得てから実行すること。
+- API 有効化・Firestore 作成・3 つの専用 SA 作成と IAM 付与コマンドを実行前に提示し、私の `y` 承認を得てから実行すること。
 ```
 
 ---
@@ -280,7 +276,7 @@ Google Antigravity / Claude Code / Gemini CLI を使って本章を実行する�
 ## Links and References
 
 * [Create and manage Cloud Run instances](https://docs.cloud.google.com/run/docs/instances/create-and-manage-instances) — Cloud Run instances の概要と対応リージョン
-* [Google Cloud MCP servers overview](https://docs.cloud.google.com/mcp/overview) — `roles/mcp.toolUser` を用いた Google Cloud リモート MCP サーバーの利用方法
+* [Google Cloud MCP servers overview](https://docs.cloud.google.com/mcp/overview) — `roles/mcp.toolUser` を用いた公式リモート MCP サーバーの利用方法
 * [IAM least privilege best practices](https://docs.cloud.google.com/iam/docs/using-iam-securely) — サービスアカウントの最小権限設計ガイド
 
-次へ進む 👉 [第 1 章：監視対象 GKE アプリとアラートストリームの構築](01-target-gke-and-alerting.md)
+次へ進む 👉 [第 1 章：監視対象 GKE・イベントストリーム・可用性 SLO の構築](01-target-gke-and-alerting.md)
