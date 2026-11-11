@@ -52,8 +52,8 @@ flowchart LR
 検証用の Google Cloud プロジェクト ID を指定して `.env` を作成します（本番プロジェクトは指定しないでください）。
 
 ```bash
-# <your-account> を実際の配布元アカウント名に置き換えて実行してください
-git clone "https://github.com/<your-account>/agentic-sre-handson.git"
+# HTTPS でクローンする場合（Private 運用中かつ SSH 鍵設定済みの場合は git@github.com:tyorikan/agentic-sre-handson.git）
+git clone "https://github.com/tyorikan/agentic-sre-handson.git"
 cd agentic-sre-handson
 
 cp .env.example .env
