@@ -47,6 +47,57 @@ flowchart LR
     style Step3 fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px
 ```
 
+### Step 2.0 実施者（作業ユーザー）に必要な Google Cloud IAM ロールの確認
+
+本ハンズオンではサービスアカウントへの IAM 付与や Kubernetes RBAC の作成を行うため、基本ロールの **編集者（`roles/editor`）だけでは途中で権限エラーになります**。実施者の Google アカウントに以下のいずれかが付与されていることを確認してください。
+
+* **方法 A（個人検証プロジェクト向け・最短）**: 対象プロジェクトの **オーナー（`roles/owner`）**
+* **方法 B（組織ポリシー等で `roles/owner` を使わない場合の事前定義ロール一式）**: プロジェクト管理者に依頼し、実施ユーザーへ以下のロールを付与します。
+
+| 事前定義ロール | 使用する章と主な用途 |
+|---|---|
+| `roles/serviceusage.serviceUsageAdmin` | 第 0 章：各種 Google Cloud API の有効化と利用 |
+| `roles/iam.serviceAccountAdmin` | 第 0・6 章：エージェント専用サービスアカウントの作成・削除 |
+| `roles/iam.serviceAccountUser` | 第 1・5 章：Cloud Build 実行および Cloud Run instance への SA アタッチ |
+| `roles/resourcemanager.projectIamAdmin` | 第 0・2 章：SA への最小権限付与、BigQuery `CONNECTION DEFAULT` 初回権限委譲 |
+| `roles/datastore.owner` | 第 0 章：Firestore `(default)` Native データベースの作成 |
+| `roles/artifactregistry.admin` | 第 1・6 章：コンテナイメージ用リポジトリの作成・削除 |
+| `roles/cloudbuild.builds.editor` / `roles/storage.admin` | 第 1・5 章：`gcloud builds submit` によるソース転送とコンテナビルド |
+| `roles/container.admin` | 第 1・5・6 章：GKE Autopilot 作成・削除、`Role` / `RoleBinding` 作成、権限検証 |
+| `roles/pubsub.admin` | 第 1・6 章：トピック・サブスクリプション作成、Log Sink Writer への権限付与 |
+| `roles/logging.admin` | 第 1・5・6 章：Cloud Logging エラーシンク作成・削除、エージェント構造化ログ閲覧 |
+| `roles/bigquery.admin` | 第 2・5・6 章：データセット・`CONNECTION DEFAULT` モデル作成、ベクトル生成・削除 |
+| `roles/run.admin` | 第 5・6 章：Cloud Run instance のデプロイ・停止・削除 |
+| `roles/secretmanager.admin` | 第 4・6 章：Slack 連携を行う場合のトークン登録・削除（Slack 省略時は不要） |
+
+```bash
+# （方法 B の場合のみ）プロジェクト管理者がハンズオン実施ユーザーへ最小ロール一式を付与するコマンド例
+export HANDSON_USER_EMAIL="your-email@example.com"
+export GOOGLE_CLOUD_PROJECT="your-handson-project-id"
+
+for ROLE in \
+  roles/serviceusage.serviceUsageAdmin \
+  roles/iam.serviceAccountAdmin \
+  roles/iam.serviceAccountUser \
+  roles/resourcemanager.projectIamAdmin \
+  roles/datastore.owner \
+  roles/artifactregistry.admin \
+  roles/cloudbuild.builds.editor \
+  roles/storage.admin \
+  roles/container.admin \
+  roles/pubsub.admin \
+  roles/logging.admin \
+  roles/bigquery.admin \
+  roles/run.admin \
+  roles/secretmanager.admin; do
+  gcloud projects add-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
+    --member="user:${HANDSON_USER_EMAIL}" \
+    --role="${ROLE}" \
+    --condition=None \
+    --quiet
+done
+```
+
 ### Step 2.1 リポジトリの取得と環境変数の設定
 
 検証用の Google Cloud プロジェクト ID を指定して `.env` を作成します（本番プロジェクトは指定しないでください）。

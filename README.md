@@ -72,6 +72,10 @@ flowchart TB
 
 上から順番に進めることで、ゼロから全コンポーネントを構築し、3 つの実戦障害シナリオで動作を検証できます。各章には **Cloud Shell 用の手順** と **AI コーディングエージェント（Google Antigravity / Claude Code / Gemini CLI）用の指示プロンプト** の両方を記載しています。
 
+### 開始前の前提条件（実施者に必要な IAM ロール）
+* **検証用サンドボックスプロジェクトの場合**: 実施ユーザーに **オーナー（`roles/owner`）** が付与されていれば全章そのまま実行できます。
+* **⚠️ `roles/editor`（編集者）のみでは完走できません**: IAM バインディング付与・GKE `RoleBinding` 作成・Pub/Sub トピック IAM 設定・Secret Manager 操作で権限不足となります。`roles/owner` を使わずに事前定義ロールで最小権限付与を行う場合の一覧と付与コマンドは、[00-overview-and-architecture.md](docs/00-overview-and-architecture.md) の「Step 2.0」を参照してください。
+
 | 章 | ドキュメント | 所要時間 | 構築・検証する内容 |
 |---|---|---|---|
 | **00** | [00-overview-and-architecture.md](docs/00-overview-and-architecture.md) | 20 分 | 全体設計、できること・不向きなことの境界、GCP API・IAM 事前準備 |
