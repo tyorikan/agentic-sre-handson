@@ -128,7 +128,7 @@ def test_guardrail_downgrades_disallowed_namespace_and_circuit_breaker() -> None
 
 
 def test_pubsub_payload_normalization_and_target_app_modes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Cloud Logging シンク形式のパースと監視対象 FastAPI アプリの 3 障害モードが正常動作すること。"""
+    """Cloud Logging シンク形式のパースと監視対象 FastAPI アプリの 4 障害モードが正常動作すること。"""
     raw_log = b"""{
         "insertId": "log-991",
         "severity": "ERROR",
@@ -160,6 +160,10 @@ def test_pubsub_payload_normalization_and_target_app_modes(monkeypatch: pytest.M
     client.post("/admin/fault", json={"mode": "DB_POOL_EXHAUSTED", "duration_seconds": 60})
     db_resp = client.post("/orders", json={"item_id": "SKU-1", "quantity": 1, "amount_jpy": 1000})
     assert db_resp.status_code == 500
+
+    client.post("/admin/fault", json={"mode": "TAX_CACHE_CORRUPTION", "duration_seconds": 60})
+    tax_resp = client.post("/orders", json={"item_id": "SKU-1", "quantity": 1, "amount_jpy": 1000})
+    assert tax_resp.status_code == 500
 
     client.post("/admin/fault", json={"mode": "NONE", "duration_seconds": 0})
     monkeypatch.setenv("APP_VERSION", "v2.0.0-buggy")

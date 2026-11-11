@@ -251,6 +251,12 @@ class SlackHitlCoordinator:
 
         if self._bolt_app and ticket.channel_id and ticket.message_ts:
             action_label = "✅ 承認・実行完了" if approved else "🛑 却下・手動対応へ移行"
+            kb_note = (
+                f"\n📚 *自律ナレッジ登録:* `{outcome.learned_runbook_id}` を BigQuery `incident_runbooks` へ追加しました"
+                f"（AI.EMBED 自動ベクトル化・次回推奨: `{outcome.learned_recommended_action}`）"
+                if outcome.learned_runbook_id
+                else ""
+            )
             await self._bolt_app.client.chat_update(
                 channel=ticket.channel_id,
                 ts=ticket.message_ts,
@@ -264,6 +270,7 @@ class SlackHitlCoordinator:
                                 f"*{action_label}* (操作者: <@{slack_user_id}>)\n"
                                 f"*対象:* `{ticket.decision.target_namespace}/{ticket.decision.target_deployment}`\n"
                                 f"*結果:* {outcome.detail_message}"
+                                f"{kb_note}"
                             ),
                         },
                     }

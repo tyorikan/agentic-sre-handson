@@ -6,6 +6,7 @@ GKE クラスタ上で稼働し、構造化 JSON ログと HTTP ステータス�
 1. TRANSIENT_NET_ERR: 下流決済ゲートウェイの一時的な通信瞬断（指定秒数後に自然回復）
 2. MISSING_CONFIG_BUG: v2 デプロイ時の必須設定キー（PAYMENT_CURRENCY_PRECISION）欠落バグ（ロールバックで解消）
 3. DB_POOL_EXHAUSTED: データベースコネクションプール枯渇・ロック待ち（未知/高リスク障害として人間承認を要求）
+4. TAX_CACHE_CORRUPTION: シード 100 件に未登録の初見インメモリ税率テーブル CRC32 破損（Pod のローリング再起動で回復）
 """
 
 from __future__ import annotations
@@ -131,6 +132,16 @@ async def create_order(req: OrderRequest, request: Request, response: Response) 
         )
         raise HTTPException(status_code=500, detail="Database connection pool exhausted due to lock contention")
 
+    if fault == "TAX_CACHE_CORRUPTION":
+        _emit_structured_log(
+            "ERROR",
+            "RuntimeError: In-memory consumption tax rate lookup table CRC32 checksum mismatch; worker heap cache corrupted",
+            error_code="TAX_RULE_CRC32_MISMATCH_500",
+            trace_id=trace_id,
+            extra={"cache_segment": "jp_consumption_tax_v1", "expected_crc32": "0x9A4F21C0", "actual_crc32": "0x0000DEAD"},
+        )
+        raise HTTPException(status_code=500, detail="In-memory tax table checksum corruption")
+
     order_id = f"ORD-{uuid.uuid4().hex[:10].upper()}"
     _emit_structured_log(
         "INFO",
@@ -145,7 +156,7 @@ async def create_order(req: OrderRequest, request: Request, response: Response) 
 @app.post("/admin/fault")
 async def configure_fault(fault_req: FaultInjectionRequest) -> dict[str, Any]:
     """ハンズオンの障害注入スクリプトから一時的な障害状態をセットする。"""
-    allowed = {"NONE", "TRANSIENT_NET_ERR", "DB_POOL_EXHAUSTED"}
+    allowed = {"NONE", "TRANSIENT_NET_ERR", "DB_POOL_EXHAUSTED", "TAX_CACHE_CORRUPTION"}
     if fault_req.mode not in allowed:
         raise HTTPException(status_code=400, detail=f"Unsupported mode: {fault_req.mode}")
 

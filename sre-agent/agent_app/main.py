@@ -95,8 +95,18 @@ async def process_incoming_alert(
     guardrails: IncidentGuardrailManager,
     orchestrator: SreIncidentOrchestrator,
     slack_coordinator: SlackHitlCoordinator,
+    *,
+    allow_drill_reset: bool = False,
 ) -> bool:
     """単一アラートを重複排除・処理権取得の上で実行する（スキップ時は False、実行時は True）。"""
+    if alert.error_code == "ADMIN_COOLDOWN_RESET":
+        if allow_drill_reset:
+            await asyncio.to_thread(guardrails.reset_all_cooldowns, alert.summary)
+            _log_json("INFO", "訓練用クールダウンおよびサーキットブレーカーをリセットしました。", incident_id=alert.incident_id)
+            return True
+        _log_json("WARNING", "ALLOW_DRILL_COOLDOWN_RESET=false のため ADMIN_COOLDOWN_RESET を無視しました。", incident_id=alert.incident_id)
+        return False
+
     claimed, reason = await asyncio.to_thread(guardrails.claim_for_processing, alert)
     if not claimed:
         _log_json("INFO", "クールダウン中のためアラートを重複排除スキップしました。", incident_id=alert.incident_id, reason=reason)
@@ -175,7 +185,13 @@ async def run_daemon(settings: AgentSettings) -> None:
         try:
             alert = parse_pubsub_payload(message.data)
             fut = asyncio.run_coroutine_threadsafe(
-                process_incoming_alert(alert, guardrails, orchestrator, slack_coordinator),
+                process_incoming_alert(
+                    alert,
+                    guardrails,
+                    orchestrator,
+                    slack_coordinator,
+                    allow_drill_reset=settings.allow_drill_cooldown_reset,
+                ),
                 loop,
             )
             fut.result(timeout=180)

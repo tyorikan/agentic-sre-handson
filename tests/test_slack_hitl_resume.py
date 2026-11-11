@@ -14,7 +14,11 @@ from agent_app.remediation_tools import SafeRemediationService
 from agent_app.sandbox_runner import SandboxRunner
 from agent_app.slack_socket import SlackHitlCoordinator, build_report_blocks
 from agent_app.ticket_store import FirestoreApprovalTicketStore
-from agent_app.vector_kb import LocalJsonlKnowledgeBase
+from agent_app.vector_kb import (
+    BigQueryVectorKnowledgeBase,
+    LocalJsonlKnowledgeBase,
+    synthesize_runbook_deterministic,
+)
 from agent_app.workflow import SreIncidentOrchestrator, WorkflowRunResult, build_session_service
 from calc_pass_hat_k import compute_pass_at_k, compute_pass_hat_k, evaluate_results
 
@@ -51,6 +55,10 @@ async def _approval_required_restart_analyzer(
     )
 
 
+async def _fast_det_synthesizer(alert: AlertEvent, decision: TriageDecision, outcome: RemediationOutcome):
+    return synthesize_runbook_deterministic(alert, decision, outcome)
+
+
 @pytest.mark.asyncio
 async def test_slack_hitl_authorization_approve_and_reject_resume(tmp_path: Path) -> None:
     """Slack 承認者チェック、Approve 時の ADK 再開・GKE 実行、Reject 時の実行中止を検証する。"""
@@ -76,6 +84,7 @@ async def test_slack_hitl_authorization_approve_and_reject_resume(tmp_path: Path
         guardrail_manager=guardrails,
         remediation_service=remediation,
         decision_analyzer=_approval_required_restart_analyzer,
+        runbook_synthesizer=_fast_det_synthesizer,
         session_service=DatabaseSessionService(db_url=settings.session_db_url),
     )
     coordinator = SlackHitlCoordinator(settings, orchestrator)
@@ -252,6 +261,7 @@ async def test_resume_survives_instance_restart_via_persistent_ticket_and_sessio
         guardrail_manager=guardrails,
         remediation_service=remediation,
         decision_analyzer=_approval_required_restart_analyzer,
+        runbook_synthesizer=_fast_det_synthesizer,
         session_service=build_session_service(settings),
     )
     coord1 = SlackHitlCoordinator(
@@ -277,6 +287,7 @@ async def test_resume_survives_instance_restart_via_persistent_ticket_and_sessio
         guardrail_manager=guardrails,
         remediation_service=remediation,
         decision_analyzer=_approval_required_restart_analyzer,
+        runbook_synthesizer=_fast_det_synthesizer,
         session_service=build_session_service(settings),
     )
     coord2 = SlackHitlCoordinator(
@@ -337,4 +348,233 @@ def test_build_session_service_firestore_returns_adk_service(monkeypatch: pytest
         )
     )
     assert isinstance(svc, FirestoreSessionService)
+
+
+@pytest.mark.asyncio
+async def test_autonomous_kb_learning_promotes_novel_restart_to_auto_remediate(tmp_path: Path) -> None:
+    """シナリオ4検証: 初見エラーが1回目の承認解決で知識ベースへ自動登録され、2回目は人間承認なしで自動復旧すること。"""
+    db_file = tmp_path / "self_learn_sessions.db"
+    settings = AgentSettings(
+        sandbox_mode="local_subprocess",
+        session_backend="sqlite",
+        session_db_url=f"sqlite+aiosqlite:///{db_file}",
+        enable_autonomous_kb_learning=True,
+        allow_drill_cooldown_reset=True,
+        slack_allowed_approvers=("U_SRE_LEAD",),
+    )
+    store = InMemoryEventStoreBackend()
+    guardrails = IncidentGuardrailManager(settings, store)
+    k8s = FakeK8sExecutor()
+    remediation = SafeRemediationService(settings, k8s, post_error_rate_probe=lambda _ns, _svc: 0.002)
+    kb = LocalJsonlKnowledgeBase(REPO_ROOT / "bigquery" / "seed_runbooks_100.jsonl")
+    assert kb.total_records == 100
+
+    async def _kb_aware_analyzer(
+        alert: AlertEvent,
+        _stats: SandboxMetricsAnalysis,
+        matches: list[SimilarRunbookMatch],
+    ) -> TriageDecision:
+        top = matches[0]
+        if top.similarity_score >= settings.auto_remediate_similarity_threshold:
+            return TriageDecision(
+                decision=top.recommended_action,
+                remediation_type=top.remediation_type,
+                target_namespace=alert.namespace,
+                target_deployment=alert.service_name,
+                matched_runbook_id=top.runbook_id,
+                similarity_score=top.similarity_score,
+                root_cause_hypothesis=top.root_cause,
+                rationale=f"自律学習済み Runbook {top.runbook_id} と一致したため自動実行します。",
+            )
+        return TriageDecision(
+            decision="REQUIRE_APPROVAL",
+            remediation_type="RESTART_DEPLOYMENT",
+            target_namespace=alert.namespace,
+            target_deployment=alert.service_name,
+            matched_runbook_id=top.runbook_id,
+            similarity_score=top.similarity_score,
+            root_cause_hypothesis="Pod 内のインメモリ消費税ルックアップテーブル CRC32 破損",
+            rationale="初見エラーのため人間承認後に Deployment ローリング再起動を提案します。",
+        )
+
+    orchestrator = SreIncidentOrchestrator(
+        settings=settings,
+        sandbox_runner=SandboxRunner(settings),
+        knowledge_base=kb,
+        guardrail_manager=guardrails,
+        remediation_service=remediation,
+        decision_analyzer=_kb_aware_analyzer,
+        runbook_synthesizer=_fast_det_synthesizer,
+        session_service=DatabaseSessionService(db_url=settings.session_db_url),
+    )
+    coordinator = SlackHitlCoordinator(settings, orchestrator)
+
+    # 1. 初回発生: シード 100 件との類似度が < 0.85 のため一時停止し Slack 承認待ちになる
+    novel_alert_1 = AlertEvent(
+        incident_id="NOVEL-TAX-1",
+        error_code="TAX_RULE_CRC32_MISMATCH_500",
+        summary="RuntimeError: In-memory consumption tax rate lookup table CRC32 checksum mismatch",
+        error_rate_series=[0.15, 0.80, 0.92, 0.95],
+        recent_deployment_within_30m=False,
+    )
+    res_1 = await orchestrator.handle_alert(novel_alert_1)
+    assert res_1.paused_for_approval is True
+    assert res_1.decision.decision == "REQUIRE_APPROVAL"
+    assert res_1.decision.similarity_score < 0.85
+    assert len(k8s.restarts) == 0
+
+    await coordinator.notify_workflow_result(res_1)
+    outcome_1 = await coordinator.process_approval_decision(
+        incident_id="NOVEL-TAX-1",
+        slack_user_id="U_SRE_LEAD",
+        approved=True,
+    )
+    assert outcome_1.executed is True
+    assert outcome_1.verification_passed is True
+    assert outcome_1.learned_runbook_id is not None
+    assert outcome_1.learned_runbook_id.startswith("AUTO-")
+    assert outcome_1.learned_recommended_action == "AUTO_REMEDIATE"
+    assert kb.total_records == 101
+    assert len(k8s.restarts) == 1
+
+    # 2. クールダウン解除後、同一初見エラーが再発 -> 今度は AUTO-* に >= 0.85 で一致し承認なしで自動再起動完走！
+    guardrails.reset_all_cooldowns("Scenario 4 second injection")
+    novel_alert_2 = AlertEvent(
+        incident_id="NOVEL-TAX-2",
+        error_code="TAX_RULE_CRC32_MISMATCH_500",
+        summary="RuntimeError: In-memory consumption tax rate lookup table CRC32 checksum mismatch",
+        error_rate_series=[0.20, 0.85, 0.94, 0.96],
+        recent_deployment_within_30m=False,
+    )
+    res_2 = await orchestrator.handle_alert(novel_alert_2)
+    assert res_2.paused_for_approval is False
+    assert res_2.decision.decision == "AUTO_REMEDIATE"
+    assert res_2.decision.matched_runbook_id == outcome_1.learned_runbook_id
+    assert res_2.decision.similarity_score >= 0.85
+    assert res_2.outcome is not None and res_2.outcome.action_status == "RESTARTED"
+    assert len(k8s.restarts) == 2
+
+
+@pytest.mark.asyncio
+async def test_autonomous_kb_learning_keeps_manual_intervention_as_require_approval(tmp_path: Path) -> None:
+    """手動介入 (MANUAL_INTERVENTION) 事象は承認解決後も AUTO_REMEDIATE に昇格させず REQUIRE_APPROVAL で登録すること。"""
+    db_file = tmp_path / "manual_learn.db"
+    settings = AgentSettings(
+        sandbox_mode="local_subprocess",
+        session_backend="sqlite",
+        session_db_url=f"sqlite+aiosqlite:///{db_file}",
+        enable_autonomous_kb_learning=True,
+        slack_allowed_approvers=("U_SRE_LEAD",),
+    )
+    store = InMemoryEventStoreBackend()
+    guardrails = IncidentGuardrailManager(settings, store)
+    k8s = FakeK8sExecutor()
+    remediation = SafeRemediationService(settings, k8s, post_error_rate_probe=lambda _ns, _svc: 0.0)
+    kb = LocalJsonlKnowledgeBase(REPO_ROOT / "bigquery" / "seed_runbooks_100.jsonl")
+
+    async def _manual_analyzer(
+        alert: AlertEvent,
+        _stats: SandboxMetricsAnalysis,
+        _matches: list[SimilarRunbookMatch],
+    ) -> TriageDecision:
+        return TriageDecision(
+            decision="REQUIRE_APPROVAL",
+            remediation_type="MANUAL_INTERVENTION",
+            target_namespace=alert.namespace,
+            target_deployment=alert.service_name,
+            matched_runbook_id="NONE",
+            similarity_score=0.35,
+            root_cause_hypothesis="外部監査台帳スキーマの非互換変更",
+            rationale="手動でのマイグレーション確認が必要です。",
+        )
+
+    orchestrator = SreIncidentOrchestrator(
+        settings=settings,
+        sandbox_runner=SandboxRunner(settings),
+        knowledge_base=kb,
+        guardrail_manager=guardrails,
+        remediation_service=remediation,
+        decision_analyzer=_manual_analyzer,
+        runbook_synthesizer=_fast_det_synthesizer,
+        session_service=DatabaseSessionService(db_url=settings.session_db_url),
+    )
+    coordinator = SlackHitlCoordinator(settings, orchestrator)
+
+    alert = AlertEvent(
+        incident_id="NOVEL-MANUAL-1",
+        error_code="LEDGER_SCHEMA_VERSION_MISMATCH_500",
+        summary="External audit ledger schema incompatible",
+        error_rate_series=[0.5, 0.8],
+    )
+    res = await orchestrator.handle_alert(alert)
+    await coordinator.notify_workflow_result(res)
+    outcome = await coordinator.process_approval_decision(
+        incident_id="NOVEL-MANUAL-1",
+        slack_user_id="U_SRE_LEAD",
+        approved=True,
+    )
+    assert outcome.learned_runbook_id is not None
+    assert outcome.learned_recommended_action == "REQUIRE_APPROVAL"
+    assert kb.total_records == 101
+
+
+def test_bigquery_ai_search_and_autonomous_merge_queries() -> None:
+    """BigQueryVectorKnowledgeBase が AI.SEARCH と embedding 列除外の MERGE 文を発行すること。"""
+
+    class _FakeRow:
+        runbook_id = "AUTO-1234ABCD"
+        category = "メモリリーク・FD/PID 枯渇"
+        title = "テスト自動登録 Runbook"
+        root_cause = "インメモリ破損"
+        recommended_action = "AUTO_REMEDIATE"
+        remediation_type = "RESTART_DEPLOYMENT"
+        remediation_steps = "ローリング再起動"
+        anti_patterns = "無検証連打禁止"
+        verification_check = "エラー率 < 1.0%"
+        similarity_score = 0.93
+
+    class _FakeJob:
+        def __init__(self, rows: list, affected: int = 1) -> None:
+            self._rows = rows
+            self.num_dml_affected_rows = affected
+
+        def result(self) -> list:
+            return self._rows
+
+    class _FakeBqClient:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        def query(self, sql: str, job_config=None) -> _FakeJob:  # noqa: ANN001
+            self.queries.append(sql)
+            return _FakeJob([_FakeRow()], affected=1)
+
+    fake_bq = _FakeBqClient()
+    settings = AgentSettings(project_id="test-proj", bq_dataset="sre_agent_ops")
+    bq_kb = BigQueryVectorKnowledgeBase(settings, client=fake_bq)
+
+    alert = AlertEvent(incident_id="BQ-1", error_code="TAX_RULE_CRC32_MISMATCH_500", summary="CRC mismatch")
+    matches = bq_kb.search_similar(alert, top_k=3)
+    assert len(matches) == 1
+    assert matches[0].runbook_id == "AUTO-1234ABCD"
+    assert "AI.SEARCH(" in fake_bq.queries[0]
+    assert "'search_document'" in fake_bq.queries[0]
+
+    entry = synthesize_runbook_deterministic(
+        alert,
+        TriageDecision(
+            decision="REQUIRE_APPROVAL",
+            remediation_type="RESTART_DEPLOYMENT",
+            target_namespace="sre-demo-app",
+            target_deployment="order-service",
+            root_cause_hypothesis="CRC mismatch",
+            rationale="Restart needed",
+        ),
+        RemediationOutcome(executed=True, action_status="RESTARTED", detail_message="OK", verification_passed=True),
+    )
+    inserted = bq_kb.upsert_learned_runbook(entry)
+    assert inserted is True
+    assert "MERGE `test-proj.sre_agent_ops.incident_runbooks`" in fake_bq.queries[1]
+    assert "embedding" not in fake_bq.queries[1]
+
 

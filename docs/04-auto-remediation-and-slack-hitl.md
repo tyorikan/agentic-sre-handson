@@ -1,7 +1,7 @@
 # 第 4 章：ADK 2.x ワークフロー・型付き GKE 自動復旧・Slack Socket Mode 承認連携 (`04-auto-remediation-and-slack-hitl.md`)
 
 **所要時間**: 約 45 分  
-**到達目標**: ADK Python 2.x のグラフワークフロー（`Workflow` / `JoinNode` / `@node(require_confirmation=True)`）による 3 分岐制御、安全な型付き GKE 復旧と事後検証、および公開 URL を一切開けない Slack Socket Mode 双方向承認の仕組みを理解し、Slack App を準備する。
+**到達目標**: ADK Python 2.x のグラフワークフロー（`Workflow` / `JoinNode` / `@node(require_confirmation=True)`）による 3 分岐制御、安全な型付き GKE 復旧と事後検証、公開 URL を一切開けない Slack Socket Mode 双方向承認、および**承認解決した初見インシデントを次回から自動復旧へ昇格させる自律学習機構**を理解し、Slack App を準備する。
 
 ---
 
@@ -62,7 +62,7 @@ flowchart LR
 flowchart TD
     Pre["前処理: CloudTelemetryEnricher.enrich_alert<br/>ログ時系列エラー率・直近デプロイ有無を補完"] --> S(["START"])
     S --> P1["@node: analyze_metrics_in_sandbox<br/>隔離空間でスロープ計算"]
-    S --> P2["@node: search_similar_incidents<br/>BigQuery VECTOR_SEARCH 上位3件照合"]
+    S --> P2["@node: search_similar_incidents<br/>BigQuery AI.SEARCH 上位3件照合"]
     P1 & P2 --> J["JoinNode: join_diagnostics<br/>両方の診断完了を待機・合流"]
     J --> LLM["@node: correlate_and_decide<br/>gemini-3.8-flash + 公式リモート MCP<br/>TriageDecision 構造化出力"]
     LLM --> Router["@node: enforce_guardrails_and_route<br/>ガードレール検査・3分岐ルーティング"]
@@ -71,7 +71,7 @@ flowchart TD
     Router -->|"route = AUTO_REMEDIATE"| N2["@node: auto_remediate_node<br/>即時 Rollback / Restart + 事後回復確認"]
     Router -->|"route = REQUIRE_APPROVAL"| N3["@node: approved_remediate_node<br/>require_confirmation=True で自動一時停止"]
 
-    N3 -.->|"Slack で Approve 押下"| Exec["Firestore から再開・処置実行"]
+    N3 -.->|"Slack で Approve 押下"| Exec["Firestore 復元・処置実行<br/>初見回復時は AUTO-* Runbook を自動登録"]
     N3 -.->|"Slack で Reject 押下"| Cancel["実行スキップ・手動引き継ぎ"]
 
     classDef nodeBox fill:#ffffff,stroke:#4285F4,stroke-width:1.5px,color:#202124;
@@ -161,7 +161,7 @@ flowchart LR
 sequenceDiagram
     autonumber
     participant WF as ADK 2.x Workflow<br/>Cloud Run instance 内
-    participant DB as Cloud Firestore<br/>Session & Tickets
+    participant DB as Firestore & BigQuery<br/>状態永続化 & 知識ベース
     participant Bolt as SlackHitlCoordinator<br/>Outbound WebSocket
     participant Slack as Slack チャンネル<br/>オンコール担当者
     participant GKE as 監視対象 GKE<br/>sre-demo-app
@@ -179,20 +179,31 @@ sequenceDiagram
     end
 
     rect rgb(230, 244, 234)
-        Note over WF,GKE: フェーズ 2: WebSocket 承認イベント受信・二重実行防止・ADK セッション再開
+        Note over WF,GKE: フェーズ 2: WebSocket 承認受信・ADK 再開・初見事象の自律ナレッジ昇格登録
         Slack-->>Bolt: 担当者が Approve をクリックし WebSocket 経由で受信
         Bolt->>Bolt: 押下者の Slack User ID が許可リスト内か検証
         Bolt->>DB: Firestore トランザクションでチケット取得・ロック
         Bolt->>WF: resume_from_approval confirmed=True, invocation_id=...
         WF->>DB: 中断箇所から ADK セッション復元
         WF->>GKE: 型付き復旧 + 事後検証を実行 / 手動引継時は記録のみ
-        WF-->>Bolt: RemediationOutcome 返却
+        WF->>DB: 初見かつ事後回復確認 OK 時は AUTO-* Runbook を MERGE 登録し AI.EMBED 自動生成
+        WF-->>Bolt: RemediationOutcome 返却 learned_runbook_id 付き
         Bolt->>DB: 完了済み承認チケット削除
-        Bolt->>Slack: 元メッセージを「承認・実行完了」表示へ更新
+        Bolt->>Slack: 元メッセージを「承認・実行完了 + 自律ナレッジ登録」表示へ更新
     end
 ```
 
 </details>
+
+### 承認解決時の自律ナレッジ昇格ルール（誤学習防止ガードレール）
+
+運用を続けるほど人手を減らしていくため、[workflow.py](../sre-agent/agent_app/workflow.py) の `resume_from_approval` と [vector_kb.py](../sre-agent/agent_app/vector_kb.py) の `determine_promoted_action` では、以下の厳格な条件を満たした場合に限り新規 Runbook（`AUTO-<fingerprint先頭8文字>`）を合成して BigQuery `incident_runbooks` へ `MERGE` 登録します。
+
+| 判定条件・復旧種別 | 知識ベースへの登録有無 | 次回発生時の `recommended_action` | 設計上の理由 |
+|---|---|---|---|
+| **Slack で `Reject` された場合、または処置後にエラー率 `1.0%` 未満へ回復しなかった場合** | **登録しない** | — | 誤判断や未解決の手順が知識ベースに混入して次回以降の自動復旧を汚染する事態を防ぐため |
+| **初見（類似度 `0.85` 未満）かつ `Approve` 承認後に `ROLLBACK` / `RESTART` で回復確認できた場合** | **自動 `MERGE` 登録**（BigQuery `AI.EMBED` が裏側で自動ベクトル化） | **`AUTO_REMEDIATE` へ昇格** | 人間が承認し実環境で回復が実証された安全な型付き復旧であるため、2 回目以降はオンコール担当者を起こさず即座に自動復旧させるため |
+| **初見かつ `Approve` されたが `MANUAL_INTERVENTION`［DB ロック調査等］である場合** | **自動 `MERGE` 登録** | **`REQUIRE_APPROVAL` を維持** | 原因分析や禁止事項の知見は蓄積して次回の調査を高速化しつつ、DB 操作等の高リスク手順が無断自動実行されるのを防ぐため |
 
 ---
 
@@ -273,6 +284,9 @@ tests/test_slack_hitl_resume.py::test_slack_report_highlights_failed_post_verifi
 tests/test_slack_hitl_resume.py::test_resume_survives_instance_restart_via_persistent_ticket_and_session PASSED
 tests/test_slack_hitl_resume.py::test_build_session_service_rejects_unknown_backend PASSED
 tests/test_slack_hitl_resume.py::test_build_session_service_firestore_returns_adk_service PASSED
+tests/test_slack_hitl_resume.py::test_autonomous_kb_learning_promotes_novel_restart_to_auto_remediate PASSED
+tests/test_slack_hitl_resume.py::test_autonomous_kb_learning_keeps_manual_intervention_as_require_approval PASSED
+tests/test_slack_hitl_resume.py::test_bigquery_ai_search_and_autonomous_merge_queries PASSED
 ```
 
 ---
@@ -281,7 +295,7 @@ tests/test_slack_hitl_resume.py::test_build_session_service_firestore_returns_ad
 
 ```markdown
 `AGENTS.md` を読み込み、第4章（`docs/04-auto-remediation-and-slack-hitl.md`）のテスト検証を実行してください。
-- `.venv` 環境で `pytest -v` を実行し、全 13 件以上のテスト（重複排除、サンドボックス隔離、100件検索、Workflow 3分岐、事後検証未回復時通知、Slack 承認者検証、およびインスタンス再起動後の Resume 復旧）が PASS することを確認して報告すること。
+- `.venv` 環境で `pytest -v` を実行し、全 19 件のテスト（重複排除、サンドボックス隔離、100件検索、Workflow 3分岐、事後検証未回復時通知、Slack 承認者検証、インスタンス再起動後の Resume 復旧、および解決ナレッジ自律昇格）が PASS することを確認して報告すること。
 - Secret Manager への Slack トークン登録は私が手元でトークンを入力して行うため、実行用コマンドのみ案内すること。
 ```
 
@@ -293,4 +307,4 @@ tests/test_slack_hitl_resume.py::test_build_session_service_firestore_returns_ad
 * [Slack Socket Mode documentation](https://api.slack.com/apis/connections/socket) — 外向き WebSocket によるイベント・Interactivity 受信仕様
 * [Secret Manager overview](https://docs.cloud.google.com/secret-manager/docs/overview) — シークレットの安全な管理と Cloud Run 連携
 
-次へ進む 👉 [第 5 章：Cloud Run instances への閉域常駐デプロイと 3 大障害訓練](05-deploy-cloud-run-instance-and-drills.md)
+次へ進む 👉 [第 5 章：Cloud Run instances への閉域常駐デプロイと 4 大障害訓練](05-deploy-cloud-run-instance-and-drills.md)

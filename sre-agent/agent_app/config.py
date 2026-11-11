@@ -1,7 +1,7 @@
 """環境変数に基づく設定管理モジュール。
 
-モデル名、リージョン、許可 Namespace、クールダウン時間、サーキットブレーカー上限を
-すべて環境変数から読み込み、コードへのハードコードを排除します。
+モデル名、リージョン、許可 Namespace、クールダウン時間、サーキットブレーカー上限、
+および自律ナレッジ蓄積フラグをすべて環境変数から読み込み、コードへのハードコードを排除します。
 """
 
 from __future__ import annotations
@@ -14,6 +14,11 @@ from dotenv import load_dotenv
 def _split_csv(raw: str) -> tuple[str, ...]:
     """カンマ区切り文字列を空白除去済みタプルへ変換する。"""
     return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+def _parse_bool(raw: str) -> bool:
+    """環境変数文字列を真偽値へ変換する。"""
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 @dataclass(frozen=True)
@@ -31,10 +36,14 @@ class AgentSettings:
     # Pub/Sub 常時購読設定
     alert_subscription: str = field(default_factory=lambda: os.getenv("ALERT_PUBSUB_SUBSCRIPTION", "sre-alert-stream-sub"))
 
-    # BigQuery 設定
+    # BigQuery 知識ベース（Autonomous Embedding Generation）& 状態管理設定
     bq_dataset: str = field(default_factory=lambda: os.getenv("BQ_DATASET", "sre_agent_ops"))
     bq_runbooks_table: str = field(default_factory=lambda: os.getenv("BQ_RUNBOOKS_TABLE", "incident_runbooks"))
     bq_events_table: str = field(default_factory=lambda: os.getenv("BQ_EVENTS_TABLE", "incident_events"))
+    bq_connection_id: str = field(default_factory=lambda: os.getenv("BQ_CONNECTION_ID", "sre_genai_conn"))
+    enable_autonomous_kb_learning: bool = field(
+        default_factory=lambda: _parse_bool(os.getenv("ENABLE_AUTONOMOUS_KB_LEARNING", "true"))
+    )
 
     # GKE クラスタと復旧操作の安全境界
     gke_cluster_name: str = field(default_factory=lambda: os.getenv("GKE_CLUSTER_NAME", "sre-demo-cluster"))
@@ -46,6 +55,9 @@ class AgentSettings:
     max_auto_actions_per_hour: int = field(default_factory=lambda: int(os.getenv("MAX_AUTO_ACTIONS_PER_HOUR", "1")))
     auto_remediate_similarity_threshold: float = field(
         default_factory=lambda: float(os.getenv("AUTO_REMEDIATE_SIMILARITY_THRESHOLD", "0.85"))
+    )
+    allow_drill_cooldown_reset: bool = field(
+        default_factory=lambda: _parse_bool(os.getenv("ALLOW_DRILL_COOLDOWN_RESET", "false"))
     )
 
     # サンドボックス・観測ウィンドウ設定 ("cloud_run" または "local_subprocess")

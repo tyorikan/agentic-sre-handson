@@ -27,7 +27,7 @@ flowchart LR
         Dedup["dedup_store.py<br/>Fingerprint 15分重複排除"]
         Enrich["telemetry_enrichment.py<br/>ログ時系列エラー率・デプロイ履歴補完"]
         Sandbox["sandbox_runner.py<br/>/usr/local/gcp/bin/sandbox do<br/>外向き通信遮断・減衰傾き計算"]
-        Vec["vector_kb.py<br/>VECTOR_SEARCH 類似照合"]
+        Vec["vector_kb.py<br/>AI.SEARCH 類似照合 & 自律ナレッジ登録"]
         MCP["mcp_tools.py<br/>公式リモート MCP 読取専用 10 ツール"]
         Dedup --> Enrich --> Sandbox & Vec
     end
@@ -115,9 +115,18 @@ flowchart LR
 
 ---
 
-## 5. ローカル仮想環境での単体テスト検証
+## 5. BigQuery `AI.SEARCH` 照合と自律ナレッジ登録インターフェース (`vector_kb.py`)
 
-ここまでの重複排除・サンドボックス隔離フラグ・100 件知識ベース照合が正しく動作することをテストで確認します。
+[sre-agent/agent_app/vector_kb.py](../sre-agent/agent_app/vector_kb.py) の `BigQueryVectorKnowledgeBase` は、前章で構築した自動埋め込みテーブルに対して以下の 2 つの役割を担います。
+
+1. **読み取り照合（`search_similar`）**: パラメータ化クエリで `AI.SEARCH(TABLE ..., 'search_document', @query_text, distance_type => 'COSINE', top_k => @top_k)` を実行し、類似度上位 3 件の過去 Runbook を取得します。
+2. **解決済み初見ナレッジの自律登録（`upsert_learned_runbook`）**: 次章で実装する Slack 承認再開時に、初見障害の復旧と事後回復検証が成功した場合のみ `AUTO-<fingerprint先頭8文字>` の構造化 Runbook を `MERGE` 登録します。`embedding` カラムを省略して書き込むだけで BigQuery が自動的にベクトルを生成するため、アプリケーション側に埋め込み API 呼び出しコードを書く必要がありません。
+
+---
+
+## 6. ローカル仮想環境での単体テスト検証
+
+ここまでの重複排除・4 種障害モード・サンドボックス隔離フラグ・100 件知識ベース照合が正しく動作することをテストで確認します。
 
 ```bash
 python3 -m venv .venv

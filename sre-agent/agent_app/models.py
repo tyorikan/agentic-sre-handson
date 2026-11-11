@@ -1,7 +1,7 @@
 """常駐 SRE エージェントのドメインモデル定義。
 
 入力アラート、隔離サンドボックス分析結果、ベクトル検索結果、3 分岐の意思決定スキーマ、
-および Slack 通知用インシデントレポートを型安全に表現します。
+自律学習用 Runbook 合成スキーマ、および Slack 通知用インシデントレポートを型安全に表現します。
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ class SandboxMetricsAnalysis(BaseModel):
 
 
 class SimilarRunbookMatch(BaseModel):
-    """BigQuery VECTOR_SEARCH から返却された過去の類似インシデント情報。"""
+    """BigQuery AI.SEARCH から返却された過去の類似インシデント情報。"""
 
     runbook_id: str
     category: str
@@ -79,11 +79,64 @@ class TriageDecision(BaseModel):
     anti_pattern_warning: str = Field(default="", description="避けるべき誤対応の注意喚起")
 
 
+class SynthesizedRunbookDraft(BaseModel):
+    """Gemini が承認解決済みインシデントから抽出する構造化 Runbook ドラフト。"""
+
+    category: str = Field(description="障害カテゴリ名")
+    title: str = Field(description="簡潔で識別しやすいインシデント件名")
+    service_pattern: str = Field(description="発生しやすいサービス構成・コンポーネント特徴")
+    metrics_pattern: str = Field(description="エラー率やレイテンシの時系列推移パターン")
+    recent_change_hint: str = Field(description="直近デプロイや設定変更との関連性")
+    root_cause: str = Field(description="特定された根本原因")
+    remediation_steps: str = Field(description="実証された復旧手順または手動対応手順")
+    anti_patterns: str = Field(description="実行してはいけない誤対応とその理由")
+    verification_check: str = Field(description="処置後に正常回復したと判定する確認基準")
+
+
+class SynthesizedRunbookEntry(BaseModel):
+    """BigQuery incident_runbooks テーブル（AI.EMBED 自動埋め込み列付き）へ登録する確定レコード。"""
+
+    runbook_id: str
+    category: str
+    title: str
+    service_pattern: str
+    symptom_signature: str
+    metrics_pattern: str
+    recent_change_hint: str
+    root_cause: str
+    recommended_action: DecisionType
+    remediation_type: RemediationType
+    remediation_steps: str
+    anti_patterns: str
+    verification_check: str
+    historical_mttr_minutes: int = 5
+
+    def build_search_document(self) -> str:
+        """初期シード 100 件と同一フォーマットの AI.EMBED 対象テキストを組み立てる。"""
+        return (
+            f"カテゴリ: {self.category}\n"
+            f"件名: {self.title}\n"
+            f"対象構成: {self.service_pattern}\n"
+            f"エラー兆候: {self.symptom_signature}\n"
+            f"メトリクス推移: {self.metrics_pattern}\n"
+            f"変更相関: {self.recent_change_hint}\n"
+            f"根本原因: {self.root_cause}"
+        )
+
+
 class RemediationOutcome(BaseModel):
-    """復旧アクション実行（または静観）および事後メトリクス確認の最終結果。"""
+    """復旧アクション実行（または静観）および事後メトリクス確認・自律ナレッジ登録の最終結果。"""
 
     executed: bool
     action_status: str = Field(description="OBSERVED | ROLLED_BACK | RESTARTED | AWAITING_APPROVAL | REJECTED | FAILED")
     detail_message: str
     verification_passed: bool = False
     post_error_rate: float | None = None
+    learned_runbook_id: str | None = Field(
+        default=None,
+        description="承認解決後に incident_runbooks へ新規自律登録された Runbook ID（例: AUTO-A1B2C3D4）",
+    )
+    learned_recommended_action: DecisionType | None = Field(
+        default=None,
+        description="自律登録された Runbook に設定された次回発生時の推奨判断区分",
+    )

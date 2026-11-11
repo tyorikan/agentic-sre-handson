@@ -48,7 +48,11 @@ from .models import (
 )
 from .remediation_tools import SafeRemediationService
 from .sandbox_runner import SandboxRunner
-from .vector_kb import RunbookKnowledgeBase
+from .vector_kb import (
+    RunbookKnowledgeBase,
+    RunbookSynthesizerFn,
+    build_llm_runbook_synthesizer,
+)
 
 DecisionAnalyzerFn = Callable[
     [AlertEvent, SandboxMetricsAnalysis, list[SimilarRunbookMatch]],
@@ -99,8 +103,11 @@ def build_llm_decision_analyzer(
             "   -> decision='OBSERVE', remediation_type='NONE' とする（不要な再起動でコネクション再確立嵐を起こさないこと）。\n"
             "2. 直近デプロイ起因の既知バグや既知の Stateless リソース肥大化で、過去事例と強く一致する場合:\n"
             "   -> decision='AUTO_REMEDIATE' とし、remediation_type に 'ROLLBACK_DEPLOYMENT' または 'RESTART_DEPLOYMENT' を指定する。\n"
-            "3. DB ロック競合・スキーマ不整合・未知の障害・確信度が低い場合:\n"
-            "   -> decision='REQUIRE_APPROVAL' とし、勝手に本番変更せず人間の判断を仰ぐ。"
+            "3. DB ロック競合・スキーマ不整合・過去事例との類似度が 0.85 未満の初見障害・確信度が低い場合:\n"
+            "   -> decision='REQUIRE_APPROVAL' とし、勝手に本番変更せず人間の判断を仰ぐ。\n"
+            "      その際、インメモリキャッシュ破損やワーカー状態異常など Pod 再起動で初期化回復が見込める場合は "
+            "remediation_type='RESTART_DEPLOYMENT'（直近デプロイ直後なら 'ROLLBACK_DEPLOYMENT'）を提案し、\n"
+            "      DB ロック・永続データ不整合・外部システム障害の場合は remediation_type='MANUAL_INTERVENTION' を指定する。"
         ),
         tools=tools,
         output_schema=TriageDecision,
@@ -186,6 +193,7 @@ class SreIncidentOrchestrator:
         remediation_service: SafeRemediationService,
         decision_analyzer: DecisionAnalyzerFn | None = None,
         telemetry_enricher: TelemetryEnricherFn | None = None,
+        runbook_synthesizer: RunbookSynthesizerFn | None = None,
         session_service: BaseSessionService | None = None,
     ) -> None:
         self._settings = settings
@@ -195,6 +203,7 @@ class SreIncidentOrchestrator:
         self._remediation = remediation_service
         self._analyzer = decision_analyzer or build_llm_decision_analyzer(settings)
         self._enricher = telemetry_enricher
+        self._synthesizer = runbook_synthesizer or build_llm_runbook_synthesizer(settings)
         self._sessions = session_service or build_session_service(settings)
         self._app = self._build_adk_app()
         self._runner = Runner(app=self._app, session_service=self._sessions)
@@ -516,4 +525,34 @@ class SreIncidentOrchestrator:
             session_id=session_id,
         )
         state = updated_session.state if updated_session else {}
-        return RemediationOutcome.model_validate(state["outcome"])
+        outcome = RemediationOutcome.model_validate(state["outcome"])
+
+        # 初見・低類似度事象が承認実行後に正常回復した場合、構造化 Runbook を知識ベースへ自律登録する
+        if (
+            self._settings.enable_autonomous_kb_learning
+            and outcome.verification_passed
+            and decision.similarity_score < self._settings.auto_remediate_similarity_threshold
+            and hasattr(self._kb, "upsert_learned_runbook")
+        ):
+            entry = await self._synthesizer(alert, decision, outcome)
+            inserted = await asyncio.to_thread(self._kb.upsert_learned_runbook, entry)
+            if inserted:
+                outcome = outcome.model_copy(
+                    update={
+                        "learned_runbook_id": entry.runbook_id,
+                        "learned_recommended_action": entry.recommended_action,
+                        "detail_message": (
+                            f"{outcome.detail_message} | "
+                            f"新規 Runbook {entry.runbook_id} を知識ベースへ自律登録しました"
+                            f"（次回推奨区分: {entry.recommended_action}）"
+                        ),
+                    }
+                )
+                _emit_step_log(
+                    "承認解決済みの初見インシデントを知識ベースへ自律登録しました。",
+                    incident_id=alert.incident_id,
+                    learned_runbook_id=entry.runbook_id,
+                    learned_recommended_action=entry.recommended_action,
+                )
+
+        return outcome

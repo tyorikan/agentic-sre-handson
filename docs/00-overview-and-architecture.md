@@ -5,9 +5,9 @@
 
 ---
 
-## 1. このワークショップで体験する 3 つの自律運用シナリオ
+## 1. このワークショップで体験する自律運用と自己成長ループ
 
-本番システムの運用では、「すべてのアラートで Pod を再起動すればよい」わけではありません。誤った自動操作は障害をかえって拡大させます。本ハンズオンでは、以下の判断フローをゼロから構築します。
+本番システムの運用では、「すべてのアラートで Pod を再起動すればよい」わけではありません。誤った自動操作は障害をかえって拡大させます。本ハンズオンでは、以下の判断フローと解決ナレッジ自律蓄積ループをゼロから構築します。
 
 ![アラート検知から 3 分岐・Slack 承認再開までの意思決定フロー図](images/00-01-triage-routing-flow.png)
 
@@ -24,7 +24,7 @@ flowchart LR
     Guard -->|"一過性エラー・自然減衰中"| S1["シナリオ 1: 静観 OBSERVE<br/>操作せず Slack へ根拠通知"]
     Guard -->|"既知バグ 類似度>=0.85<br/>かつ 1時間以内初回"| S2["シナリオ 2: 自動復旧 AUTO_REMEDIATE<br/>Deployment ロールバック実行<br/>+ エラー率 < 1.0% 回復確認"]
     Guard -->|"未知の DB 障害 / 低確信度<br/>または回数上限到達"| S3["シナリオ 3: 人間承認待ち REQUIRE_APPROVAL<br/>Firestore 保存・ADK 一時停止<br/>Slack Approve / Reject ボタン送信"]
-    S3 -->|"Approve 押下"| Resume["ADK 再開・処置実行"]
+    S3 -->|"Approve 押下"| Resume["ADK 再開・処置実行<br/>初見回復時は BigQuery へ自動ナレッジ昇格"]
     S3 -->|"Reject 押下"| Manual["手動調査へ引き継ぎ"]
 
     classDef base fill:#ffffff,stroke:#4285F4,stroke-width:1.5px,color:#202124;
@@ -49,6 +49,7 @@ flowchart LR
   1. **Out-of-Band（帯域外）常駐監視**: 監視対象の GKE クラスタとは独立した **Cloud Run instances** 上でエージェントを動かすため、GKE 側がノード枯渇や障害に陥ってもエージェントは巻き込まれず外部から復旧 API を実行できます。
   2. **攻撃対象面ゼロの双方向通信**: Cloud Run instance には `--ingress internal` と `--no-default-url` を設定し、インターネットからの着信を完全遮断します。Pub/Sub StreamingPull と Slack Socket Mode はどちらも**コンテナからの外向き TLS 通信**であるため、公開 URL を一切開けずにリアルタイム監視と承認ボタン連携が成立します。
   3. **調査の柔軟性と変更の厳格性の分離**: メトリクス統計計算などの動的スクリプトは外向き通信・認証情報を遮断した **Cloud Run sandboxes（`sandbox do`）** 内で実行し、GKE の変更操作は Namespace 固定・回数上限付きの型付き Python 関数のみに限定します。
+  4. **検証済み解決策のみを蓄積する自律成長型知識ベース**: 初見の障害は安全ガードレールで人間承認に回し、担当者が承認して**事後エラー率 1.0% 未満への回復が実証された場合のみ**、解決内容を構造化 Runbook として BigQuery へ `MERGE` 登録します。テーブルの `GENERATED ALWAYS AS (AI.EMBED(...))` 定義により BigQuery が裏側で自動的にベクトル化するため、再学習バッチ不要で次回から `AI.SEARCH` による自動復旧対象に昇格します。未検証の推測や回復失敗ケースは登録しないため、誤った対処法で知識ベースが汚染されることもありません。
 * **できないこと・不向きなこと（設計上の明確な境界線）**:
   1. **全量アクセスログの直接 LLM 監視には不向き**: 毎秒数千行の生ログをすべて LLM に読ませるとコストと遅延が破綻します。一次検知は必ず Cloud Monitoring アラートや Cloud Logging のエラーフィルタシンクで行います。
   2. **DB スキーマ破損やロック競合の無断自動修復は行わない**: ステートフルな DB 障害でアプリを無断再起動するとロールバック負荷と再接続ラッシュで被害が拡大します。本設計ではこれらを自動的に `REQUIRE_APPROVAL` へ振り分け、1 分以内に診断証跡を揃えて人間へ判断を委ねます。
@@ -88,14 +89,14 @@ flowchart LR
 | `roles/serviceusage.serviceUsageAdmin` | 第 0 章：各種 Google Cloud API の有効化と利用 |
 | `roles/iam.serviceAccountAdmin` | 第 0・6 章：エージェント専用サービスアカウントの作成・削除 |
 | `roles/iam.serviceAccountUser` | 第 1・5 章：Cloud Build 実行および Cloud Run instance への SA アタッチ |
-| `roles/resourcemanager.projectIamAdmin` | 第 0・2 章：SA への最小権限付与、BigQuery `CONNECTION DEFAULT` 初回権限委譲 |
+| `roles/resourcemanager.projectIamAdmin` | 第 0・2 章：SA への最小権限付与、BigQuery Cloud Resource Connection 用 SA への推論権限付与 |
 | `roles/datastore.owner` | 第 0 章：Firestore `(default)` Native データベースの作成 |
 | `roles/artifactregistry.admin` | 第 1・6 章：コンテナイメージ用リポジトリの作成・削除 |
 | `roles/cloudbuild.builds.editor` / `roles/storage.admin` | 第 1・5 章：`gcloud builds submit` によるソース転送とコンテナビルド |
 | `roles/container.admin` | 第 1・5・6 章：GKE Autopilot 作成・削除、`Role` / `RoleBinding` 作成、権限検証 |
 | `roles/pubsub.admin` | 第 1・6 章：トピック・サブスクリプション作成、Log Sink Writer への権限付与 |
 | `roles/logging.admin` | 第 1・5・6 章：Cloud Logging エラーシンク作成・削除、エージェント構造化ログ閲覧 |
-| `roles/bigquery.admin` | 第 2・5・6 章：データセット・`CONNECTION DEFAULT` モデル作成、ベクトル生成・削除 |
+| `roles/bigquery.admin` | 第 2・5・6 章：データセット・Cloud Resource Connection・`AI.EMBED` 自動埋め込みテーブル作成と削除 |
 | `roles/run.admin` | 第 5・6 章：Cloud Run instance のデプロイ・停止・削除 |
 | `roles/secretmanager.admin` | 第 4・6 章：Slack 連携を行う場合のトークン登録・削除（Slack 省略時は不要） |
 

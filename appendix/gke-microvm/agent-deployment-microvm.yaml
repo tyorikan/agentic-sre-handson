@@ -75,6 +75,10 @@ spec:
               value: "sre-alert-stream-sub"
             - name: BQ_DATASET
               value: "sre_agent_ops"
+            - name: BQ_CONNECTION_ID
+              value: "sre_genai_conn"
+            - name: ENABLE_AUTONOMOUS_KB_LEARNING
+              value: "true"
             - name: GKE_CLUSTER_NAME
               value: "sre-demo-cluster"
             - name: GKE_CLUSTER_LOCATION

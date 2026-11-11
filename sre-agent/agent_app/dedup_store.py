@@ -63,10 +63,26 @@ class InMemoryEventStoreBackend:
     def rows(self) -> list[IncidentEventRecord]:
         return list(self._rows)
 
+    def _last_reset_at(self) -> datetime | None:
+        resets = [r.created_at for r in self._rows if r.decision == "ADMIN_RESET"]
+        return max(resets) if resets else None
+
     def find_recent_by_fingerprint(self, fingerprint: str, since: datetime) -> list[IncidentEventRecord]:
-        return [r for r in self._rows if r.fingerprint == fingerprint and r.created_at >= since]
+        cutoff = self._last_reset_at()
+        effective_since = max(since, cutoff) if cutoff else since
+        return [
+            r
+            for r in self._rows
+            if r.fingerprint == fingerprint
+            and r.decision != "ADMIN_RESET"
+            and r.created_at > effective_since
+            if cutoff
+        ] if cutoff else [
+            r for r in self._rows if r.fingerprint == fingerprint and r.created_at >= since
+        ]
 
     def count_auto_actions_for_service(self, namespace: str, service_name: str, since: datetime) -> int:
+        cutoff = self._last_reset_at()
         return sum(
             1
             for r in self._rows
@@ -74,6 +90,7 @@ class InMemoryEventStoreBackend:
             and r.service_name == service_name
             and r.decision == "AUTO_REMEDIATE"
             and r.created_at >= since
+            and (cutoff is None or r.created_at > cutoff)
         )
 
     def append_event(self, record: IncidentEventRecord) -> None:
@@ -95,7 +112,12 @@ class BigQueryEventStoreBackend:
                    verification_passed, summary, created_at
             FROM `{self._table_fqn}`
             WHERE fingerprint = @fingerprint
+              AND decision != 'ADMIN_RESET'
               AND created_at >= @since
+              AND created_at > COALESCE(
+                (SELECT MAX(created_at) FROM `{self._table_fqn}` WHERE decision = 'ADMIN_RESET'),
+                TIMESTAMP('1970-01-01T00:00:00Z')
+              )
             ORDER BY created_at DESC
             LIMIT 5
         """
@@ -133,6 +155,10 @@ class BigQueryEventStoreBackend:
               AND service_name = @service_name
               AND decision = 'AUTO_REMEDIATE'
               AND created_at >= @since
+              AND created_at > COALESCE(
+                (SELECT MAX(created_at) FROM `{self._table_fqn}` WHERE decision = 'ADMIN_RESET'),
+                TIMESTAMP('1970-01-01T00:00:00Z')
+              )
         """
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
@@ -333,3 +359,25 @@ class IncidentGuardrailManager:
                 f"前回 incident_id={record.incident_id}, decision={record.decision}",
             )
         return record
+
+    def reset_all_cooldowns(self, summary: str = "Hands-on drill cooldown reset", now: datetime | None = None) -> None:
+        """監査履歴を削除せずに ADMIN_RESET 境界レコードを追記し、クールダウンと1時間上限を即時解除する。"""
+        ts = now or datetime.now(timezone.utc)
+        reset_record = IncidentEventRecord(
+            event_id=uuid.uuid4().hex,
+            incident_id=f"RESET-{uuid.uuid4().hex[:8]}",
+            fingerprint="ADMIN_RESET",
+            namespace="all",
+            service_name="all",
+            error_code="ADMIN_COOLDOWN_RESET",
+            decision="ADMIN_RESET",
+            remediation_type="NONE",
+            matched_runbook_id="NONE",
+            similarity_score=0.0,
+            verification_passed=True,
+            summary=summary,
+            created_at=ts,
+        )
+        self._backend.append_event(reset_record)
+        with self._lock:
+            self._recent_fingerprints.clear()

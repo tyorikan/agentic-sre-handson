@@ -1,7 +1,7 @@
-# 第 5 章：Cloud Run instances への閉域常駐デプロイと 3 大障害訓練 (`05-deploy-cloud-run-instance-and-drills.md`)
+# 第 5 章：Cloud Run instances への閉域常駐デプロイと 4 大障害訓練 (`05-deploy-cloud-run-instance-and-drills.md`)
 
 **所要時間**: 約 45 分  
-**到達目標**: 常駐 SRE エージェントを **Cloud Run instances**（`--sandbox-launcher --ingress internal --no-default-url`）へデプロイし、GKE 上の監視対象アプリに 3 種類の本番想定障害を注入して「静観」「自動ロールバック＋回復確認」「人間承認待ち→再開」を一気通貫で検証する。
+**到達目標**: 常駐 SRE エージェントを **Cloud Run instances**（`--sandbox-launcher --ingress internal --no-default-url`）へデプロイし、GKE 上の監視対象アプリに 4 種類の本番想定障害を注入して「静観」「自動ロールバック＋回復確認」「高リスク DB 障害の人間承認」「初見障害の自律ナレッジ学習と 2 回目の全自動復旧」を一気通貫で検証する。
 
 ---
 
@@ -97,13 +97,13 @@ gcloud beta run instances deploy sre-autonomous-agent \
   --sandbox-launcher \
   --ingress=internal \
   --no-default-url \
-  --set-env-vars="^@^GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}@GOOGLE_CLOUD_REGION=${GOOGLE_CLOUD_REGION}@GOOGLE_CLOUD_LOCATION=global@GOOGLE_GENAI_USE_ENTERPRISE=True@SRE_TRIAGE_MODEL=${SRE_TRIAGE_MODEL}@SRE_EMBEDDING_MODEL=${SRE_EMBEDDING_MODEL}@ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false@ALERT_PUBSUB_SUBSCRIPTION=${ALERT_PUBSUB_SUBSCRIPTION}@BQ_DATASET=${BQ_DATASET}@GKE_CLUSTER_NAME=${GKE_CLUSTER_NAME}@GKE_CLUSTER_LOCATION=${GKE_CLUSTER_LOCATION}@ALLOWED_K8S_NAMESPACES=${ALLOWED_K8S_NAMESPACES}@SANDBOX_MODE=cloud_run@INITIAL_STABILIZATION_SECONDS=30@SESSION_BACKEND=firestore@FIRESTORE_DATABASE=(default)@SLACK_ALERT_CHANNEL_ID=${SLACK_ALERT_CHANNEL_ID}@SLACK_ALLOWED_APPROVER_IDS=${SLACK_ALLOWED_APPROVER_IDS:-}" \
+  --set-env-vars="^@^GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}@GOOGLE_CLOUD_REGION=${GOOGLE_CLOUD_REGION}@GOOGLE_CLOUD_LOCATION=global@GOOGLE_GENAI_USE_ENTERPRISE=True@SRE_TRIAGE_MODEL=${SRE_TRIAGE_MODEL}@SRE_EMBEDDING_MODEL=${SRE_EMBEDDING_MODEL}@ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false@ALERT_PUBSUB_SUBSCRIPTION=${ALERT_PUBSUB_SUBSCRIPTION}@BQ_DATASET=${BQ_DATASET}@BQ_CONNECTION_ID=${BQ_CONNECTION_ID:-sre_genai_conn}@ENABLE_AUTONOMOUS_KB_LEARNING=${ENABLE_AUTONOMOUS_KB_LEARNING:-true}@ALLOW_DRILL_COOLDOWN_RESET=true@GKE_CLUSTER_NAME=${GKE_CLUSTER_NAME}@GKE_CLUSTER_LOCATION=${GKE_CLUSTER_LOCATION}@ALLOWED_K8S_NAMESPACES=${ALLOWED_K8S_NAMESPACES}@SANDBOX_MODE=cloud_run@INITIAL_STABILIZATION_SECONDS=30@SESSION_BACKEND=firestore@FIRESTORE_DATABASE=(default)@SLACK_ALERT_CHANNEL_ID=${SLACK_ALERT_CHANNEL_ID}@SLACK_ALLOWED_APPROVER_IDS=${SLACK_ALLOWED_APPROVER_IDS:-}" \
   ${SLACK_SECRET_FLAGS[@]+"${SLACK_SECRET_FLAGS[@]}"} \
   --project="${GOOGLE_CLOUD_PROJECT}"
 ```
 
 > [!TIP]
-> `INITIAL_STABILIZATION_SECONDS=30` を設定することで、単発のエラーログが Pub/Sub に到着した直後に即断せず、30 秒間の観測ウィンドウで直近のエラー率バケット推移を集計して「一時的スパイクの自然減衰」と「持続障害」を高精度に区別します。
+> `INITIAL_STABILIZATION_SECONDS=30` を設定することで、単発のエラーログが Pub/Sub に到着した直後に即断せず、30 秒間の観測ウィンドウで直近のエラー率バケット推移を集計して「一時的スパイクの自然減衰」と「持続障害」を高精度に区別します。また、ハンズオン訓練で同一シナリオを待たずに連続再検証できるよう `ALLOW_DRILL_COOLDOWN_RESET=true` を有効化しています（本番環境では既定値 `false` に戻してください）。
 
 ### デプロイ設定の確認（Verification）
 
@@ -130,7 +130,7 @@ gcloud logging read \
 
 ---
 
-## 3. 実戦障害訓練（3 大シナリオの検証）
+## 3. 実戦障害訓練（4 大シナリオの検証）
 
 ### 訓練 1：一時的な下流ネットワーク瞬断 → 「静観（OBSERVE）」の検証
 
@@ -160,7 +160,7 @@ sequenceDiagram
         Note over Agent,BQ: 2. 30秒安定化観測・隔離 sandbox 減衰解析・過去事例照合
         Agent->>Agent: INITIAL_STABILIZATION_SECONDS=30 待機後に直近90秒ログ時系列を取得
         Agent->>Agent: sandbox do で減衰傾き負 is_naturally_decaying=True・直近デプロイ無しを確認
-        Agent->>BQ: VECTOR_SEARCH により INC-013 外部決済 TLS 瞬断が上位一致
+        Agent->>BQ: AI.SEARCH により INC-013 外部決済 TLS 瞬断が上位一致
     end
 
     rect rgb(230, 244, 234)
@@ -209,7 +209,7 @@ sequenceDiagram
     rect rgb(232, 240, 254)
         Note over Agent,BQ: 2. 直近デプロイ検知・知識ベース高類似度一致・安全ガード検証
         Agent->>Agent: 直近30分以内の新規 ReplicaSet ロールアウトと高止まりエラー率を確認
-        Agent->>BQ: VECTOR_SEARCH により INC-001 必須環境変数欠落が類似度 >= 0.85 で一致
+        Agent->>BQ: AI.SEARCH により INC-001 必須環境変数欠落が類似度 >= 0.85 で一致
         Agent->>Agent: ガードレール PASS — sre-demo-app 内・類似度 >= 0.85・1時間以内初回
     end
 
@@ -300,19 +300,117 @@ bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGIO
 ./target-app/scripts/reset_fault.sh
 ```
 
+---
+
+### 訓練 4：初見のインメモリ税率テーブル破損 → 「1 回目 Slack 承認＆自律ナレッジ登録 → 2 回目全自動復旧」の検証
+
+最後に、初期シード 100 件には存在しない**まったく初見の障害**（インメモリ消費税ルックアップテーブルの CRC32 チェックサム破損：`TAX_RULE_CRC32_MISMATCH_500`）を注入し、**人間が 1 度承認して解決した障害をエージェントが自律学習し、2 回目から人間介入ゼロで自動復旧させる自己成長ループ**を検証します。
+
+> [!IMPORTANT]
+> 訓練 4 では Slack の `[Approve & Execute]` ボタン押下をトリガーとして再開・ナレッジ昇格を行うため、第 4 章 Step 5 の Slack App 連携が設定済みであることを前提とします。
+
+![シナリオ 4: 初見エラーの 1 回目承認解決から自律ナレッジ登録・2 回目全自動復旧への進化シーケンス図](images/05-05-drill4-self-learning-sequence.png)
+
+<details>
+<summary>詳細: Mermaid ソースを表示</summary>
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Script as inject_novel_tax_corrupt.sh
+    participant GKE as GKE: order-service
+    participant Agent as SRE Agent: Cloud Run instance
+    participant BQ as BigQuery: AI.EMBED 知識ベース
+    participant Slack as Slack: オンコール担当者
+
+    rect rgb(254, 247, 224)
+        Note over Script,Slack: 1回目: シード100件に未登録の初見エラー発生 → 類似度 0.85 未満のため人間承認待ち
+        Script->>GKE: TAX_CACHE_CORRUPTION 注入 + TAX_RULE_CRC32_MISMATCH_500 発火
+        Agent->>BQ: AI.SEARCH 照合 → 既存100件との類似度 < 0.85 のため REQUIRE_APPROVAL へ降格
+        Agent->>Slack: 初見エラー調査レポート + Approve & Execute ボタン送信
+        Slack-->>Agent: 担当者が Approve をクリック
+        Agent->>GKE: RESTART_DEPLOYMENT ローリング再起動実行 → 事後エラー率 < 1.0% 回復を確認
+    end
+
+    rect rgb(243, 232, 253)
+        Note over Agent,BQ: 自律ナレッジ昇格: 実証された解決策を構造化し BigQuery が自動でベクトル化
+        Agent->>BQ: Gemini 3.8 Flash で AUTO-* Runbook を合成し MERGE 登録 — 次回推奨 AUTO_REMEDIATE
+        BQ->>BQ: GENERATED ALWAYS AS AI.EMBED により gemini-embedding-2 ベクトルを自動生成
+        Agent->>Slack: 処置完了 + 新規 Runbook AUTO-* 自動登録を通知
+    end
+
+    rect rgb(230, 244, 234)
+        Note over Script,Slack: 2回目: 同一の初見エラーを再注入 → 自律学習済みナレッジと一致し人間承認なしで自動復旧
+        Script->>GKE: クールダウン解除後に再び TAX_CACHE_CORRUPTION を注入
+        Agent->>BQ: AI.SEARCH 照合 → 自律登録済み AUTO-* が類似度 >= 0.85 で最上位一致
+        Agent->>GKE: 人間承認を待たず AUTO_REMEDIATE で即座にローリング再起動・回復確認
+        Agent->>Slack: 自動復旧完了レポート通知
+    end
+```
+
+</details>
+
+#### ステップ A：1 回目の注入（初見エラーのため Slack 承認待ち → ローリング再起動 → 自律ナレッジ登録）
+
+```bash
+./target-app/scripts/inject_novel_tax_corrupt.sh
+```
+
+1. 既存 100 件との類似度スコアが `0.85` 未満となるため、安全ガードレールが自動的に `REQUIRE_APPROVAL` へ振り分け、Slack に調査レポートと `[Approve & Execute]` ボタンを投稿します。
+2. Slack で **`[Approve & Execute]`** をクリックすると、エージェントは `RESTART_DEPLOYMENT`（ゼロダウンタイムのローリング再起動）を実行して破損したインメモリキャッシュをクリアし、事後エラー率が `1.0%` 未満へ回復したことを確認します。
+3. 回復確認の直後、エージェントが自動的に `AUTO-*` ID の構造化 Runbook を BigQuery `incident_runbooks` へ `MERGE` 登録し、Slack メッセージ末尾に `🧠 自律ナレッジ登録完了` と表示されます。
+
+#### ステップ B：BigQuery `AI.EMBED` バックグラウンド埋め込み完了の確認とクールダウン解除
+
+新規追加された `AUTO-*` レコードに対して、BigQuery の自動埋め込み生成が完了（`embedding.status = ''`）したことを確認してから、連続検証用にクールダウンを解除します。
+
+```bash
+# 1. 自律登録された AUTO-* Runbook と AI.EMBED ベクトル生成完了（embedded = true）の確認（約 15〜45 秒）
+for i in $(seq 1 8); do
+  bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGION}" --use_legacy_sql=false \
+    'SELECT
+       runbook_id,
+       recommended_action,
+       remediation_type,
+       (embedding IS NOT NULL AND embedding.status = "") AS embedded,
+       SUBSTR(title, 1, 45) AS title_preview
+     FROM `sre_agent_ops.incident_runbooks`
+     WHERE STARTS_WITH(runbook_id, "AUTO-")'
+  sleep 8
+done
+
+# 2. embedded = true になったことを確認したら、訓練用の 15 分クールダウン・1 時間上限を即時解除
+./target-app/scripts/reset_fault.sh --reset-cooldown
+```
+
+#### ステップ C：2 回目の同一障害注入（人間承認ゼロでの `AUTO_REMEDIATE` 自動復旧を確認）
+
+```bash
+./target-app/scripts/inject_novel_tax_corrupt.sh
+```
+
+**確認ポイント**:
+* 今度は BigQuery `AI.SEARCH` が先ほど自律登録された `AUTO-*` Runbook を類似度 `0.85` 以上で最上位ヒットさせるため、**Slack の承認ボタンを待たずに `AUTO_REMEDIATE` ルートへ直行**し、自動的に Pod がローリング再起動されて回復すること！
+* `incident_events` 監査テーブルで、1 回目の `REQUIRE_APPROVAL` → `APPROVED_EXECUTED` から、2 回目の `AUTO_REMEDIATE`（`matched_runbook_id = "AUTO-..."`）へ進化した履歴を確認します。
+
+```bash
+bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGION}" --use_legacy_sql=false \
+  'SELECT created_at, incident_id, error_code, decision, remediation_type, matched_runbook_id, ROUND(similarity_score, 3) AS sim, verification_passed FROM `sre_agent_ops.incident_events` ORDER BY created_at DESC LIMIT 8'
+```
+
 ### 💡 トラブルシューティングのヒント
 
 * **単発の `McpError: Server returned an error response` がログに出る場合**: LLM がリモート MCP ツールのフィルタ引数を初回試行で誤り、サーバーが入力補正エラーを返すことがあります。ADK のツール機構がエラーメッセージをモデルへ返して自動リトライするため、後続ステップで `Gemini トリアージ推論を完了しました` と記録されていれば正常動作です。全ツール呼び出しが連続失敗する場合のみ、`roles/mcp.toolUser` と `roles/serviceusage.serviceUsageConsumer` の付与を確認してください。
-* **訓練直後に同じ訓練を再実行したい場合**: 重複排除ストアが同一エラー指紋を 15 分間クールダウンするため、再テスト時は 15 分待つか、別のエラーシナリオを実行してください。
+* **訓練直後に同じ訓練をすぐ再実行したい場合**: `ALLOW_DRILL_COOLDOWN_RESET=true` を設定した検証環境では `./target-app/scripts/reset_fault.sh --reset-cooldown` を実行することで、15 分間のクールダウンと 1 時間 1 回上限を即時リセットできます。
 
 ---
 
 ## 🤖 AI コーディングエージェントを使う場合の指示プロンプト
 
 ```markdown
-`AGENTS.md` と `.env` を読み込み、第5章（`docs/05-deploy-cloud-run-instance-and-drills.md`）のデプロイと 3 つの障害訓練を順番に実行してください。
+`AGENTS.md` と `.env` を読み込み、第5章（`docs/05-deploy-cloud-run-instance-and-drills.md`）のデプロイと 4 つの障害訓練を順番に実行してください。
 - `sre-autonomous-agent` イメージのビルドと `gcloud beta run instances deploy` はコマンド全文を提示し、私の `y` 承認後に実行すること。
-- 訓練 1・訓練 2・訓練 3 は 1 つずつ実行し、各訓練の後に `kubectl get pods -n sre-demo-app -L version` と BigQuery `incident_events` テーブルの記録結果を確認して報告すること。
+- 訓練 1・訓練 2・訓練 3・訓練 4 は 1 つずつ実行し、各訓練の後に `kubectl get pods -n sre-demo-app -L version` と BigQuery `incident_events` / `incident_runbooks` テーブルの記録結果を確認して報告すること。
 ```
 
 ---

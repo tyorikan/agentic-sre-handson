@@ -110,7 +110,8 @@ cat << 'EOF' > /tmp/sample_eval_runs.json
 {
   "scenario_1_transient_observe": [true, true, true, true, true],
   "scenario_2_known_bug_rollback": [true, true, true, true, true],
-  "scenario_3_db_lock_require_approval": [true, true, true, true, true]
+  "scenario_3_db_lock_require_approval": [true, true, true, true, true],
+  "scenario_4_novel_self_learning": [true, true, true, true, true]
 }
 EOF
 
@@ -155,8 +156,9 @@ gcloud pubsub topics delete sre-alert-stream \
   --project="${GOOGLE_CLOUD_PROJECT}" \
   --quiet
 
-# 4. BigQuery データセット・Artifact Registry・Secret Manager の削除（任意）
+# 4. BigQuery データセット・Cloud Resource Connection・Artifact Registry の削除（任意）
 bq rm -r -f -d "${GOOGLE_CLOUD_PROJECT}:${BQ_DATASET}"
+bq rm --connection --location="${GOOGLE_CLOUD_REGION}" --project_id="${GOOGLE_CLOUD_PROJECT}" -f "${BQ_CONNECTION_ID:-sre_genai_conn}" || true
 
 gcloud artifacts repositories delete sre-handson \
   --location="${GOOGLE_CLOUD_REGION}" \
