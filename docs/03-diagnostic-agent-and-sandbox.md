@@ -74,13 +74,15 @@ flowchart TD
 * **GKE は `/mcp/read-only` を指定**: 変更系ツール（リソース削除・パッチ等）がエンドポイント自体に存在しないため、調査フェーズでの誤変更を構造的に遮断できます。
 * **`tool_filter` で公開ツールを厳選**: 不要な汎用ツールや日次割り当ての小さい `answer_query` を隠すことで、モデルのツール選択迷いとトークン消費を抑えます。
 * **初見エラー時のみ・固有情報を含めずに検索**: 公式ドキュメント検索は類似度 `0.85` 未満の初見エラーに限り、一般的な英語技術キーワード 2〜5 語で最大 2 回まで呼び出すようプロンプトで制約しています（ログ本文・ホスト名・ID は検索語に含めません）。
-* **補助接続の Fail-Open 設計**: Developer Knowledge は `OptionalMcpToolset`（接続・読み取りタイムアウト 10 秒）で包んでおり、API 未有効やネットワーク制約で到達できない場合も警告ログを 1 行出して観測 10 ツールのみでトリアージを継続します。環境変数 `ENABLE_DEVELOPER_KNOWLEDGE_MCP="false"` で明示的に無効化することも可能です。VPC Service Controls 環境での注意点は [第 6 章](06-optional-hardening-and-cleanup.md) を参照してください。
+* **補助接続の Fail-Open 設計**: Developer Knowledge は `OptionalMcpToolset`（タイムアウト 10 秒）で包んでおり、到達できない環境でも警告ログを 1 行出して観測 10 ツールのみで診断を継続します。
+  * 無効化したい場合は `ENABLE_DEVELOPER_KNOWLEDGE_MCP="false"` を指定します。
+  * VPC Service Controls 環境での注意点は [第 6 章](06-optional-hardening-and-cleanup.md) 第 4 節を参照してください。
 
 ---
 
 ## 4. Cloud Run sandboxes による隔離コード実行の境界
 
-時系列エラー率の減衰傾き（線形回帰スロープ）などの数値解析コードを親コンテナ上で直接動かすと、親プロセスが保持する Slack トークンやメタデータサーバー認証情報に到達できてしまいます。そこで `sandboxLauncher: true` 有効時に利用できる `/usr/local/gcp/bin/sandbox do` で完全隔離空間を起動します。
+親コンテナ上で統計スクリプトを直接動かすと、Slack トークンや Google Cloud メタデータ認証情報へ到達できてしまいます。そこで `--sandbox-launcher` 有効時に使える `/usr/local/gcp/bin/sandbox do` で通信・認証を遮断した隔離空間を起動します。
 
 ![親コンテナと Cloud Run sandbox 隔離空間のセキュリティ境界図](images/03-02-sandbox-isolation-boundary.png)
 

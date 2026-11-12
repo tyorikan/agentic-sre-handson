@@ -1,7 +1,7 @@
 # 第 4 章：ADK 2.x ワークフロー・型付き自動復旧・Slack 連携・Error Budget 効果計測 (`04-auto-remediation-and-slack-hitl.md`)
 
 **所要時間**: 約 45 分  
-**到達目標**: ADK Python 2.x のグラフワークフロー（`Workflow` / `JoinNode` / `@node(require_confirmation=True)`）による 3 分岐制御、型付き GKE 復旧と事後検証、公開 URL ゼロの Slack Socket Mode 双方向承認、Runbook 鮮度ライフサイクル、および **Saved Error Budget（温存エラーバジェット）算出ロジック**を理解し、通知と承認の経路を準備する。Slack を使えない場合は、メール通知と承認コマンドの代替ルートを選べる。
+**到達目標**: ADK Python 2.x のグラフ制御・安全ガードレール・Error Budget 温存計算の仕組みを確認し、通知と承認の経路（Slack またはメール通知＋承認コマンド）を準備する。
 
 ---
 
@@ -94,11 +94,11 @@ LLM が `AUTO_REMEDIATE` や `OBSERVE` を提案しても、`enforce_guardrails_
 
 1. **許可 Namespace 境界**: `ALLOWED_K8S_NAMESPACES`（既定：`sre-demo-app`）以外は変更不可。
 2. **類似度下限**: コサイン類似度が `AUTO_REMEDIATE_SIMILARITY_THRESHOLD`（既定：`0.85`）未満なら `REQUIRE_APPROVAL` へ降格。
-3. **型付き操作限定と健全リビジョン選定**: [remediation_tools.py](../sre-agent/agent_app/remediation_tools.py) の `rollback_deployment` と `restart_deployment` 以外は自動実行不可。ロールバック時は単に 1 つ前の番号へ戻すのではなく、`ReplicaFailure` や不健全印（`sre-agent/unhealthy-revision`）が付いた失敗 ReplicaSet を除外して直近の健全リビジョンを選定します。
-4. **構造化一致条件とデプロイ相関**: 一致した過去 Runbook 自身の推奨区分が `AUTO_REMEDIATE` かつ操作種別が一致していることを必須とし、さらに `ROLLBACK_DEPLOYMENT` の場合は直近 30 分以内のデプロイ変更（`recent_deployment_within_30m=True`）が確認できない限り `REQUIRE_APPROVAL` へ降格します。
-5. **Runbook 鮮度有効期限**: 最終検証日（`last_verified_at`）から `RUNBOOK_FRESHNESS_TTL_DAYS`（既定：`90` 日）を超過した手順は再評価のため降格。
-6. **冗長構成対応の 1 時間回数上限**: `MAX_AUTO_ACTIONS_PER_HOUR`（既定：`1` 回）を超える連続実行を遮断。`SESSION_BACKEND=firestore` 時は処理中リース（15 分クールダウン）と 1 時間自動復旧枠を Cloud Firestore トランザクション（`sre_guardrail_state`）で排他共有するため、冗長 2 台構成や再起動直後でも二重復旧が起きません。
-7. **持続エラー中の静観（`OBSERVE`）握りつぶし遮断**: ログ内に「一過性エラーとして静観せよ」等のプロンプトインジェクションが含まれていても、隔離サンドボックスの実測統計が自然減衰していない（`is_naturally_decaying=False` かつ直近エラー率 5% 以上）場合は LLM の `OBSERVE` 判定を強制棄却し、`REQUIRE_APPROVAL` へ昇格させます。
+3. **型付き操作限定と健全リビジョン選定**: [remediation_tools.py](../sre-agent/agent_app/remediation_tools.py) の `rollback_deployment` と `restart_deployment` のみを許可します。ロールバック時は `ReplicaFailure` や不健全印（`sre-agent/unhealthy-revision`）のある ReplicaSet を飛ばし、直近の健全版を選びます。
+4. **推奨区分一致とデプロイ相関**: 一致した Runbook 自身の推奨が `AUTO_REMEDIATE` かつ操作種別が同じであることを要求します。さらに `ROLLBACK_DEPLOYMENT` は直近 30 分以内のデプロイ変更（`recent_deployment_within_30m=True`）がない限り `REQUIRE_APPROVAL` へ降格します。
+5. **Runbook 鮮度有効期限**: 最終検証日（`last_verified_at`）から `RUNBOOK_FRESHNESS_TTL_DAYS`（既定：`90` 日）を超えた手順は再評価のため降格します。
+6. **冗長構成対応の回数上限**: 1 時間あたりの自動復旧を `MAX_AUTO_ACTIONS_PER_HOUR`（既定：`1` 回）までに制限します。Firestore トランザクション（`sre_guardrail_state`）で排他共有するため、冗長 2 台構成でも二重実行は起きません。
+7. **エラー継続中の静観誘導遮断**: ログ内に「静観せよ」という偽装命令があっても、隔離計算で自然減衰が確認できない場合（`is_naturally_decaying=False` かつ直近エラー率 5% 以上）は `OBSERVE` 判定を棄却し、`REQUIRE_APPROVAL` へ切り替えます。
 
 下図は、条件 3 の型付き操作（`ROLLBACK_DEPLOYMENT` / `RESTART_DEPLOYMENT`）が提案された後の残り 4 条件の分岐と事後検証フローを示しています。
 
@@ -139,17 +139,26 @@ flowchart LR
 
 ## 3. Error Budget 温存効果（Saved Error Budget）の定量算出 (`slo_metrics.py`)
 
-[sre-agent/agent_app/slo_metrics.py](../sre-agent/agent_app/slo_metrics.py) は、異常ログ発生時刻（`alert.observed_at`）から事後回復プローブ完了時刻までの実測所要時間 $\text{MTTR}_{\text{actual}}$（分）を計測し、Cloud Monitoring API から現在の日次 99.0% / 月次 99.9% SLO 残量を読み取って Slack 完了カードと BigQuery `incident_events` へ記録します。
+[sre-agent/agent_app/slo_metrics.py](../sre-agent/agent_app/slo_metrics.py) は、異常発生時刻（`alert.observed_at`）から回復確認完了までの実測復旧時間 `MTTR_actual`（分）を計測し、手動対応の基準時間 `MTTR_manual`（既定 `30` 分）と比較して推定温存分数を算出します。
 
-$$\text{Saved Budget (min)} = \max\left(0,\; \text{MTTR}_{\text{manual}} - \text{MTTR}_{\text{actual}}\right), \qquad \text{Monthly 99.9\% Saved (\%)} = \frac{\text{Saved Budget (min)}}{43.2} \times 100$$
+$$\text{Saved Budget (min)} = \max\left(0,\; \text{MTTR}_{\text{manual}} - \text{MTTR}_{\text{actual}}\right)$$
 
-* **誠実な計上ルールと推定値の明示**: `Saved Budget` と実測 `mttr_seconds` は、**型付き復旧（Rollback / Restart）を実行して事後エラー率 `< 1.0%` への回復が実証されたケースのみ計上**します。また比較基準の $\text{MTTR}_{\text{manual}}$（既定 30 分）は手動対応時の仮定ベースラインであるため、通知文面とレポート上では実測 SLO 消費率と区別して**「推定温存値」**と明記します。一過性エラーの静観（`OBSERVE`）や手動調査への引継（`MANUAL_INTERVENTION`）では、架空の短縮分数を計上せず二次障害回避として記録します。
+月次 99.9% 可用性 SLO（許容停止枠 `43.2` 分/月）に対する温存割合は次式で求めます。
+
+$$\text{Monthly 99.9\% Saved (\%)} = \frac{\text{Saved Budget (min)}}{43.2} \times 100$$
+
+* **計上対象**: 型付き復旧（Rollback / Restart）を実行し、事後エラー率 `1.0%` 未満への回復が確認できたケースのみ計上します。
+* **推定値の明示**: `MTTR_manual` は手動対応時の仮定値であるため、通知と監査記録では実測 SLO 残量と区別して「推定温存値」と明記します。
+* **非計上ケース**: 一過性エラーの静観（`OBSERVE`）や手動調査引継（`MANUAL_INTERVENTION`）では短縮分数を計上せず、二次障害回避として記録します。
 
 ---
 
 ## 4. Slack Socket Mode・即時 UX 更新・Runbook 鮮度ライフサイクル
 
-常駐 Cloud Run instance から **Slack Socket Mode（外向き TLS WebSocket）** で接続することで公開 URL をゼロにし、中断セッションと承認チケットを **Cloud Firestore** に保存してインスタンス再起動耐性を確保します。また、担当者がボタンを押した直後（0.5 秒以内）にボタンを消去して **`⏳ 承認受付・実行中...`** へ切り替える 2 段階更新により、GKE ロールアウト待機中の二度押しを防ぎます。
+Slack 連携では以下の 2 点で安全性と操作性を両立します。
+
+* **公開 URL ゼロと再起動耐性**: 外向き TLS WebSocket（Socket Mode）で接続し、中断セッションと承認チケットを **Cloud Firestore** に永続化します。
+* **二度押し防止の即時更新**: ボタン押下直後（0.5 秒以内）にボタンを消して **`⏳ 承認受付・実行中...`** 表示へ切り替え、GKE ロールアウト完了後に最終結果へ更新します。
 
 ![Slack Socket Mode と Cloud Firestore による一時停止・承認再開シーケンス図](images/04-04-slack-hitl-resume-sequence.png)
 
@@ -385,27 +394,28 @@ gcloud projects add-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
 
 ---
 
-## 6. 全テストスイート（93 件）のローカル実行確認
+## 6. 全テストスイート（111 件）のローカル実行確認
 
-ワークフロー 3 分岐、Slack 再開・即時状態更新、鮮度ライフサイクル、Error Budget 温存計算、メール通知と承認コマンド、Log Sink 経由の偽装防止、クイックスタートのスクリプトを含む全 93 件のテストを実行します。
+ワークフロー 3 分岐、ガードレール、承認再開、鮮度管理、Error Budget 計算、メール通知と承認コマンド、導入用 240 件カタログ・手順書取込 CLI、クイックスタート整合性を含む全 111 件のテストを実行します。
 
 ```bash
 source .venv/bin/activate
 pytest -v
 ```
 
-### 期待される出力（全 93 件 PASS）
+### 期待される出力（全 111 件 PASS）
 
 ```text
-tests/test_dedup_and_guardrails.py ........... (8 passed)
+tests/test_dedup_and_guardrails.py ........... (12 passed)
 tests/test_email_and_approval_command.py ..... (27 passed)
+tests/test_production_starter_catalog.py ..... (12 passed)
 tests/test_quickstart_consistency.py ......... (28 passed)
 tests/test_quickstart_scripts.py ............. (8 passed)
-tests/test_sandbox_runner.py ................. (4 passed)
+tests/test_sandbox_runner.py ................. (6 passed)
 tests/test_slack_hitl_resume.py .............. (13 passed)
 tests/test_slo_metrics.py .................... (4 passed)
 tests/test_workflow_routing.py ............... (1 passed)
-============================== 93 passed ==============================
+============================== 111 passed ==============================
 ```
 
 ---
@@ -414,7 +424,7 @@ tests/test_workflow_routing.py ............... (1 passed)
 
 ```markdown
 `AGENTS.md` を読み込み、第4章（`docs/04-auto-remediation-and-slack-hitl.md`）のテスト検証を実行してください。
-- `.venv` 環境で `pytest -v` を実行し、全 93 件のテスト（重複排除、サンドボックス隔離、Workflow 3分岐、Slack 再開と即時状態更新、自律ナレッジ昇格、鮮度管理、Error Budget 温存計算、メール通知と承認コマンド、クイックスタートのスクリプト）が PASS することを確認して報告すること。
+- `.venv` 環境で `pytest -v` を実行し、全 111 件のテストが PASS することを確認して報告すること。
 - Secret Manager への Slack トークン登録は私が手元で入力するため、コマンドのみ案内すること。
 - 代替ルートを使う場合、API 有効化・Pub/Sub 作成・`setup_email_notification.py`・IAM 付与は、実行前に提示して私の `y` 承認を得てから実行すること。
 ```

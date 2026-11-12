@@ -1,7 +1,7 @@
 # 第 5 章：閉域常駐デプロイ・4 大障害訓練・Error Budget 温存効果の実測 (`05-deploy-cloud-run-instance-and-drills.md`)
 
 **所要時間**: 約 50 分  
-**到達目標**: 常駐 SRE エージェントを **Cloud Run instances**（`--sandbox-launcher --ingress internal --no-default-url`）へデプロイし、4 種類の本番想定障害を通して「静観」「自動ロールバック」「高リスク DB 障害の人間承認引継」「初見障害の自律学習と鮮度再評価」、および**訓練前後の Error Budget 消費比較と温存効果の定量証明**を一気通貫で検証する。
+**到達目標**: エージェントを閉域設定の **Cloud Run instances** へデプロイし、4 つの障害シナリオ（静観・自動切り戻し・DB 承認引継・初見事象の自己学習と鮮度再評価）および Error Budget 温存効果を実機で検証する。
 
 ---
 
@@ -44,10 +44,10 @@ flowchart LR
 
 </details>
 
-* **なぜ Cloud Run Services ではなく Cloud Run instances なのか**: リクエスト駆動でスケールトゥゼロする Cloud Run Services と異なり、Cloud Run instances は単一コンテナを常時稼働させて Pub/Sub StreamingPull と Slack Socket Mode WebSocket を維持でき、さらに `--sandbox-launcher` で隔離サンドボックスを即起動できます。
-* **共有 CPU 特性とサンドボックス並列制御**: Cloud Run instances は共有 CPU モデル（1 vCPU あたり定常 6.25%・最大 500 CPU 秒バースト）であり、隔離サンドボックスも同じ CPU・メモリ枠を共有します。本エージェントの処理時間の 98% 以上はネットワーク待機で CPU 消費は 1 件あたり約 1 秒未満ですが、複数アラート同時着信時の瞬間負荷を抑えるため `MAX_CONCURRENT_SANDBOXES=2` のセマフォでサンドボックスの同時起動数を制限しています。重い統計解析を常時回す場合は第 6 章の GKE Standard `microVM` 構成を選択してください。
-* **代替ルートも外向き通信だけで成立**: 通知メールの送信は Application Integration の API 呼び出し、承認コマンドからの承認は承認専用サブスクリプションの StreamingPull で受け取るため、着信 URL は不要です。
-* **閉域 GKE コントロールプレーンへの接続補足**: 本手順の GKE はプライベートノード構成（コントロールプレーン外部到達有効）のためそのまま到達できます。コントロールプレーンの外部エンドポイントも閉じた GKE に接続する場合は、Cloud Run instance に Direct VPC Egress（`--network` / `--subnet`）を付与するか GKE の DNS ベースエンドポイントを使用します。
+* **Cloud Run instances を使う理由**: リクエストがないと停止する Cloud Run Services と異なり、常駐プロセスで Pub/Sub StreamingPull と Slack WebSocket を維持しつつ、`--sandbox-launcher` で隔離空間を即起動できます。
+* **共有 CPU と同時実行制御**: Cloud Run instances は共有 CPU（1 vCPU あたり定常 6.25%・最大 500 CPU 秒バースト）を親と隔離空間で共有します。同時着信時の負荷集中を防ぐため `MAX_CONCURRENT_SANDBOXES=2` で同時起動数を制限しています（高負荷解析には第 6 章の GKE `microVM` を使用）。
+* **代替ルートも着信 URL 不要**: メール送信は Application Integration API、承認受信は承認専用トピックの StreamingPull を使うため、外向き通信だけで完結します。
+* **閉域 GKE コントロールプレーンへの接続**: 本手順の GKE はコントロールプレーンの外部到達が有効です。コントロールプレーンも閉域化する場合は Direct VPC Egress（`--network` / `--subnet`）または GKE DNS エンドポイントを併用します。
 
 ---
 
@@ -238,7 +238,7 @@ SRE Agent Report [5m4fmm6attxchacf]
 根本原因の推定: 外部決済事業者のエッジロードバランサ切り替え等に伴う一時的な TLS ハンドシェイク接続リセット。
 判断根拠: 実トラフィック上のエラー率が既に 0.0% へ自然減衰（is_naturally_decaying=True）しており、過去事例 INC-013 の推奨アクションも OBSERVE であるため静観とする。
 📊 SLO & Error Budget 効果: 自然減衰を 58秒 で確認し静観 — 不要な Pod 再起動による再接続ストームと追加の Error Budget 流出を防止
-⚠️ 回避した誤対応: この状態で Pod を一斉再起動すると確立済みの正常な TLS コネクションプールまで破棄され、再ハンドシェイク嵐で障害が長引く。
+⚠️ 回避した誤対応: この状態で Pod を一斉再起動すると確立済みの正常な TLS コネクションプールまで破棄され、再ハンドシェイク集中で障害が長引く。
 ```
 
 ---

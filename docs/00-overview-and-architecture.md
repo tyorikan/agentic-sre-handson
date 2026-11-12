@@ -39,18 +39,18 @@ flowchart TD
 
 </details>
 
-### なぜこの設計が本番で機能するのか／何が不向きなのか
+### なぜこの設計が機能するのか／何が不向きなのか
 
-* **本番で機能する 5 つの理由**:
-  1. **Out-of-Band（帯域外）常駐監視**: 監視対象の GKE とは独立した **Cloud Run instances** 上で稼働するため、GKE 側が障害に陥っても外部から復旧 API を実行できます。
-  2. **着信公開 URL ゼロの双方向通信**: `--ingress internal` と `--no-default-url` で外部からの着信を完全遮断します。Pub/Sub StreamingPull と Slack Socket Mode はどちらもコンテナからの外向き TLS 通信であるため、公開 URL なしで監視と承認ボタン連携が成立します。Slack を使えない場合の代替ルートであるメール通知と承認コマンドも、外向き通信だけで動作します。
-  3. **調査の柔軟性と変更の厳格性の分離**: 統計計算スクリプトは外向き通信・認証情報を遮断した **Cloud Run sandboxes（`sandbox do`）** 内で実行し、GKE の変更は Namespace 固定・回数上限付きの型付き関数のみに限定します。
-  4. **鮮度管理付きの自律成長型知識ベース**: 初見障害は人間承認を経て**事後エラー率 1.0% 未満への回復が実証された場合のみ** BigQuery `incident_runbooks` へ自動登録し、`AI.EMBED` 生成列で自動ベクトル化します。一方、90 日以上未検証の手順は人間再承認へ自動降格し、却下・未回復手順は自動凍結します。
-  5. **Error Budget 温存効果の定量証明**: Cloud Monitoring の公式 SLO モニタリングと連動し、約 1〜2 分の自動復旧によって「従来の人間手動対応［既定 30 分仮定］と比べてどれだけ Error Budget を温存できたか」を推定値として算出し、実測 SLO 残量とともに証明できます。
-* **できないこと・不向きなこと（設計上の明確な境界線）**:
-  1. **全量生ログの直接 LLM 監視には不向き**: 平常時の大量ログを LLM に直接読ませるとコストと遅延が破綻します。一次抽出は必ず Cloud Logging シンクやアラートで行います。
-  2. **DB スキーマ破損やロック競合の無断自動修復は行わない**: ステートフルな DB 障害でアプリを無断再起動すると被害が拡大するため、自動的に `REQUIRE_APPROVAL` へ振り分けて人間へ判断を委ねます。
-  3. **リージョンと製品ステージの制約**: Cloud Run instances および sandboxes は Preview（Pre-GA）機能であり、本構成は GA 後の本番適用を見据えた検証用リファレンス設計です。`us-central1`・`us-east1`・`europe-west1` は非対応のため、対応リージョンである **`asia-northeast1`（東京）** を使用します。現時点で SLA 付き GA 基盤が必要な場合は第 6 章の GKE Standard `microVM` 構成を選択してください。
+* **機能する 5 つの設計ポイント**:
+  1. **監視基盤の分離（Out-of-Band 常駐）**: 監視対象 GKE とは別の **Cloud Run instances** 上で動くため、GKE 障害時も外部から復旧 API を呼べます。
+  2. **公開 URL ゼロの双方向連携**: `--ingress internal --no-default-url` で着信を遮断し、外向き通信のみで Pub/Sub 購読と承認連携（Slack Socket Mode またはメール通知＋承認コマンド）を行います。
+  3. **調査と変更の権限分離**: 統計計算は通信・認証を遮断した **Cloud Run sandboxes（`sandbox do`）** に閉じ込め、GKE 変更は許可 Namespace と回数上限付きの型付き API のみに絞ります。
+  4. **鮮度管理付きの自己成長知識ベース**: 初見障害は承認後に**事後エラー率 1.0% 未満へ回復した場合のみ** BigQuery `AI.EMBED` 列へ自動登録し、90 日超過時は再承認へ降格・失敗時は凍結します。
+  5. **Error Budget 温存効果の定量記録**: Service Monitoring SLO と連動し、実測 SLO 残量と手動対応基準（既定 30 分仮定）に対する推定温存分数を自動記録します。
+* **対象外・不向きな領域（設計上の境界線）**:
+  1. **全量生ログの直接 LLM 監視**: 平常時の大量ログをそのまま LLM へ送るとコストと遅延が破綻するため、一次抽出は Cloud Logging シンクと SLO アラートで行います。
+  2. **DB 障害の無断自動修復**: 行ロック競合やスキーマ不整合でアプリを無断再起動すると被害が広がるため、必ず `REQUIRE_APPROVAL` で人間へ引き継ぎます。
+  3. **対応リージョンと製品ステージ**: Cloud Run instances / sandboxes は Preview 機能であり、対応リージョンの **`asia-northeast1`（東京）** を使用します（`us-central1` 等は非対応）。SLA 付き GA 基盤が必要な場合は [第 6 章](06-optional-hardening-and-cleanup.md) の GKE Standard `microVM` を選択してください。
 
 ---
 
@@ -187,9 +187,9 @@ fi
 
 既定の Compute Engine サービスアカウントが無効化された組織環境でも動作し、かつ過剰権限（`roles/editor` 等）を排除するため、用途別に 3 つの専用サービスアカウントを作成します。
 
-1. **`sre-cloudbuild-sa`**（コンテナビルド専用）：ソース取得・Artifact Registry 書込・ビルドログ出力のみ
-2. **`sre-gke-node-sa`**（GKE ノード専用）：ノードからのログ・メトリクス送信とイメージ取得のみ
-3. **`sre-autonomous-agent-sa`**（常駐 SRE エージェント専用）：観測・SLO 読取、リモート MCP 呼び出し、BigQuery・Firestore 読み書き、Pub/Sub 購読、モデル推論、GKE クラスタ到達のみ（GKE 内の変更範囲は第 1 章の Kubernetes RBAC で `sre-demo-app` のみに限定）
+1. **`sre-cloudbuild-sa`**（ビルド専用）：ソース取得・Artifact Registry 書込・ビルドログ出力のみ
+2. **`sre-gke-node-sa`**（GKE ノード専用）：ログ・メトリクス送信とコンテナイメージ取得のみ
+3. **`sre-autonomous-agent-sa`**（SRE エージェント専用）：観測・MCP 読取、BigQuery・Firestore 読み書き、Pub/Sub 購読、モデル推論、GKE 到達のみ。GKE 内の変更範囲は第 1 章の Kubernetes RBAC で `sre-demo-app` に限定します。
 
 ```bash
 export SRE_BUILD_SA_NAME="sre-cloudbuild-sa"

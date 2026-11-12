@@ -99,7 +99,7 @@ flowchart LR
 
 1. **自動ベクトル生成列（`GENERATED ALWAYS AS (AI.EMBED(...))`）**: `search_document` 列を含む行を `INSERT` / `MERGE` するだけで、BigQuery が非同期ジョブで `gemini-embedding-2` を呼び出してベクトルを自動生成・維持します。
 2. **ベクトル再計算ゼロの鮮度更新**: `last_verified_at` や `verified_count`、`recommended_action` のみを `UPDATE` しても `search_document` 列は変わらないため、埋め込み再計算コストも検索空白も一切発生しません。
-3. **コサイン類似度への正規化**: `AI.SEARCH(..., distance_type => 'COSINE')` が返すコサイン距離 $d \in [0, 2]$ を、しきい値判定（`0.85` 以上で既知事象）に使いやすいコサイン類似度 $s \in [0, 1]$ へ変換します。
+3. **コサイン類似度への正規化**: `AI.SEARCH(..., distance_type => 'COSINE')` が返すコサイン距離 `d`（範囲 `0〜2`、`0` が完全一致）を、しきい値判定（`0.85` 以上で既知事象）に使いやすいコサイン類似度 `s`（範囲 `0〜1`）へ変換します。
 
 $$s = \max\bigl(0.0,\; \min(1.0,\; 1.0 - d)\bigr)$$
 
@@ -244,12 +244,15 @@ bq query \
 | [bigquery/seed_runbooks_100.jsonl](../bigquery/seed_runbooks_100.jsonl) | 100 件（`AUTO_REMEDIATE` 35 / `REQUIRE_APPROVAL` 40 / `OBSERVE` 25） | **ハンズオン訓練専用**。`order-service` 等の訓練用サービス名と検証済み経過日数を含む |
 | [bigquery/seed_runbooks_production_starter.jsonl](../bigquery/seed_runbooks_production_starter.jsonl) | 240 件・8 分類（`REQUIRE_APPROVAL` 217 / `OBSERVE` 23 / **`AUTO_REMEDIATE` 0**） | **自社 PoC・本番の初期土台**。固有サービス名を含まず、すべて「未検証」として登録 |
 
-* **同じデータセットに両方を入れたままにしない**: 似た障害パターンが検索結果で競合するため、ハンズオンと自社検証ではデータセットまたはプロジェクトを分けてください。
-* **導入前の確認推奨**: 汎用 240 件は一般的な GKE・データベース・ネットワーク・IAM・非同期処理の典型パターンをまとめた下書きであり、個別環境で動作検証された記録ではありません。投入前に SRE チームで自社構成に当てはまらない行の除外や手順の調整を行うことを推奨します。
+* **データセットの分離**: 似た障害パターンが検索で競合しないよう、訓練用 100 件と導入用 240 件は同一テーブルに混在させず、プロジェクトまたはデータセットを分けてください。
+* **投入前の確認**: 汎用 240 件は典型障害の初期テンプレートであり、個別環境での検証記録ではありません。自社構成に該当しない行の除外や手順調整を行ってから投入してください。
 
 ### 4.2 導入用 240 件の投入手順
 
-[bigquery/03_seed_production_starter.sql](../bigquery/03_seed_production_starter.sql) は、一過性の静観（`OBSERVE`）以外の全行を SQL でも強制的に `REQUIRE_APPROVAL` とし、`last_verified_at = NULL`・`verified_count = 0`（未検証）で登録します。承認通知（Slack / メール）では、未検証の事例に一致した際に `この環境では未検証` と明示されます。
+[bigquery/03_seed_production_starter.sql](../bigquery/03_seed_production_starter.sql) は以下の安全設定でデータを投入します。
+
+* `OBSERVE`（静観）以外の全行を SQL でも強制的に `REQUIRE_APPROVAL`（人間承認待ち）へ固定
+* `last_verified_at = NULL`・`verified_count = 0` で登録し、承認通知（Slack / メール）上に **`この環境では未検証`** と明示
 
 ```sh
 bq load \
@@ -287,10 +290,14 @@ python3 ./bigquery/import_markdown_runbooks.py \
 
 ### 4.4 実運用での学習と自動復旧への切り替え
 
-初期投入データの使われ方は、アラートとの類似度によって 2 通りに分かれます。
+初期投入データの学習経路は、アラートとの類似度によって 2 通りに分かれます。
 
-1. **類似度が `0.85` 未満で一致した場合（汎用 240 件での典型挙動）**: 固有サービス名を持たない汎用エントリは、`AI.SEARCH` の実測で類似度が概ね `0.78〜0.84` になります。トリアージ時の参考手順として上位 3 件に渡された上で、人間が承認して回復確認に成功すると、そのサービス固有の `AUTO-*` Runbook が自動登録されます（Rollback / Restart 実行時は次回から `AUTO_REMEDIATE` 対象）。
-2. **類似度が `0.85` 以上で一致した場合（自社サービス名入りの手順書を取り込んだ場合など）**: 承認・回復確認時には `last_verified_at` と `verified_count` のみが更新され、**自動では `AUTO_REMEDIATE` へ昇格しません**。自動化の範囲を人が管理できるよう、実績を確認した手順だけを以下の SQL で明示的に昇格させます。
+1. **類似度が `0.85` 未満の場合（汎用 240 件の典型挙動）**:
+   * 固有サービス名を持たない汎用エントリは、実測類似度が概ね `0.78〜0.84` となり参考手順として提示されます。
+   * 担当者が承認して回復確認（エラー率 `1.0%` 未満）に成功すると、そのサービス固有の `AUTO-*` Runbook が自動登録され、次回から自動復旧対象になります。
+2. **類似度が `0.85` 以上の場合（自社サービス名入りの手順書を取り込んだ場合など）**:
+   * 承認・回復時は `last_verified_at` と `verified_count` のみが更新され、**自動では `AUTO_REMEDIATE` へ昇格しません**。
+   * 実績を確認した手順だけを、運用者が以下の SQL で明示的に昇格させます。
 
 ```sql
 -- 承認実行と事後回復確認が 2 回以上成功している昇格候補の確認

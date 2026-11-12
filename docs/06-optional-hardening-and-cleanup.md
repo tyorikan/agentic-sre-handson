@@ -43,10 +43,10 @@ flowchart TD
 
 </details>
 
-* **必須条件**: GKE Standard クラスタ（バージョン `1.37` 以降）かつ Nested Virtualization 対応の x86 マシンシリーズ（`n4` / `n2` / `c4` 等、`e2` や Autopilot は非対応）が必要です。またシステム Pod 用に通常ノードプールを最低 1 ノード残します。
-* **通信境界とセキュリティ設定の注意点**:
-  * [network-policy-metadata-deny.yaml](../appendix/gke-microvm/network-policy-metadata-deny.yaml) は着信を全面拒否し、外向き通信を DNS（53）・HTTPS（443）およびエージェント自身の Workload Identity 認証エンドポイント（`169.254.169.254:80` / `169.254.169.252:988`）のみに絞ります。未信頼コードを別 `microVM` ワーカー Pod へ分離実行する場合は、該当ワーカー側のメタデータ許可ブロックを削除して完全遮断してください。
-  * GKE Sandbox Pod はハイパーバイザ境界で隔離されるため、ホスト側の Linux セキュリティモジュール設定（`seccompProfile` 等）は公式仕様上非サポートであり、[agent-deployment-microvm.yaml](../appendix/gke-microvm/agent-deployment-microvm.yaml) でも除外しています。
+* **必須条件**: GKE Standard（`1.37` 以降）と Nested Virtualization 対応の x86 マシン（`n4` / `n2` / `c4` 等、`e2` や Autopilot は非対応）が必要です。システム Pod 用の通常ノードプールも最低 1 ノード残します。
+* **通信と隔離の設計ポイント**:
+  * [network-policy-metadata-deny.yaml](../appendix/gke-microvm/network-policy-metadata-deny.yaml) で着信を全面拒否し、外向き通信を DNS（53）・HTTPS（443）・Workload Identity 認証先に限定します（未信頼コード専用ワーカー Pod を分ける場合はメタデータ許可も削除）。
+  * ハイパーバイザで隔離されるため、公式仕様上非サポートの `seccompProfile` はマニフェストから除外しています。
 
 ```bash
 source .env
@@ -73,7 +73,9 @@ kubectl apply -f ./appendix/gke-microvm/network-policy-metadata-deny.yaml
 
 ## 2. オプション B：Model Armor による間接プロンプトインジェクション防御（本番運用では必須推奨）
 
-外部攻撃者が HTTP ヘッダ等に仕込んだ悪意ある命令文字列がエラーログ経由で LLM に入るのを防ぐため、エージェント本体では `<untrusted_log_summary>` タグ境界化と「エラー継続中の `OBSERVE` 判定強制棄却」を標準実装しています。さらに本番環境で外部ユーザー入力を含みうるログを扱う場合は、環境変数 `MODEL_ARMOR_TEMPLATE_ID` を設定して LLM 投入前の Model Armor 検査を有効化するか、[appendix/production-hardening/model_armor_guard.py](../appendix/production-hardening/model_armor_guard.py) で ADK の `ModelArmorPlugin` を組み込むことを強く推奨します。
+悪意ある HTTP ヘッダ等がエラーログ経由で LLM に入る攻撃に対し、標準実装の `<untrusted_log_summary>` 境界タグと「エラー継続中の静観棄却」に加えて、**Model Armor** の事前検査を追加できます。
+
+* **有効化方法**: 環境変数 `MODEL_ARMOR_TEMPLATE_ID` を設定するか、[appendix/production-hardening/model_armor_guard.py](../appendix/production-hardening/model_armor_guard.py) の `ModelArmorPlugin` を組み込みます。
 
 ![Model Armor による悪意あるログ出力の間接プロンプトインジェクション遮断フロー図](images/06-02-model-armor-guard.png)
 
@@ -98,14 +100,14 @@ flowchart LR
 
 </details>
 
-* 日本語の通常ログの誤検知を防ぐため、`enable_multi_language_detection = True` とリージョン固有エンドポイント（`modelarmor.<LOCATION>.rep.googleapis.com`）を設定します。
-* 組織のフロア設定で Google リモート MCP サーバー（`GOOGLE_MCP_SERVER`）へプロンプトインジェクション検査を適用している場合、エラー文言を含む検索クエリや抜粋応答が誤検知（`403`）されることがあります。公式ドキュメント検索は `OptionalMcpToolset` により失敗時も自動でスキップされますが、恒常的に遮断される環境では `ENABLE_DEVELOPER_KNOWLEDGE_MCP="false"` を指定してください。
+* **日本語ログ対応**: 誤検知を抑えるため `enable_multi_language_detection = True` とリージョン固有エンドポイント（`modelarmor.<LOCATION>.rep.googleapis.com`）を設定します。
+* **リモート MCP 検査との兼ね合い**: 組織設定で `GOOGLE_MCP_SERVER` への検査を有効にしている場合、エラー文言を含む文書検索が `403` で遮断されることがあります（`OptionalMcpToolset` が自動スキップしますが、常時遮断される環境では `ENABLE_DEVELOPER_KNOWLEDGE_MCP="false"` を指定します）。
 
 ---
 
 ## 3. オプション C：`pass^3` 反復評価によるリリースゲート
 
-プロンプトやツール定義を更新した際、同一シナリオを $n$ 回試行して $c$ 回成功したときに $k$ 回連続で誤判断なく動作する確率 $\text{pass}^k$ を [appendix/production-hardening/calc_pass_hat_k.py](../appendix/production-hardening/calc_pass_hat_k.py) で検証できます。
+プロンプトやツール定義を更新した際、同一シナリオを `n` 回試行して `c` 回成功したときに `k` 回連続で誤判断なく動作する確率 `pass^k` を [appendix/production-hardening/calc_pass_hat_k.py](../appendix/production-hardening/calc_pass_hat_k.py) で算出できます。
 
 $$\text{pass}^k = \mathbb{E}_{\text{task}}\left[\frac{\binom{c}{k}}{\binom{n}{k}}\right]$$
 
@@ -131,15 +133,15 @@ python3 ./appendix/production-hardening/calc_pass_hat_k.py \
 
 本ハンズオンで構築したエージェントは、コードを 1 行も変更せず環境変数と RBAC の組み合わせだけで、安全な「観測モード」から段階的に本番適用できます。
 
-| 導入フェーズ | 環境変数と RBAC の設定値 | エージェントの実際の挙動 |
+| 導入フェーズ | 環境変数と RBAC の設定値 | エージェントの挙動 |
 |---|---|---|
-| **STEP 1: 観測・通知のみ**［1〜2 週間］ | `ALLOWED_K8S_NAMESPACES=""` / `ALLOW_DRILL_COOLDOWN_RESET="false"` / 対象 GKE の `RoleBinding` 未付与 | 変更権限ゼロで稼働。異常検知時は隔離解析・`AI.SEARCH` 照合を行い、根拠レポートのみを Slack またはメールへ送信 |
-| **STEP 2: 人間承認＋自律学習**［2〜4 週間］ | `ALLOWED_K8S_NAMESPACES="対象NS"` / `MAX_AUTO_ACTIONS_PER_HOUR="0"` / `ALLOW_DRILL_COOLDOWN_RESET="false"` / `SLACK_ALLOWED_APPROVER_IDS` 指定 | すべての復旧候補が決定論的ガードレールで承認待ちへ移行。人間が承認して回復実証された手順だけが `AI.EMBED` 知識ベースへ自動蓄積 |
-| **STEP 3: 限定自動復旧**［定着後］ | `ALLOWED_K8S_NAMESPACES="対象NS"` / `MAX_AUTO_ACTIONS_PER_HOUR="1"` / `ALLOW_DRILL_COOLDOWN_RESET="false"` / `RUNBOOK_FRESHNESS_TTL_DAYS="90"` | 類似度 `0.85` 以上かつ直近 90 日以内に実証済みの既知障害のみ 1 時間 1 回まで即時自動復旧。DB・未知・90 日超過手順は承認を維持 |
+| **STEP 1: 観測のみ**［1〜2 週］ | `ALLOWED_K8S_NAMESPACES=""` / `ALLOW_DRILL_COOLDOWN_RESET="false"` / GKE `RoleBinding` 未付与 | 変更権限ゼロで稼働し、隔離解析・`AI.SEARCH` 照合レポートのみを通知 |
+| **STEP 2: 承認＋学習**［2〜4 週］ | `ALLOWED_K8S_NAMESPACES="対象NS"` / `MAX_AUTO_ACTIONS_PER_HOUR="0"` / `SLACK_ALLOWED_APPROVER_IDS` 指定 | 全復旧候補を承認待ちへ回し、承認・回復実証された手順だけを `AI.EMBED` へ蓄積 |
+| **STEP 3: 限定自動復旧**［定着後］ | `MAX_AUTO_ACTIONS_PER_HOUR="1"` / `ALLOW_DRILL_COOLDOWN_RESET="false"` / `RUNBOOK_FRESHNESS_TTL_DAYS="90"` | 類似度 `0.85` 以上かつ 90 日以内実証済みの既知障害を 1 時間 1 回まで即復旧（DB・未知は承認維持） |
 
-* **初期知識ベースの入れ替え**: 自社環境への導入時はハンズオン用 100 件ではなく、導入用の汎用 240 件（`seed_runbooks_production_starter.jsonl`）または既存手順書の変換データを投入します。投入手順と自動復旧への明示昇格 SQL は [第 2 章](02-bigquery-vector-kb.md) の第 4 節を参照してください。
-* **閉域 GKE コントロールプレーンへ接続する場合**: 本ハンズオンの GKE はプライベートノード構成（コントロールプレーン外部到達有効）ですが、本番でコントロールプレーンの外部エンドポイントも閉じている場合は、Cloud Run instance に Direct VPC Egress（`--network` / `--subnet`）を設定するか GKE の DNS ベースエンドポイントを使用してください。
-* **VPC Service Controls 環境での Developer Knowledge MCP**: `developerknowledge.googleapis.com` は Restricted VIP（`restricted.googleapis.com`）に対応していません。VPC 内で `*.googleapis.com` を Restricted VIP へ向けている場合は、`developerknowledge.googleapis.com` のみ Private Google Access（`private.googleapis.com` / `199.36.153.8/30`）へ解決させるか、`ENABLE_DEVELOPER_KNOWLEDGE_MCP="false"` で無効化してください。
+* **初期知識ベースの入れ替え**: 訓練用 100 件ではなく、汎用 240 件カタログまたは既存手順書の変換データを投入します。手順と昇格 SQL は [第 2 章](02-bigquery-vector-kb.md) 第 4 節を参照してください。
+* **閉域 GKE コントロールプレーン接続**: コントロールプレーンの外部到達も閉じている場合は、[第 5 章](05-deploy-cloud-run-instance-and-drills.md) 第 1 節の通り Direct VPC Egress または GKE DNS エンドポイントを設定します。
+* **VPC Service Controls 環境での注意**: `developerknowledge.googleapis.com` は Restricted VIP 非対応です。当該ホストのみ Private Google Access（`private.googleapis.com`）へ解決させるか、`ENABLE_DEVELOPER_KNOWLEDGE_MCP="false"` を指定します。
 
 ---
 

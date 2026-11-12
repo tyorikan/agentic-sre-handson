@@ -2,7 +2,10 @@
 
 [![CI](https://github.com/tyorikan/agentic-sre-handson/actions/workflows/ci.yml/badge.svg)](https://github.com/tyorikan/agentic-sre-handson/actions/workflows/ci.yml)
 
-Cloud Logging / Cloud Monitoring のイベントストリームを 24 時間常時待ち受け、異常検知時に**「マルチシグナル相関分析」「隔離サンドボックスでの統計解析」「BigQuery 自律埋め込み知識ベース（`AI.EMBED` / `AI.SEARCH`）との照合」**を実行し、**静観・GKE 自動復旧・Slack 承認連携・解決ナレッジの自律昇格・Error Budget 温存効果の定量計測**までを一気通貫で構築するハンズオンリポジトリです。
+Cloud Logging と Cloud Monitoring の異常通知を 24 時間待ち受け、**原因調査・安全判定・自動復旧・人間承認・解決手順の自動学習**までを一貫して行う常駐型 SRE エージェントを構築するハンズオンです。
+
+* **調査と判定**: 公式リモート MCP による環境読み取り、隔離サンドボックスでのエラー推移計算、BigQuery 自律埋め込み知識ベース（`AI.EMBED` / `AI.SEARCH`）との類似照合を並列実行します。
+* **実行と定量評価**: 事象に応じて「静観・自動切り戻し・人間承認待ち」を使い分け、復旧時間（MTTR）と温存できた Error Budget を自動計測します。
 
 ![Agentic SRE ハンズオン 全体概要アニメーション](docs/images/overview-demo.webp)
 
@@ -12,7 +15,10 @@ Cloud Logging / Cloud Monitoring のイベントストリームを 24 時間常�
 
 ## 1. 全体アーキテクチャと設計の特徴
 
-監視対象の GKE クラスタが障害に陥っても監視エージェントが共倒れしないよう、エージェント本体は別基盤の **Cloud Run instances（＋ Cloud Run sandboxes）** 上で常駐稼働させます（Out-of-Band 監視）。外部からの着信 URL を完全に無効化（`--ingress internal --no-default-url`）したまま、外向き通信のみで Pub/Sub 購読と双方向 Slack 承認を実現します。Slack を使えない場合は、メール通知と承認コマンドの代替ルートを選べます。
+監視対象の GKE クラスタと共倒れしないよう、エージェント本体は別基盤の **Cloud Run instances（＋ Cloud Run sandboxes）** に常駐させます。
+
+* **公開 URL ゼロの閉域構成**: `--ingress internal --no-default-url` で外部からの着信を遮断し、外向き通信のみで Pub/Sub 購読と Slack 承認を行います。
+* **Slack 不要の代替ルート**: Slack を使えない環境では、Application Integration のメール通知とターミナルの承認コマンドで同じ手順を実施できます。
 
 ![常駐自律型 SRE エージェント 全体アーキテクチャ構成図](docs/images/00-overall-architecture.png)
 
@@ -73,16 +79,16 @@ flowchart TB
 
 ### 一般的なデモ実装と本リポジトリの設計パターンの違い
 
-> **製品ステージに関する注記**: 中核ランタイムの Cloud Run instances および Cloud Run sandboxes は **Preview（Pre-GA）** 機能です。本リポジトリは **GA 後の本番導入を見据えた事前検証用リファレンス設計** として構成しています。現時点で SLA 付きの GA 基盤が必要な場合は、[第 6 章](docs/06-optional-hardening-and-cleanup.md) の GKE Standard `microVM` 構成を選択できます。
+> **製品ステージの注記**: Cloud Run instances と Cloud Run sandboxes は **Preview（Pre-GA）** 機能であり、本構成は GA 後の本番導入を見据えた検証用リファレンス設計です。現時点で SLA 付きの GA 基盤が必要な場合は [第 6 章](docs/06-optional-hardening-and-cleanup.md) の GKE Standard `microVM` 構成を選択できます。
 
-| 観点 | 一般的なデモ実装の課題 | 本ハンズオンの設計パターン（GA 後の本番適用を想定） |
+| 観点 | 一般的なデモ実装の課題 | 本ハンズオンの設計パターン |
 |---|---|---|
-| **検知と常時監視コスト** | 毎分 LLM に生ログを送って高コスト化するか、ERROR ログ頼みで症状悪化を見逃す | **ERROR ログシンクと SLO Fast Burn-Rate アラート**の両方を Pub/Sub へ集約。15 分クールダウンと **Firestore 分散排他リース**により、冗長 2 台構成でも重複呼び出しと二重復旧を遮断 |
-| **一過性エラーと誘導耐性** | 通信瞬断でも毎回再起動して悪化させる一方、ログ内の偽装命令で静観へ誘導されうる | 隔離サンドボックスで減衰傾きを算出し一過性瞬断は**「静観（OBSERVE）」**を選択。一方、実測エラー率が継続中の場合は LLM の静観判定を決定論的に棄却してアラート握りつぶしを防止 |
-| **変更操作の安全性** | LLM に自由な `kubectl` 文字列を生成させ、不良版への誤ロールバックも起こりうる | 読取は公式リモート MCP、変更は**許可 Namespace・Runbook 推奨区分一致・直近 30 分デプロイ相関・1 時間 1 回上限・健全 ReplicaSet 選定・事後回復検証**付きの型付き関数に限定 |
-| **承認連携・死活監視** | 公開 URL が必要で再起動時に承認状態が消え、監視エージェント自身の停止にも気づけない | **Slack Socket Mode** 外向き接続と **Firestore** 永続化で再起動後も再開可能［代替ルートはメール通知＋承認コマンド］。エージェント自身の 60 秒周期 Heartbeat 途絶時は人間へ直接通知 |
-| **ナレッジ蓄積と鮮度管理** | 初期データ検索止まり、または古い手順が無検証で自動実行され続ける | 承認解決済みの初見障害を **`AI.EMBED` 自動埋め込み列**へ登録して次回自動復旧へ昇格。**90 日未検証の手順は人間再承認へ自動降格**し、却下・未回復手順は即凍結 |
-| **導入効果の定量評価** | 「便利になった」という定性評価止まりで信頼性への貢献が測れない | **Cloud Monitoring Service Monitoring SLO**（日次 99.0%・月次 99.9%）を構築し、実測消費と手動対応基準［既定 30 分仮定］に対する**推定 Error Budget 温存分数**を算出・監査記録 |
+| **検知と監視コスト** | 全ログを LLM に送って高コスト化するか、ERROR ログ頼みで症状悪化を見逃す | ERROR ログと SLO 急燃焼アラートを Pub/Sub へ集約し、Firestore の 15 分排他リースで重複呼び出しを遮断 |
+| **一過性障害と誘導耐性** | 通信瞬断でも再起動して悪化させ、逆にログ内の偽装命令で静観へ誘導されうる | 隔離計算で自然減衰を確認した瞬断のみ静観し、エラー継続中の静観判定はルールで強制棄却 |
+| **変更操作の安全性** | 自由な `kubectl` 生成により、権限逸脱や不良版への誤ロールバックが起こりうる | 読取専用 MCP と型付き API を分離し、許可 NS・デプロイ相関・1 時間 1 回上限・健全版選定・事後検証を強制 |
+| **承認連携と死活監視** | 公開 URL が必要で再起動時に状態が消え、エージェント自身の停止にも気づけない | 外向き接続（Slack またはメール＋CLI）と Firestore 永続化で再開でき、60 秒 Heartbeat 途絶時は人間へ直接通知 |
+| **知識蓄積と鮮度管理** | 初期データの検索止まり、または古い手順が無検証で自動実行され続ける | 承認・回復実証済みの手順を `AI.EMBED` 列へ自動登録し、90 日超過時は再承認へ降格・失敗時は即凍結 |
+| **導入効果の定量評価** | 「便利になった」という定性評価止まりで信頼性への貢献が測れない | Service Monitoring SLO（日次 99.0%・月次 99.9%）と連動し、実測消費と推定温存分数を自動記録 |
 
 ---
 
@@ -117,7 +123,9 @@ flowchart TB
 
 ## 3. ローカル環境でのクイックテスト（クラウド課金 \$0）
 
-Google Cloud へデプロイする前に、手元の Python 3.11+ 仮想環境で重複排除・冗長 2 台排他リース・サンドボックス並列制御・100 件検索・ADK 2.x 3 分岐・プロンプトインジェクション耐性・健全リビジョン選定・Slack 再開・鮮度管理・Error Budget 温存計算・メール通知と承認コマンド・クイックスタート整合性の全 99 テストを実行できます（GitHub Actions CI でも自動実行されます）。
+Google Cloud へデプロイする前に、手元の Python 3.11+ 仮想環境で全 **111 件**の単体・整合性テストを実行できます（GitHub Actions CI でも自動実行されます）。
+
+* 検証範囲: 重複排除・Firestore 排他リース・サンドボックス隔離・知識ベース照合（100 件／汎用 240 件）・ADK 2.x 3 分岐・誘導耐性・健全版ロールバック・承認再開・Error Budget 計算・クイックスタート整合性
 
 ```bash
 python3 -m venv .venv
@@ -140,9 +148,9 @@ pytest -v
 | **② クイックスタート** | 約 90 分で実施し、終了後に `quickstart/cleanup.sh` を実行 | **約 \$0.37〜\$0.47** | GKE クラスタ管理手数料 1.5 時間（\$0.15）＋ GKE Pod 群 1.5 時間（\$0.05）＋ Cloud NAT 1.5 時間（\$0.01）＋ Cloud Run instance 1 時間（\$0.02）＋ Cloud Build・100 件自動ベクトル化・障害訓練の Gemini 推論（\$0.14〜\$0.24） |
 | **③ 1 ヶ月放置（未削除）** | 削除せず 730 時間稼働させたまま放置 | **約 \$115 / 月** | GKE クラスタ管理手数料（\$73.00）＋ GKE Autopilot Pod 群（\$25.60）＋ 常駐 Cloud Run instance 1 台（\$11.56）＋ Cloud NAT 待機（約 \$4.00）＋ Artifact Registry・Secret Manager・ログメトリクス（約 \$0.40）。平時の Pub/Sub・Gemini 推論は \$0.00 |
 
-* **無料枠に関する補足**: 上記はすべて無料枠控除前のオンデマンド定価です。請求先アカウントで 1 台目の GKE Autopilot クラスタ管理手数料の無料枠や Cloud Logging 月 50 GiB 無料枠が残っている環境では自動割引され、①通常実施時は **約 \$0.32〜\$0.42**、②クイックスタートは **約 \$0.22〜\$0.32**、③1 ヶ月放置時は **約 \$38 / 月** となります。
-* **代替ルートのメール通知に関する補足**: 通知メールは Application Integration の連携の実行として課金され、定価は実行 1,000 回あたり \$0.50 です。フル版の訓練 1 周で送る 9 通［クイックスタートはテストメール込み合計 8 通］は \$0.01 未満のため、上表の概算には含めていません。無料枠は月 400 回までです。
-* **環境を残して待機課金だけ抑える方法**: 数日後に再デモする場合は `gcloud beta run instances stop` と `kubectl scale deployment order-service order-traffic-generator -n sre-demo-app --replicas=0` でコンテナ稼働課金を停止できます。GKE クラスタ管理手数料（\$0.10/時間）まで止める場合はクラスタを削除してください。
+* **無料枠適用時の目安**: 請求先アカウントに GKE Autopilot 1 台目や Cloud Logging（月 50 GiB）の無料枠が残っている場合、①通常実施は **約 \$0.32〜\$0.42**、②クイックスタートは **約 \$0.22〜\$0.32**、③1 ヶ月放置は **約 \$38 / 月** に下がります。
+* **メール通知（代替ルート）の料金**: Application Integration の定価は 1,000 回あたり \$0.50（月 400 回まで無料枠あり）です。訓練 1 周の送信数（フル版 9 通／クイックスタートはテスト込み 8 通）は \$0.01 未満です。
+* **一時停止で待機課金を抑える方法**: 数日後に再実施する場合は `gcloud beta run instances stop` と `kubectl scale deployment order-service order-traffic-generator -n sre-demo-app --replicas=0` で稼働課金を止められます。GKE 管理手数料（\$0.10/時間）も止める場合はクラスタを削除してください。
 
 ### B. 本番システムへ導入・常時運用した際の月額増分コスト目安（規模別 3 パターン）
 
@@ -161,7 +169,10 @@ pytest -v
 
 ## 5. 自社環境への段階導入ロードマップ（コード変更ゼロ・環境変数のみで切替）
 
-本リポジトリのエージェントは、コードを書き換えずに環境変数と RBAC だけで「観測のみ → 承認実行＋知識蓄積 → 限定自動復旧」の 3 段階ロールアウトをそのまま実践できます。自社環境の初期知識ベースには、固有サービス名を含まず変更系をすべて `REQUIRE_APPROVAL` に固定した汎用 240 件カタログ（`bigquery/seed_runbooks_production_starter.jsonl`）と既存手順書インポート CLI（`bigquery/import_markdown_runbooks.py`）を利用できます。詳細は [02-bigquery-vector-kb.md](docs/02-bigquery-vector-kb.md) 第 4 節および [06-optional-hardening-and-cleanup.md](docs/06-optional-hardening-and-cleanup.md) 第 4 節を参照してください。
+コードを書き換えずに環境変数と RBAC だけで、次の 3 段階で本番へ導入できます。
+
+* **初期データ資産**: 固有サービス名を含まず変更系をすべて人間承認待ち（`REQUIRE_APPROVAL`）に固定した**汎用 240 件カタログ**（`bigquery/seed_runbooks_production_starter.jsonl`）と、既存手順書の変換 CLI（`bigquery/import_markdown_runbooks.py`）を同梱しています。
+* **詳細手順**: カタログ投入手順は [02-bigquery-vector-kb.md](docs/02-bigquery-vector-kb.md) 第 4 節、環境変数一覧は [06-optional-hardening-and-cleanup.md](docs/06-optional-hardening-and-cleanup.md) 第 4 節を参照してください。
 
 1. **STEP 1（観測・通知のみ）**: `ALLOWED_K8S_NAMESPACES=""`（GKE `RoleBinding` 未付与）で起動し、変更操作ゼロで診断精度を評価
 2. **STEP 2（人間承認＋自律学習）**: `ALLOWED_K8S_NAMESPACES="対象NS"` かつ `MAX_AUTO_ACTIONS_PER_HOUR="0"` とし、承認された復旧だけを実測検証して `AI.EMBED` 知識ベースへ自動蓄積

@@ -57,8 +57,8 @@ flowchart LR
 
 ### なぜ「高速検知ストリーム」と「SLO モニタリング」の 2 経路に分けるのか？
 
-1. **ミリ秒〜数秒の即時起動＆平時 LLM 課金ゼロ（Log Sink → Pub/Sub）**: Cloud Monitoring のメトリクス集計窓（1 分単位）を待たず、GKE から `severity >= ERROR` の構造化ログが出た瞬間に Pub/Sub へ転送して自律調査を開始します。平常時の `INFO` ログはログルーターで除外されるため、平時の LLM トークン課金はゼロです。
-2. **信頼性の定量評価（単一カウンタメトリクス → Service Monitoring SLO）**: 全注文ログ（正常 `201` と異常 `5xx`）を Cloud Logging の単一カウンタメトリクス `order_requests_count` で集計し、第 2〜4 章の作業中から健全なベースラインを蓄積します。これにより第 5 章の障害訓練で「自動復旧によってどれだけ Error Budget 消費を抑えられたか」を実測できます。
+1. **数秒以内の即時起動＆平時課金ゼロ（Log Sink → Pub/Sub）**: 1 分単位のメトリクス集計を待たず、`severity >= ERROR` ログが出た瞬間に Pub/Sub へ転送します。平常時の `INFO` ログはログルーターで除外するため、平時の LLM 課金はゼロです。
+2. **信頼性の定量評価（Service Monitoring SLO）**: 全注文ログ（正常 `201` と異常 `5xx`）を単一メトリクス `order_requests_count` で集計し、第 5 章の訓練で「自動復旧でどれだけ Error Budget 消費を抑えたか」を実測します。
 
 ![平常時ログ除外と異常発生時のみの Pub/Sub イベント発火シーケンス図](images/01-02-log-routing-sequence.png)
 
@@ -158,10 +158,13 @@ gcloud container clusters get-credentials "${GKE_CLUSTER_NAME}" \
 
 ## 3. 最小権限 RBAC・監視対象アプリ・定常トラフィック Pod のデプロイ
 
-プロジェクト全体の `roles/container.developer` や Kubernetes `ClusterRole` は使わず、[target-app/k8s/namespace.yaml](../target-app/k8s/namespace.yaml) で **`sre-demo-app` Namespace 内の `deployments` と `replicasets` のみを更新できる `Role` / `RoleBinding`** を定義します。あわせて、SLO の連続時系列グラフを作るため 5 秒に 1 回（毎分 12 件）注文 API を呼び出す軽量 Pod（`order-traffic-generator`）を配置します。
+エージェントにプロジェクト全体の変更権限を与えないよう、[target-app/k8s/namespace.yaml](../target-app/k8s/namespace.yaml) で以下を構成します。
+
+* **Namespace 限定 RBAC**: `sre-demo-app` 内の `deployments` と `replicasets` の参照・更新のみを許可する `Role` / `RoleBinding` を作成します。
+* **定常トラフィック生成 Pod**: SLO の時系列ベースラインを作るため、5 秒に 1 回（毎分 12 件）`POST /orders` を送る `order-traffic-generator` を配置します。
 
 > [!TIP]
-> Cloud Run のメタデータサーバーが払い出すトークンで GKE API を呼ぶ際、GKE 側は SA メールアドレスではなく 21 桁の数値 `uniqueId` を主体として照合する場合があります。`RoleBinding` に両方を登録することで、ローカル実行時と Cloud Run 常駐稼働時の双方で確実に認可されます。
+> Cloud Run のメタデータトークンで GKE API を呼ぶ際、GKE 側は SA メールアドレスではなく 21 桁の数値 `uniqueId` で主体を照合する場合があります。`RoleBinding` に両方を登録してどちらの経路でも認可されるようにします。
 
 ```bash
 export SRE_BUILD_SA_EMAIL="sre-cloudbuild-sa@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com"
@@ -238,14 +241,14 @@ gcloud pubsub topics add-iam-policy-binding "${ALERT_TOPIC}" \
 
 [target-app/scripts/setup_slo_monitoring.py](../target-app/scripts/setup_slo_monitoring.py) を実行し、アプリケーション無改修で公式の **Service Monitoring SLO** と **症状ベース検知・死活監視アラート** を一括登録します。
 
-### 単一カウンタメトリクス・2 本の可用性 SLO・症状ベース検知と死活監視の仕組み
+### このスクリプトが登録する 4 つの監視設定
 
-* **非同期集計ずれを防ぐ単一メトリクス設計**: 総件数と正常件数を別々のログメトリクスに分けると、1 分境界での非同期フラッシュ差により正常時でも見かけ上の比率割れが起きることがあります。そこで `POST /orders` の構造化ログを単一のカウンタメトリクス **`order_requests_count`**（ラベル `outcome = EXTRACT(severity)`）でアトミックに集計し、1 分間の `outcome="INFO"` 比率が 95% 以上の分を「正常分」と判定する **Windows-based SLI** を構成します。
-* **用途に応じた 2 本の可用性 SLO**: 評価期間 $T_{\text{period}}$ に対する許容エラーバジェットは $T_{\text{period}} \times (1 - \text{Goal})$ で定まります。
-  1. **訓練観測用・日次 99.0% SLO（`order-availability-daily-99` / カレンダー日次）**: 許容枠 **$14.4\text{ 分/日}$**。約 1〜2 分の障害訓練で残量ゲージが約 7〜14% 動くため、訓練前後の変化をコンソール上で鮮明に確認できます。
-  2. **本番換算用・月次 99.9% SLO（`order-availability-monthly-999` / カレンダー月次）**: 30 日換算の許容枠 **$43.2\text{ 分/月}$**。人間手動対応［既定 30 分仮定］だと 1 回の障害で月間バジェットの約 70% を失うのに対し、自動復旧［約 1.3 分］なら約 3% の消費で済む推定温存効果を定量比較できます。
-* **ERROR ログ頼みを補う SLO Fast Burn-Rate アラート合流**: Log Sink だけでは ERROR ログを出さない症状悪化を見逃します。本スクリプトは日次 SLO の 10 分間燃焼率（`select_slo_burn_rate` > 10 倍）を監視するアラートポリシーを作成し、既存の `sre-alert-stream` Pub/Sub トピックへ合流させます。復旧完了時の自動クローズ通知（`state="closed"`）はエージェント側で自動的にスキップします。なお、Pod 全滅等でリクエスト自体が完全にゼロになった場合は比率メトリクスの分母が 0 になるため、本番環境では GKE 外形監視（Uptime Check）や Pod 稼働数アラートも併用してください。
-* **監視エージェント自身の死活監視（Heartbeat & MetricAbsence）**: エージェント自身が停止した際に同じ Pub/Sub へ通知しても誰も受信できません。そこでエージェントが 60 秒周期で出力する `event="agent_heartbeat"` ログを `sre_agent_heartbeat_count` として集計し、**5 分間途絶した際は人間向けメール通知チャネル（`NOTIFY_EMAIL_TO` 設定時）へ直接発報**する不在検知アラートを登録します。
+1. **単一カウンタメトリクス（`order_requests_count`）**: 総件数と正常件数を別メトリクスにすると 1 分境界の集計ずれが起きるため、`outcome = EXTRACT(severity)` ラベル付きの 1 つのメトリクスで集計します。1 分間の `INFO` 比率 95% 以上を正常分とする **Windows-based SLI** を定義します。
+2. **2 本の可用性 SLO**: 評価期間 `T_period` に対する許容停止枠（Error Budget）は `T_period × (1 - Goal)` で計算されます。
+   * **日次 99.0% SLO（`order-availability-daily-99`）**: 許容枠は **14.4 分/日**。1〜2 分の障害訓練で残量が約 7〜14% 動くため、画面上で変化をすぐ確認できます。
+   * **月次 99.9% SLO（`order-availability-monthly-999`）**: 30 日換算の許容枠は **43.2 分/月**。手動対応（30 分仮定で枠の約 70% 消費）と自動復旧（約 1.3 分で約 3% 消費）の差を定量比較します。
+3. **SLO 急燃焼アラート（`select_slo_burn_rate` > 10 倍）**: ERROR ログを出さない症状悪化も検知できるよう、日次 SLO の 10 分間燃焼率アラートを `sre-alert-stream` トピックへ合流させます（復旧通知 `state="closed"` は自動スキップ）。なお、トラフィック自体が 0 件になった場合は比率が算出されないため、本番では外形監視（Uptime Check）も併用します。
+4. **エージェント自身の死活監視（Heartbeat 不在検知）**: エージェントが 60 秒ごとに出す `sre_agent_heartbeat_count` が **5 分間途絶した場合**、Pub/Sub ではなく人間向けメール通知チャネル（`NOTIFY_EMAIL_TO` 設定時）へ直接発報します。
 
 ```bash
 python3 -m venv .venv
