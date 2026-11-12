@@ -45,6 +45,7 @@ flowchart LR
 </details>
 
 * **なぜ Cloud Run Services ではなく Cloud Run instances なのか**: リクエスト駆動でスケールトゥゼロする Cloud Run Services と異なり、Cloud Run instances は単一コンテナを常時稼働させて Pub/Sub StreamingPull と Slack Socket Mode WebSocket を維持でき、さらに `--sandbox-launcher` で隔離サンドボックスを即起動できます。
+* **共有 CPU 特性とサンドボックス並列制御**: Cloud Run instances は共有 CPU モデル（1 vCPU あたり定常 6.25%・最大 500 CPU 秒バースト）であり、隔離サンドボックスも同じ CPU・メモリ枠を共有します。本エージェントの処理時間の 98% 以上はネットワーク待機で CPU 消費は 1 件あたり約 1 秒未満ですが、複数アラート同時着信時の瞬間負荷を抑えるため `MAX_CONCURRENT_SANDBOXES=2` のセマフォでサンドボックスの同時起動数を制限しています。重い統計解析を常時回す場合は第 6 章の GKE Standard `microVM` 構成を選択してください。
 * **代替ルートも外向き通信だけで成立**: 通知メールの送信は Application Integration の API 呼び出し、承認コマンドからの承認は承認専用サブスクリプションの StreamingPull で受け取るため、着信 URL は不要です。
 * **閉域 GKE コントロールプレーンへの接続補足**: 本手順の GKE はプライベートノード構成（コントロールプレーン外部到達有効）のためそのまま到達できます。コントロールプレーンの外部エンドポイントも閉じた GKE に接続する場合は、Cloud Run instance に Direct VPC Egress（`--network` / `--subnet`）を付与するか GKE の DNS ベースエンドポイントを使用します。
 

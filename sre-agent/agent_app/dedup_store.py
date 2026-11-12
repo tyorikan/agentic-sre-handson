@@ -10,12 +10,30 @@ import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Protocol
+from typing import Any, Protocol
 
 from google.cloud import bigquery
 
 from .config import AgentSettings
 from .models import AlertEvent, DecisionType, RemediationType
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+def _parse_iso_utc(raw: Any) -> datetime | None:
+    if isinstance(raw, datetime):
+        return _ensure_utc(raw)
+    if isinstance(raw, str) and raw.strip():
+        text = raw.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            return _ensure_utc(datetime.fromisoformat(text))
+        except ValueError:
+            return None
+    return None
 
 
 @dataclass(frozen=True)
@@ -209,40 +227,412 @@ class BigQueryEventStoreBackend:
             raise RuntimeError(f"BigQuery 監査イベントの書き込みに失敗しました: {errors}")
 
 
+class GuardrailCoordinator(Protocol):
+    """単一または複数インスタンス間で処理中リースと自動復旧レート上限を原子的に共有する境界。"""
+
+    def check_lease(self, fingerprint: str, now: datetime) -> str | None: ...
+
+    def try_acquire_lease(
+        self,
+        fingerprint: str,
+        incident_id: str,
+        now: datetime,
+        *,
+        in_flight_ttl_seconds: int = 300,
+    ) -> tuple[bool, str]: ...
+
+    def complete_lease(
+        self,
+        fingerprint: str,
+        incident_id: str,
+        decision: str,
+        completed_at: datetime,
+        *,
+        cooldown_minutes: int,
+    ) -> None: ...
+
+    def release_lease(self, fingerprint: str, incident_id: str) -> None: ...
+
+    def try_reserve_auto_action(
+        self,
+        namespace: str,
+        service_name: str,
+        now: datetime,
+        *,
+        max_per_hour: int,
+        existing_bq_count: int = 0,
+    ) -> tuple[bool, int]: ...
+
+    def reset_all(self, now: datetime) -> None: ...
+
+
+class InMemoryGuardrailCoordinator:
+    """ローカル開発・単体テスト用のスレッドセーフなインメモリ排他コーディネーター。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # fingerprint -> (updated_at, expires_at, incident_id, status, desc)
+        self._leases: dict[str, tuple[datetime, datetime, str, str, str]] = {}
+        self._rate_slots: dict[str, list[datetime]] = {}
+        self._reset_at: datetime | None = None
+
+    def _is_active(self, updated_at: datetime, expires_at: datetime, now: datetime) -> bool:
+        if self._reset_at is not None and updated_at <= self._reset_at:
+            return False
+        return updated_at <= now < expires_at
+
+    def check_lease(self, fingerprint: str, now: datetime) -> str | None:
+        current = _ensure_utc(now)
+        with self._lock:
+            entry = self._leases.get(fingerprint)
+            if entry is not None and self._is_active(entry[0], entry[1], current):
+                return entry[4]
+        return None
+
+    def try_acquire_lease(
+        self,
+        fingerprint: str,
+        incident_id: str,
+        now: datetime,
+        *,
+        in_flight_ttl_seconds: int = 300,
+    ) -> tuple[bool, str]:
+        current = _ensure_utc(now)
+        with self._lock:
+            entry = self._leases.get(fingerprint)
+            if entry is not None and self._is_active(entry[0], entry[1], current):
+                return False, entry[4]
+            desc = f"in_flight incident_id={incident_id}"
+            self._leases[fingerprint] = (
+                current,
+                current + timedelta(seconds=in_flight_ttl_seconds),
+                incident_id,
+                "IN_FLIGHT",
+                desc,
+            )
+            return True, ""
+
+    def complete_lease(
+        self,
+        fingerprint: str,
+        incident_id: str,
+        decision: str,
+        completed_at: datetime,
+        *,
+        cooldown_minutes: int,
+    ) -> None:
+        ts = _ensure_utc(completed_at)
+        desc = f"前回 incident_id={incident_id}, decision={decision}"
+        with self._lock:
+            self._leases[fingerprint] = (
+                ts,
+                ts + timedelta(minutes=cooldown_minutes),
+                incident_id,
+                "COOLDOWN",
+                desc,
+            )
+
+    def release_lease(self, fingerprint: str, incident_id: str) -> None:
+        with self._lock:
+            entry = self._leases.get(fingerprint)
+            if entry is not None and entry[3] == "IN_FLIGHT" and entry[2] == incident_id:
+                self._leases.pop(fingerprint, None)
+
+    def try_reserve_auto_action(
+        self,
+        namespace: str,
+        service_name: str,
+        now: datetime,
+        *,
+        max_per_hour: int,
+        existing_bq_count: int = 0,
+    ) -> tuple[bool, int]:
+        current = _ensure_utc(now)
+        one_hour_ago = current - timedelta(hours=1)
+        key = f"{namespace}__{service_name}"
+        with self._lock:
+            slots = [
+                ts
+                for ts in self._rate_slots.get(key, [])
+                if ts >= one_hour_ago and (self._reset_at is None or ts > self._reset_at)
+            ]
+            effective = max(len(slots), existing_bq_count)
+            if effective >= max_per_hour:
+                self._rate_slots[key] = slots
+                return False, effective
+            slots.append(current)
+            self._rate_slots[key] = slots
+            return True, effective
+
+    def reset_all(self, now: datetime) -> None:
+        with self._lock:
+            self._reset_at = _ensure_utc(now)
+            self._leases.clear()
+            self._rate_slots.clear()
+
+
+class FirestoreGuardrailCoordinator:
+    """Cloud Firestore トランザクションで冗長複数インスタンス間の重複排除と1時間上限を排他制御する。"""
+
+    # 注意: Firestore では前後が "__" で囲まれたドキュメント ID は予約語エラーになるため通常名を使う
+    _ADMIN_DOC_ID = "admin_cooldown_reset"
+
+    def __init__(self, settings: AgentSettings, *, client: Any | None = None) -> None:
+        if client is None:
+            from google.cloud import firestore
+
+            client = firestore.Client(
+                project=settings.project_id,
+                database=settings.firestore_database,
+            )
+        self._client = client
+        self._collection_name = settings.firestore_guardrail_collection
+
+    @staticmethod
+    def _safe_id(raw: str) -> str:
+        return "".join(ch if ch.isalnum() or ch in "_.-" else "_" for ch in raw)[:200]
+
+    def _col(self) -> Any:
+        return self._client.collection(self._collection_name)
+
+    @staticmethod
+    def _read_reset_at(admin_snap: Any) -> datetime | None:
+        if not admin_snap.exists:
+            return None
+        return _parse_iso_utc((admin_snap.to_dict() or {}).get("reset_at"))
+
+    @staticmethod
+    def _active_desc(data: dict[str, Any], reset_at: datetime | None, current: datetime) -> str | None:
+        updated_at = _parse_iso_utc(data.get("updated_at"))
+        expires_at = _parse_iso_utc(data.get("expires_at"))
+        if updated_at is None or expires_at is None:
+            return None
+        if reset_at is not None and updated_at <= reset_at:
+            return None
+        if updated_at <= current < expires_at:
+            return str(data.get("desc", "active lease"))
+        return None
+
+    def check_lease(self, fingerprint: str, now: datetime) -> str | None:
+        current = _ensure_utc(now)
+        col = self._col()
+        snap = col.document(f"lease_{fingerprint}").get()
+        if not snap.exists:
+            return None
+        reset_at = self._read_reset_at(col.document(self._ADMIN_DOC_ID).get())
+        return self._active_desc(snap.to_dict() or {}, reset_at, current)
+
+    def try_acquire_lease(
+        self,
+        fingerprint: str,
+        incident_id: str,
+        now: datetime,
+        *,
+        in_flight_ttl_seconds: int = 300,
+    ) -> tuple[bool, str]:
+        current = _ensure_utc(now)
+        col = self._col()
+        doc_ref = col.document(f"lease_{fingerprint}")
+        admin_ref = col.document(self._ADMIN_DOC_ID)
+        payload = {
+            "status": "IN_FLIGHT",
+            "incident_id": incident_id,
+            "updated_at": current.isoformat(),
+            "expires_at": (current + timedelta(seconds=in_flight_ttl_seconds)).isoformat(),
+            "desc": f"in_flight incident_id={incident_id}",
+        }
+
+        try:
+            from google.cloud import firestore
+        except ImportError:
+            firestore = None  # type: ignore[assignment]
+
+        if firestore is not None and isinstance(self._client, firestore.Client):
+            tx = self._client.transaction()
+
+            @firestore.transactional
+            def _acquire_in_tx(transaction: Any) -> tuple[bool, str]:
+                snap = doc_ref.get(transaction=transaction)
+                admin_snap = admin_ref.get(transaction=transaction)
+                reset_at = self._read_reset_at(admin_snap)
+                if snap.exists:
+                    active = self._active_desc(snap.to_dict() or {}, reset_at, current)
+                    if active is not None:
+                        return False, active
+                transaction.set(doc_ref, payload)
+                return True, ""
+
+            return _acquire_in_tx(tx)
+
+        snap = doc_ref.get()
+        reset_at = self._read_reset_at(admin_ref.get())
+        if snap.exists:
+            active = self._active_desc(snap.to_dict() or {}, reset_at, current)
+            if active is not None:
+                return False, active
+        doc_ref.set(payload)
+        return True, ""
+
+    def complete_lease(
+        self,
+        fingerprint: str,
+        incident_id: str,
+        decision: str,
+        completed_at: datetime,
+        *,
+        cooldown_minutes: int,
+    ) -> None:
+        ts = _ensure_utc(completed_at)
+        self._col().document(f"lease_{fingerprint}").set(
+            {
+                "status": "COOLDOWN",
+                "incident_id": incident_id,
+                "updated_at": ts.isoformat(),
+                "expires_at": (ts + timedelta(minutes=cooldown_minutes)).isoformat(),
+                "desc": f"前回 incident_id={incident_id}, decision={decision}",
+            }
+        )
+
+    def release_lease(self, fingerprint: str, incident_id: str) -> None:
+        doc_ref = self._col().document(f"lease_{fingerprint}")
+        try:
+            from google.cloud import firestore
+        except ImportError:
+            firestore = None  # type: ignore[assignment]
+
+        if firestore is not None and isinstance(self._client, firestore.Client):
+            tx = self._client.transaction()
+
+            @firestore.transactional
+            def _release_in_tx(transaction: Any) -> None:
+                snap = doc_ref.get(transaction=transaction)
+                if not snap.exists:
+                    return
+                raw = snap.to_dict() or {}
+                if raw.get("status") == "IN_FLIGHT" and raw.get("incident_id") == incident_id:
+                    transaction.delete(doc_ref)
+
+            _release_in_tx(tx)
+            return
+
+        snap = doc_ref.get()
+        if snap.exists:
+            raw = snap.to_dict() or {}
+            if raw.get("status") == "IN_FLIGHT" and raw.get("incident_id") == incident_id:
+                doc_ref.delete()
+
+    def try_reserve_auto_action(
+        self,
+        namespace: str,
+        service_name: str,
+        now: datetime,
+        *,
+        max_per_hour: int,
+        existing_bq_count: int = 0,
+    ) -> tuple[bool, int]:
+        current = _ensure_utc(now)
+        one_hour_ago = current - timedelta(hours=1)
+        col = self._col()
+        doc_ref = col.document(self._safe_id(f"rate_{namespace}__{service_name}"))
+        admin_ref = col.document(self._ADMIN_DOC_ID)
+
+        def _filter_slots(raw_list: list[Any], reset_at: datetime | None) -> list[datetime]:
+            valid: list[datetime] = []
+            for item in raw_list:
+                dt = _parse_iso_utc(item)
+                if dt is not None and dt >= one_hour_ago and (reset_at is None or dt > reset_at):
+                    valid.append(dt)
+            return valid
+
+        try:
+            from google.cloud import firestore
+        except ImportError:
+            firestore = None  # type: ignore[assignment]
+
+        if firestore is not None and isinstance(self._client, firestore.Client):
+            tx = self._client.transaction()
+
+            @firestore.transactional
+            def _reserve_in_tx(transaction: Any) -> tuple[bool, int]:
+                snap = doc_ref.get(transaction=transaction)
+                admin_snap = admin_ref.get(transaction=transaction)
+                reset_at = self._read_reset_at(admin_snap)
+                raw_slots = (snap.to_dict() or {}).get("action_timestamps", []) if snap.exists else []
+                slots = _filter_slots(raw_slots, reset_at)
+                effective = max(len(slots), existing_bq_count)
+                if effective >= max_per_hour:
+                    return False, effective
+                slots.append(current)
+                transaction.set(
+                    doc_ref,
+                    {
+                        "action_timestamps": [s.isoformat() for s in slots],
+                        "updated_at": current.isoformat(),
+                    },
+                )
+                return True, effective
+
+            return _reserve_in_tx(tx)
+
+        snap = doc_ref.get()
+        reset_at = self._read_reset_at(admin_ref.get())
+        raw_slots = (snap.to_dict() or {}).get("action_timestamps", []) if snap.exists else []
+        slots = _filter_slots(raw_slots, reset_at)
+        effective = max(len(slots), existing_bq_count)
+        if effective >= max_per_hour:
+            return False, effective
+        slots.append(current)
+        doc_ref.set(
+            {
+                "action_timestamps": [s.isoformat() for s in slots],
+                "updated_at": current.isoformat(),
+            }
+        )
+        return True, effective
+
+    def reset_all(self, now: datetime) -> None:
+        ts = _ensure_utc(now)
+        self._col().document(self._ADMIN_DOC_ID).set({"reset_at": ts.isoformat()})
+
+
 class IncidentGuardrailManager:
     """重複排除・クールダウン・自動実行回数上限（サーキットブレーカー）を一元管理する。"""
 
-    def __init__(self, settings: AgentSettings, backend: EventStoreBackend) -> None:
+    def __init__(
+        self,
+        settings: AgentSettings,
+        backend: EventStoreBackend,
+        *,
+        coordinator: GuardrailCoordinator | None = None,
+    ) -> None:
         self._settings = settings
         self._backend = backend
-        self._lock = threading.Lock()
-        self._recent_fingerprints: dict[str, tuple[datetime, str]] = {}
+        self._coordinator: GuardrailCoordinator = coordinator or InMemoryGuardrailCoordinator()
 
     def is_in_cooldown(self, alert: AlertEvent, now: datetime | None = None) -> tuple[bool, str]:
         """直近のクールダウン期間内に同一障害が処理済み（または処理中）であれば True と理由を返す。"""
-        current = now or datetime.now(timezone.utc)
+        current = _ensure_utc(now or datetime.now(timezone.utc))
         window = timedelta(minutes=self._settings.cooldown_minutes)
         fp = alert.compute_fingerprint()
 
-        with self._lock:
-            cached = self._recent_fingerprints.get(fp)
-            if cached is not None:
-                cached_at, cached_desc = cached
-                if current >= cached_at and (current - cached_at) < window:
-                    return (
-                        True,
-                        f"クールダウン期間内 ({self._settings.cooldown_minutes}分) に同一 fingerprint={fp} が処理中または処理済みです ({cached_desc})",
-                    )
+        active_desc = self._coordinator.check_lease(fp, current)
+        if active_desc is not None:
+            return (
+                True,
+                f"クールダウン期間内 ({self._settings.cooldown_minutes}分) に同一 fingerprint={fp} が処理中または処理済みです ({active_desc})",
+            )
 
         since = current - window
         recent = self._backend.find_recent_by_fingerprint(fp, since=since)
         if recent:
             latest = recent[0]
-            with self._lock:
-                self._recent_fingerprints[fp] = (
-                    latest.created_at,
-                    f"前回 incident_id={latest.incident_id}, decision={latest.decision}",
-                )
+            self._coordinator.complete_lease(
+                fp,
+                latest.incident_id,
+                latest.decision,
+                latest.created_at,
+                cooldown_minutes=self._settings.cooldown_minutes,
+            )
             return (
                 True,
                 f"クールダウン期間内 ({self._settings.cooldown_minutes}分) に同一 fingerprint={fp} が処理済みです "
@@ -251,38 +641,38 @@ class IncidentGuardrailManager:
         return False, ""
 
     def claim_for_processing(self, alert: AlertEvent, now: datetime | None = None) -> tuple[bool, str]:
-        """StreamingPull 並行受信時の重複起動を防ぐため、クールダウン確認と処理権取得を原子的に行う。"""
-        current = now or datetime.now(timezone.utc)
+        """複数インスタンス・並行受信時の重複起動を防ぐため、クールダウン確認と処理権取得を原子的に行う。"""
+        current = _ensure_utc(now or datetime.now(timezone.utc))
         window = timedelta(minutes=self._settings.cooldown_minutes)
         fp = alert.compute_fingerprint()
 
-        with self._lock:
-            cached = self._recent_fingerprints.get(fp)
-            if cached is not None:
-                cached_at, cached_desc = cached
-                if current >= cached_at and (current - cached_at) < window:
-                    return (
-                        False,
-                        f"クールダウン期間内 ({self._settings.cooldown_minutes}分) に同一 fingerprint={fp} を重複排除しました ({cached_desc})",
-                    )
-            since = current - window
-            recent = self._backend.find_recent_by_fingerprint(fp, since=since)
-            if recent:
-                latest = recent[0]
-                desc = f"前回 incident_id={latest.incident_id}, decision={latest.decision}"
-                self._recent_fingerprints[fp] = (latest.created_at, desc)
-                return False, f"クールダウン期間内に同一 fingerprint={fp} が処理済みです ({desc})"
+        acquired, active_desc = self._coordinator.try_acquire_lease(fp, alert.incident_id, current)
+        if not acquired:
+            return (
+                False,
+                f"クールダウン期間内 ({self._settings.cooldown_minutes}分) に同一 fingerprint={fp} を重複排除しました ({active_desc})",
+            )
 
-            self._recent_fingerprints[fp] = (current, f"in_flight incident_id={alert.incident_id}")
-            return True, ""
+        since = current - window
+        recent = self._backend.find_recent_by_fingerprint(fp, since=since)
+        if recent:
+            latest = recent[0]
+            self._coordinator.complete_lease(
+                fp,
+                latest.incident_id,
+                latest.decision,
+                latest.created_at,
+                cooldown_minutes=self._settings.cooldown_minutes,
+            )
+            desc = f"前回 incident_id={latest.incident_id}, decision={latest.decision}"
+            return False, f"クールダウン期間内に同一 fingerprint={fp} が処理済みです ({desc})"
+
+        return True, ""
 
     def release_claim(self, alert: AlertEvent) -> None:
         """例外発生により処理未完了となった場合に処理中ロックを解放する。"""
         fp = alert.compute_fingerprint()
-        with self._lock:
-            cached = self._recent_fingerprints.get(fp)
-            if cached is not None and cached[1].startswith(f"in_flight incident_id={alert.incident_id}"):
-                self._recent_fingerprints.pop(fp, None)
+        self._coordinator.release_lease(fp, alert.incident_id)
 
     def enforce_safety_guardrails(
         self,
@@ -293,10 +683,28 @@ class IncidentGuardrailManager:
         proposed_remediation: RemediationType,
         similarity_score: float,
         matched_runbook_age_days: float | None = None,
+        matched_runbook_action: DecisionType | None = None,
+        matched_runbook_remediation: RemediationType | None = None,
+        recent_deployment_within_30m: bool | None = None,
+        is_naturally_decaying: bool | None = None,
+        latest_error_rate: float | None = None,
         now: datetime | None = None,
     ) -> tuple[DecisionType, RemediationType, str]:
-        """LLM が提案した判断に対し、決定論的ルールで安全側への降格（ダウングレード）を強制する。"""
+        """LLM が提案した判断に対し、決定論的ルールで安全側への降格・昇格を強制する。"""
         if proposed_decision == "OBSERVE":
+            # ログ経由のプロンプトインジェクション等による「持続障害の静観（握りつぶし）誘導」を遮断
+            if is_naturally_decaying is False and (latest_error_rate or 0.0) >= 0.05:
+                fallback_remediation: RemediationType = (
+                    matched_runbook_remediation
+                    if matched_runbook_remediation in ("ROLLBACK_DEPLOYMENT", "RESTART_DEPLOYMENT", "MANUAL_INTERVENTION")
+                    else "MANUAL_INTERVENTION"
+                )
+                return (
+                    "REQUIRE_APPROVAL",
+                    fallback_remediation,
+                    f"隔離サンドボックスの実測エラー率が継続中 ({latest_error_rate:.1%}, 自然減衰なし) のため、"
+                    "静観 (OBSERVE) 判定を棄却し人間確認へ昇格しました。",
+                )
             return "OBSERVE", "NONE", ""
 
         # 1. 許可されていない Namespace は自動変更を絶対禁止
@@ -325,7 +733,28 @@ class IncidentGuardrailManager:
                     f"復旧種別 '{proposed_remediation}' は自動実行対象外のため人間承認へ降格しました。",
                 )
 
-            # 4. Runbook 鮮度有効期限チェック: 最終検証日から RUNBOOK_FRESHNESS_TTL_DAYS を超過した手順は人間再評価へ降格
+            # 4. 構造化一致条件: 一致 Runbook の推奨区分・操作種別および直近デプロイ変更の有無を検証
+            if matched_runbook_action is not None and matched_runbook_action != "AUTO_REMEDIATE":
+                return (
+                    "REQUIRE_APPROVAL",
+                    proposed_remediation,
+                    f"一致した過去 Runbook の推奨区分が '{matched_runbook_action}' のため自動実行を禁止し人間承認へ降格しました。",
+                )
+            if matched_runbook_remediation is not None and matched_runbook_remediation != proposed_remediation:
+                return (
+                    "REQUIRE_APPROVAL",
+                    proposed_remediation,
+                    f"提案された操作 '{proposed_remediation}' が一致 Runbook の実証手順 '{matched_runbook_remediation}' "
+                    "と一致しないため人間承認へ降格しました。",
+                )
+            if proposed_remediation == "ROLLBACK_DEPLOYMENT" and recent_deployment_within_30m is False:
+                return (
+                    "REQUIRE_APPROVAL",
+                    proposed_remediation,
+                    "直近 30 分以内の新規デプロイ変更が確認されないため、無関係なロールバックを防止し人間承認へ降格しました。",
+                )
+
+            # 5. Runbook 鮮度有効期限チェック: 最終検証日から RUNBOOK_FRESHNESS_TTL_DAYS を超過した手順は人間再評価へ降格
             if (
                 matched_runbook_age_days is not None
                 and matched_runbook_age_days > float(self._settings.runbook_freshness_ttl_days)
@@ -337,15 +766,22 @@ class IncidentGuardrailManager:
                     f"鮮度有効期限 ({self._settings.runbook_freshness_ttl_days} 日) を超過しているため人間による再評価・承認へ降格しました。",
                 )
 
-            # 5. サーキットブレーカー: 同一サービスへの自動復旧が直近 1 時間に上限回数に達していたら停止
-            current = now or datetime.now(timezone.utc)
+            # 6. サーキットブレーカー: 同一サービスへの自動復旧が直近 1 時間に上限回数に達していたら停止（複数台間で原子的予約）
+            current = _ensure_utc(now or datetime.now(timezone.utc))
             one_hour_ago = current - timedelta(hours=1)
-            auto_count = self._backend.count_auto_actions_for_service(namespace, service_name, since=one_hour_ago)
-            if auto_count >= self._settings.max_auto_actions_per_hour:
+            bq_count = self._backend.count_auto_actions_for_service(namespace, service_name, since=one_hour_ago)
+            reserved, effective_count = self._coordinator.try_reserve_auto_action(
+                namespace,
+                service_name,
+                current,
+                max_per_hour=self._settings.max_auto_actions_per_hour,
+                existing_bq_count=bq_count,
+            )
+            if not reserved:
                 return (
                     "REQUIRE_APPROVAL",
                     proposed_remediation,
-                    f"直近 1 時間の自動復旧回数が上限 ({auto_count}/{self._settings.max_auto_actions_per_hour} 回) "
+                    f"直近 1 時間の自動復旧回数が上限 ({effective_count}/{self._settings.max_auto_actions_per_hour} 回) "
                     "に到達したため、再起動ループ防止のため人間承認へ降格しました。",
                 )
 
@@ -367,7 +803,8 @@ class IncidentGuardrailManager:
         slo_budget_remaining_pct: float | None = None,
         now: datetime | None = None,
     ) -> IncidentEventRecord:
-        """最終判断と処置結果を追記テーブルへ記録する。"""
+        """最終判断と処置結果を追記テーブルへ記録し、クールダウンリースを確定させる。"""
+        completed_at = _ensure_utc(now or datetime.now(timezone.utc))
         record = IncidentEventRecord(
             event_id=uuid.uuid4().hex,
             incident_id=alert.incident_id,
@@ -381,23 +818,25 @@ class IncidentGuardrailManager:
             similarity_score=similarity_score,
             verification_passed=verification_passed,
             summary=summary,
-            created_at=now or datetime.now(timezone.utc),
+            created_at=completed_at,
             mttr_seconds=mttr_seconds,
             estimated_manual_mttr_minutes=estimated_manual_mttr_minutes,
             saved_error_budget_minutes=saved_error_budget_minutes,
             slo_budget_remaining_pct=slo_budget_remaining_pct,
         )
         self._backend.append_event(record)
-        with self._lock:
-            self._recent_fingerprints[record.fingerprint] = (
-                record.created_at,
-                f"前回 incident_id={record.incident_id}, decision={record.decision}",
-            )
+        self._coordinator.complete_lease(
+            record.fingerprint,
+            record.incident_id,
+            record.decision,
+            record.created_at,
+            cooldown_minutes=self._settings.cooldown_minutes,
+        )
         return record
 
     def reset_all_cooldowns(self, summary: str = "Hands-on drill cooldown reset", now: datetime | None = None) -> None:
         """監査履歴を削除せずに ADMIN_RESET 境界レコードを追記し、クールダウンと1時間上限を即時解除する。"""
-        ts = now or datetime.now(timezone.utc)
+        ts = _ensure_utc(now or datetime.now(timezone.utc))
         reset_record = IncidentEventRecord(
             event_id=uuid.uuid4().hex,
             incident_id=f"RESET-{uuid.uuid4().hex[:8]}",
@@ -414,5 +853,4 @@ class IncidentGuardrailManager:
             created_at=ts,
         )
         self._backend.append_event(reset_record)
-        with self._lock:
-            self._recent_fingerprints.clear()
+        self._coordinator.reset_all(ts)

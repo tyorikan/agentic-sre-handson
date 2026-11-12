@@ -125,8 +125,8 @@ def format_comparison_report(
                 f"* {label}:\n"
                 f"  - 訓練前残量: {before_pct:.2f}%  ->  訓練後残量: {after_pct:.2f}% "
                 f"(実測消費: -{consumed_pct:.2f}% / 約 {consumed_min:.2f} 分)\n"
-                f"  - 仮に手動対応 {manual_mttr_minutes:.0f} 分かかった場合: -{manual_pct:.1f}% 消費 "
-                f"-> 自動化により約 {saved_min:.2f} 分のバジェットを温存"
+                f"  - 仮に手動対応 {manual_mttr_minutes:.0f} 分かかった場合（仮定ベースライン）: -{manual_pct:.1f}% 消費 "
+                f"-> 自動化により約 {saved_min:.2f} 分のバジェットを温存 [推定値]"
             )
         else:
             lines.append(f"* {label}: Cloud Monitoring 時系列アライメント反映待ち（約 60〜90 秒後に再実行すると実測差分が表示されます）")

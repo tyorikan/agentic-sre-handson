@@ -428,7 +428,7 @@ bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGIO
 | `decision` | 記録の種類。`OBSERVE` は静観、`AUTO_REMEDIATE` は自動復旧、`REQUIRE_APPROVAL` は承認待ち、`APPROVED_EXECUTED` は承認を受けて対応した記録 |
 | `matched_runbook_id` | 判断の根拠にした過去事例の ID |
 | `mttr_sec` | 検知から復旧を確かめるまでの秒数 |
-| `saved_budget_min` | 人が 30 分かけて対応した場合と比べて、減らせた Error Budget の消費。単位は分 |
+| `saved_budget_min` | 手動対応に 30 分かかると仮定した場合と比べて、減らせた Error Budget 消費の推定値。単位は分 |
 
 記録は 7 行になります。承認が必要だった訓練 3 と訓練 4-A は、承認待ちと承認後の 2 行ずつです。
 

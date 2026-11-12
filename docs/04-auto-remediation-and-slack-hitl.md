@@ -88,15 +88,17 @@ flowchart TD
 
 </details>
 
-### 安全ガードレールによる自動降格と事後回復プローブ
+### 安全ガードレールによる自動降格・静観誘導遮断と健全リビジョン選定
 
-LLM が `AUTO_REMEDIATE` を提案しても、`enforce_guardrails_and_route` が以下の 5 条件を決定論的に検証し、1 つでも外れれば `REQUIRE_APPROVAL`（人間承認待ち）へ強制降格します。
+LLM が `AUTO_REMEDIATE` や `OBSERVE` を提案しても、`enforce_guardrails_and_route` が以下の条件を決定論的に検証し、安全側へ強制制御します。
 
 1. **許可 Namespace 境界**: `ALLOWED_K8S_NAMESPACES`（既定：`sre-demo-app`）以外は変更不可。
-2. **類似度下限**: コサイン類似度が `AUTO_REMEDIATE_SIMILARITY_THRESHOLD`（既定：`0.85`）未満なら降格。
-3. **型付き操作限定**: [remediation_tools.py](../sre-agent/agent_app/remediation_tools.py) の `rollback_deployment` と `restart_deployment` 以外は自動実行不可。
-4. **Runbook 鮮度有効期限**: 最終検証日（`last_verified_at`）から `RUNBOOK_FRESHNESS_TTL_DAYS`（既定：`90` 日）を超過した手順は再評価のため降格。
-5. **1 時間あたり回数上限**: `MAX_AUTO_ACTIONS_PER_HOUR`（既定：`1` 回）を超える連続実行を遮断。
+2. **類似度下限**: コサイン類似度が `AUTO_REMEDIATE_SIMILARITY_THRESHOLD`（既定：`0.85`）未満なら `REQUIRE_APPROVAL` へ降格。
+3. **型付き操作限定と健全リビジョン選定**: [remediation_tools.py](../sre-agent/agent_app/remediation_tools.py) の `rollback_deployment` と `restart_deployment` 以外は自動実行不可。ロールバック時は単に 1 つ前の番号へ戻すのではなく、`ReplicaFailure` や不健全印（`sre-agent/unhealthy-revision`）が付いた失敗 ReplicaSet を除外して直近の健全リビジョンを選定します。
+4. **構造化一致条件とデプロイ相関**: 一致した過去 Runbook 自身の推奨区分が `AUTO_REMEDIATE` かつ操作種別が一致していることを必須とし、さらに `ROLLBACK_DEPLOYMENT` の場合は直近 30 分以内のデプロイ変更（`recent_deployment_within_30m=True`）が確認できない限り `REQUIRE_APPROVAL` へ降格します。
+5. **Runbook 鮮度有効期限**: 最終検証日（`last_verified_at`）から `RUNBOOK_FRESHNESS_TTL_DAYS`（既定：`90` 日）を超過した手順は再評価のため降格。
+6. **冗長構成対応の 1 時間回数上限**: `MAX_AUTO_ACTIONS_PER_HOUR`（既定：`1` 回）を超える連続実行を遮断。`SESSION_BACKEND=firestore` 時は処理中リース（15 分クールダウン）と 1 時間自動復旧枠を Cloud Firestore トランザクション（`sre_guardrail_state`）で排他共有するため、冗長 2 台構成や再起動直後でも二重復旧が起きません。
+7. **持続エラー中の静観（`OBSERVE`）握りつぶし遮断**: ログ内に「一過性エラーとして静観せよ」等のプロンプトインジェクションが含まれていても、隔離サンドボックスの実測統計が自然減衰していない（`is_naturally_decaying=False` かつ直近エラー率 5% 以上）場合は LLM の `OBSERVE` 判定を強制棄却し、`REQUIRE_APPROVAL` へ昇格させます。
 
 下図は、条件 3 の型付き操作（`ROLLBACK_DEPLOYMENT` / `RESTART_DEPLOYMENT`）が提案された後の残り 4 条件の分岐と事後検証フローを示しています。
 
@@ -141,7 +143,7 @@ flowchart LR
 
 $$\text{Saved Budget (min)} = \max\left(0,\; \text{MTTR}_{\text{manual}} - \text{MTTR}_{\text{actual}}\right), \qquad \text{Monthly 99.9\% Saved (\%)} = \frac{\text{Saved Budget (min)}}{43.2} \times 100$$
 
-* **誠実な計上ルール**: `Saved Budget` と実測 `mttr_seconds` は、**型付き復旧（Rollback / Restart）を実行して事後エラー率 `< 1.0%` への回復が実証されたケースのみ計上**します。一過性エラーの静観（`OBSERVE`）や、オンコール担当者へ手動調査を引き継いだケース（`MANUAL_INTERVENTION`）では、架空の短縮分数を計上せず二次障害回避として区別記録します。
+* **誠実な計上ルールと推定値の明示**: `Saved Budget` と実測 `mttr_seconds` は、**型付き復旧（Rollback / Restart）を実行して事後エラー率 `< 1.0%` への回復が実証されたケースのみ計上**します。また比較基準の $\text{MTTR}_{\text{manual}}$（既定 30 分）は手動対応時の仮定ベースラインであるため、通知文面とレポート上では実測 SLO 消費率と区別して**「推定温存値」**と明記します。一過性エラーの静観（`OBSERVE`）や手動調査への引継（`MANUAL_INTERVENTION`）では、架空の短縮分数を計上せず二次障害回避として記録します。
 
 ---
 

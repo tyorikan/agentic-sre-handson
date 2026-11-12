@@ -32,6 +32,10 @@ class AlertEvent(BaseModel):
         default=False,
         description="直近 30 分以内に Deployment のロールアウト変更があったか",
     )
+    is_resolved_notification: bool = Field(
+        default=False,
+        description="Cloud Monitoring の復旧完了通知 (state=closed) であるか",
+    )
     observed_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def compute_fingerprint(self) -> str:

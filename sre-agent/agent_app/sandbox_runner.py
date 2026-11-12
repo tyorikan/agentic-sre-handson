@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 import uuid
 from pathlib import Path
 
@@ -74,6 +75,7 @@ class SandboxRunner:
 
     def __init__(self, settings: AgentSettings) -> None:
         self._settings = settings
+        self._semaphore = threading.BoundedSemaphore(max(1, settings.max_concurrent_sandboxes))
 
     def build_command(self, python_code: str, arg_json: str, sandbox_id: str) -> list[str]:
         """実行モードに応じたコマンド配列を構築する（テストで直接検証可能）。"""
@@ -105,15 +107,16 @@ class SandboxRunner:
         cmd = self.build_command(_SERIES_ANALYSIS_SCRIPT, payload, sandbox_id)
 
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                check=False,
-                # ローカルフォールバック時も親プロセスの秘密情報（トークン等）を一切渡さない
-                env={"PATH": "/usr/local/bin:/usr/bin:/bin"} if cmd[0] == sys.executable else None,
-            )
+            with self._semaphore:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                    check=False,
+                    # ローカルフォールバック時も親プロセスの秘密情報（トークン等）を一切渡さない
+                    env={"PATH": "/usr/local/bin:/usr/bin:/bin"} if cmd[0] == sys.executable else None,
+                )
         except subprocess.TimeoutExpired as exc:
             self._force_cleanup_sandbox(sandbox_id)
             raise RuntimeError(f"隔離サンドボックスの実行がタイムアウトしました ({timeout_seconds}s)") from exc

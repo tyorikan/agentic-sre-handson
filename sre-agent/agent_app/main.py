@@ -25,7 +25,12 @@ from google.cloud import pubsub_v1
 
 from .approval_decisions import handle_approval_decision_message
 from .config import AgentSettings, load_settings
-from .dedup_store import BigQueryEventStoreBackend, IncidentGuardrailManager
+from .dedup_store import (
+    BigQueryEventStoreBackend,
+    FirestoreGuardrailCoordinator,
+    IncidentGuardrailManager,
+    InMemoryGuardrailCoordinator,
+)
 from .models import AlertEvent
 from .remediation_tools import (
     GkeAppsV1RemediationExecutor,
@@ -55,13 +60,22 @@ def parse_pubsub_payload(raw_bytes: bytes) -> AlertEvent:
         inc = data["incident"]
         labels = inc.get("resource", {}).get("labels", {})
         metric_labels = inc.get("metric", {}).get("labels", {})
+        user_labels = inc.get("policy_user_labels") or {}
+        state = str(inc.get("state", "open")).strip().lower()
+        raw_user_error_code = str(user_labels.get("error_code", "")).strip()
         return AlertEvent(
             incident_id=str(inc.get("incident_id", f"mon-{uuid.uuid4().hex[:8]}")),
-            namespace=labels.get("namespace_name", "sre-demo-app"),
-            service_name=labels.get("container_name") or metric_labels.get("service", "order-service"),
-            error_code=inc.get("policy_name", "MONITORING_ALERT"),
+            namespace=labels.get("namespace_name") or user_labels.get("namespace") or "sre-demo-app",
+            service_name=(
+                labels.get("container_name")
+                or metric_labels.get("service")
+                or user_labels.get("service_name")
+                or "order-service"
+            ),
+            error_code=raw_user_error_code.upper() if raw_user_error_code else inc.get("policy_name", "MONITORING_ALERT"),
             severity=str(inc.get("severity", "ERROR")).upper(),
             summary=inc.get("summary", "Cloud Monitoring alert triggered"),
+            is_resolved_notification=(state == "closed"),
         )
 
     # 2. Cloud Logging LogEntry Sink 形式 (jsonPayload を含む場合)
@@ -111,6 +125,14 @@ async def process_incoming_alert(
     allow_drill_reset: bool = False,
 ) -> bool:
     """単一アラートを重複排除・処理権取得の上で実行する（スキップ時は False、実行時は True）。"""
+    if alert.is_resolved_notification:
+        _log_json(
+            "INFO",
+            "Cloud Monitoring の復旧通知 (state=closed) のため処理をスキップしました。",
+            incident_id=alert.incident_id,
+        )
+        return False
+
     if alert.error_code == "ADMIN_COOLDOWN_RESET":
         if allow_drill_reset:
             await asyncio.to_thread(guardrails.reset_all_cooldowns, alert.summary)
@@ -157,6 +179,32 @@ async def _start_health_server(port: int) -> web.AppRunner:
     return runner
 
 
+async def _run_heartbeat_loop(
+    stop_event: asyncio.Event,
+    interval_seconds: int,
+    streaming_pull_future: Any,
+) -> None:
+    """Pub/Sub 購読スレッドの生存を確認しながら定期 Heartbeat ログを出力する。"""
+    if interval_seconds <= 0:
+        return
+    # 起動直後に初回 Heartbeat を出力し、以降は指定間隔ごとに出力する
+    while not stop_event.is_set():
+        pull_alive = bool(getattr(streaming_pull_future, "running", lambda: True)())
+        if pull_alive:
+            _log_json("INFO", "SRE agent heartbeat", event="agent_heartbeat", status="healthy")
+        else:
+            _log_json(
+                "ERROR",
+                "Pub/Sub StreamingPull が停止しているため Heartbeat 出力を停止します。",
+                event="agent_heartbeat_stopped",
+            )
+            return
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=float(interval_seconds))
+        except asyncio.TimeoutError:
+            continue
+
+
 async def run_daemon(settings: AgentSettings) -> None:
     """Pub/Sub StreamingPull・Slack Socket Mode・承認コマンドの待ち受け・最小 /healthz 応答を並行稼働させる常駐メインループ。"""
     health_port = int(os.getenv("PORT", "8080"))
@@ -164,7 +212,12 @@ async def run_daemon(settings: AgentSettings) -> None:
     _log_json("INFO", "ヘルスチェック用内部ポートを起動しました。", port=health_port)
 
     event_store = BigQueryEventStoreBackend(settings)
-    guardrails = IncidentGuardrailManager(settings, event_store)
+    guardrail_coordinator = (
+        FirestoreGuardrailCoordinator(settings)
+        if settings.session_backend == "firestore"
+        else InMemoryGuardrailCoordinator()
+    )
+    guardrails = IncidentGuardrailManager(settings, event_store, coordinator=guardrail_coordinator)
     sandbox_runner = SandboxRunner(settings)
     kb = BigQueryVectorKnowledgeBase(settings)
     gke_executor = GkeAppsV1RemediationExecutor(settings)
@@ -272,9 +325,14 @@ async def run_daemon(settings: AgentSettings) -> None:
         session_backend=settings.session_backend,
     )
 
+    heartbeat_task = asyncio.create_task(
+        _run_heartbeat_loop(stop_event, settings.heartbeat_interval_seconds, streaming_pull_future)
+    )
     try:
         await stop_event.wait()
     finally:
+        stop_event.set()
+        heartbeat_task.cancel()
         _log_json("INFO", "シャットダウンシグナルを受信しました。接続を安全に終了します...")
         streaming_pull_future.cancel()
         if approval_pull_future is not None:

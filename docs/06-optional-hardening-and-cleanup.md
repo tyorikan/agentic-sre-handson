@@ -7,7 +7,7 @@
 
 ## 1. オプション A：常駐エージェントを GKE Sandbox（`microVM`）で稼働させる構成
 
-「Preview 機能を使わずすべて GA 基盤で統一したい」「フル Linux カーネル互換の診断バイナリを動かしたい」場合は、[appendix/gke-microvm/](../appendix/gke-microvm) のマニフェスト一式で管理用 GKE Standard クラスタ上にデプロイできます。
+「Preview 機能を使わずすべて SLA 付き GA 基盤で統一したい」「共有 CPU ではなく専用 vCPU で重い統計解析を回したい」「フル Linux カーネル互換の診断バイナリを動かしたい」場合は、[appendix/gke-microvm/](../appendix/gke-microvm) のマニフェスト一式で管理用 GKE Standard クラスタ上にデプロイできます。
 
 ![管理用 GKE Standard クラスタにおける GKE Sandbox microVM 分離構成図](images/06-01-gke-sandbox-microvm.png)
 
@@ -67,9 +67,9 @@ kubectl apply -f ./appendix/gke-microvm/network-policy-metadata-deny.yaml
 
 ---
 
-## 2. オプション B：Model Armor による間接プロンプトインジェクション防御
+## 2. オプション B：Model Armor による間接プロンプトインジェクション防御（本番運用では必須推奨）
 
-外部攻撃者が HTTP ヘッダ等に仕込んだ悪意ある命令文字列がエラーログ経由で LLM に入るのを防ぐため、[appendix/production-hardening/model_armor_guard.py](../appendix/production-hardening/model_armor_guard.py) で ADK の `ModelArmorPlugin` を組み込めます。
+外部攻撃者が HTTP ヘッダ等に仕込んだ悪意ある命令文字列がエラーログ経由で LLM に入るのを防ぐため、エージェント本体では `<untrusted_log_summary>` タグ境界化と「エラー継続中の `OBSERVE` 判定強制棄却」を標準実装しています。さらに本番環境で外部ユーザー入力を含みうるログを扱う場合は、環境変数 `MODEL_ARMOR_TEMPLATE_ID` を設定して LLM 投入前の Model Armor 検査を有効化するか、[appendix/production-hardening/model_armor_guard.py](../appendix/production-hardening/model_armor_guard.py) で ADK の `ModelArmorPlugin` を組み込むことを強く推奨します。
 
 ![Model Armor による悪意あるログ出力の間接プロンプトインジェクション遮断フロー図](images/06-02-model-armor-guard.png)
 
@@ -151,7 +151,7 @@ gcloud beta run instances delete sre-autonomous-agent \
   --project="${GOOGLE_CLOUD_PROJECT}" \
   --quiet
 
-# 2. SLO モニタリング・Service・ログベースメトリクスの削除
+# 2. SLO モニタリング・Burn-Rate アラート・エージェント死活監視・ログベースメトリクスの削除
 python3 ./target-app/scripts/setup_slo_monitoring.py --delete
 
 # 3. 監視対象 GKE クラスタと専用 VPC・Cloud NAT の削除

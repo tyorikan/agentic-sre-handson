@@ -63,13 +63,19 @@ class AgentSettings:
         default_factory=lambda: _parse_bool(os.getenv("ALLOW_DRILL_COOLDOWN_RESET", "false"))
     )
 
-    # サンドボックス・観測ウィンドウ設定 ("cloud_run" または "local_subprocess")
+    # サンドボックス・観測ウィンドウ・死活監視設定 ("cloud_run" または "local_subprocess")
     sandbox_mode: str = field(default_factory=lambda: os.getenv("SANDBOX_MODE", "cloud_run"))
     sandbox_binary_path: str = field(
         default_factory=lambda: os.getenv("SANDBOX_BINARY_PATH", "/usr/local/gcp/bin/sandbox")
     )
+    max_concurrent_sandboxes: int = field(
+        default_factory=lambda: int(os.getenv("MAX_CONCURRENT_SANDBOXES", "2"))
+    )
     stabilization_wait_seconds: int = field(
         default_factory=lambda: int(os.getenv("INITIAL_STABILIZATION_SECONDS", "0"))
+    )
+    heartbeat_interval_seconds: int = field(
+        default_factory=lambda: int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "60"))
     )
 
     # Cloud Monitoring SLO モニタリング & Error Budget 温存効果算出設定
@@ -108,9 +114,16 @@ class AgentSettings:
     firestore_tickets_collection: str = field(
         default_factory=lambda: os.getenv("FIRESTORE_TICKETS_COLLECTION", "sre_pending_approval_tickets")
     )
+    firestore_guardrail_collection: str = field(
+        default_factory=lambda: os.getenv("FIRESTORE_GUARDRAIL_COLLECTION", "sre_guardrail_state")
+    )
     session_db_url: str = field(
         default_factory=lambda: os.getenv("SESSION_DB_URL", "sqlite+aiosqlite:////tmp/sre_agent_sessions.db")
     )
+
+    # Model Armor ログ事前検査（任意・設定時のみ有効）
+    model_armor_template_id: str = field(default_factory=lambda: os.getenv("MODEL_ARMOR_TEMPLATE_ID", ""))
+    model_armor_location: str = field(default_factory=lambda: os.getenv("MODEL_ARMOR_LOCATION", "us-central1"))
 
 
 def load_settings() -> AgentSettings:

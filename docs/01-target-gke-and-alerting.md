@@ -232,23 +232,25 @@ gcloud pubsub topics add-iam-policy-binding "${ALERT_TOPIC}" \
 
 ---
 
-## 5. Cloud Monitoring 可用性 SLO と Error Budget モニタリングの構築
+## 5. Cloud Monitoring 可用性 SLO・Burn-Rate アラート・エージェント死活監視の構築
 
-[target-app/scripts/setup_slo_monitoring.py](../target-app/scripts/setup_slo_monitoring.py) を実行し、アプリケーション無改修で公式の **Service Monitoring SLO** を登録します。
+[target-app/scripts/setup_slo_monitoring.py](../target-app/scripts/setup_slo_monitoring.py) を実行し、アプリケーション無改修で公式の **Service Monitoring SLO** と **症状ベース検知・死活監視アラート** を一括登録します。
 
-### 単一カウンタメトリクスと 2 本の 1 分窓可用性 SLO の仕組み
+### 単一カウンタメトリクス・2 本の可用性 SLO・症状ベース検知と死活監視の仕組み
 
-* **非同期集計ずれを防ぐ単一メトリクス設計**: 総件数と正常件数を別々のログメトリクスに分けると、1 分境界での非同期フラッシュ差により正常時でも見かけ上の比率割れが起きることがあります。そこで `POST /orders` の構造化ログを単一のカウンタメトリクス **`order_requests_count`**（ラベル `outcome = EXTRACT(severity)`）でアトミックに集計し、1 分間の `outcome="INFO"` 比率が 95% 以上の分を「正常分（Good Minute）」と判定する **Windows-based SLI** を構成します。
+* **非同期集計ずれを防ぐ単一メトリクス設計**: 総件数と正常件数を別々のログメトリクスに分けると、1 分境界での非同期フラッシュ差により正常時でも見かけ上の比率割れが起きることがあります。そこで `POST /orders` の構造化ログを単一のカウンタメトリクス **`order_requests_count`**（ラベル `outcome = EXTRACT(severity)`）でアトミックに集計し、1 分間の `outcome="INFO"` 比率が 95% 以上の分を「正常分」と判定する **Windows-based SLI** を構成します。
 * **用途に応じた 2 本の可用性 SLO**: 評価期間 $T_{\text{period}}$ に対する許容エラーバジェットは $T_{\text{period}} \times (1 - \text{Goal})$ で定まります。
   1. **訓練観測用・日次 99.0% SLO（`order-availability-daily-99` / カレンダー日次）**: 許容枠 **$14.4\text{ 分/日}$**。約 1〜2 分の障害訓練で残量ゲージが約 7〜14% 動くため、訓練前後の変化をコンソール上で鮮明に確認できます。
-  2. **本番換算用・月次 99.9% SLO（`order-availability-monthly-999` / カレンダー月次）**: 30 日換算の許容枠 **$43.2\text{ 分/月}$**。人間手動対応（例: 30 分）だと 1 回の障害で月間バジェットの約 70% を失うのに対し、自動復旧（約 1.3 分）なら約 3% の消費で済む効果を定量比較できます。
+  2. **本番換算用・月次 99.9% SLO（`order-availability-monthly-999` / カレンダー月次）**: 30 日換算の許容枠 **$43.2\text{ 分/月}$**。人間手動対応［既定 30 分仮定］だと 1 回の障害で月間バジェットの約 70% を失うのに対し、自動復旧［約 1.3 分］なら約 3% の消費で済む推定温存効果を定量比較できます。
+* **ERROR ログ頼みを補う SLO Fast Burn-Rate アラート合流**: Log Sink だけでは ERROR ログを出さない症状悪化を見逃します。本スクリプトは日次 SLO の 10 分間燃焼率（`select_slo_burn_rate` > 10 倍）を監視するアラートポリシーを作成し、既存の `sre-alert-stream` Pub/Sub トピックへ合流させます。復旧完了時の自動クローズ通知（`state="closed"`）はエージェント側で自動的にスキップします。なお、Pod 全滅等でリクエスト自体が完全にゼロになった場合は比率メトリクスの分母が 0 になるため、本番環境では GKE 外形監視（Uptime Check）や Pod 稼働数アラートも併用してください。
+* **監視エージェント自身の死活監視（Heartbeat & MetricAbsence）**: エージェント自身が停止した際に同じ Pub/Sub へ通知しても誰も受信できません。そこでエージェントが 60 秒周期で出力する `event="agent_heartbeat"` ログを `sre_agent_heartbeat_count` として集計し、**5 分間途絶した際は人間向けメール通知チャネル（`NOTIFY_EMAIL_TO` 設定時）へ直接発報**する不在検知アラートを登録します。
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 
-# ログベース カウンタメトリクス・Service Monitoring サービス・2本の可用性 SLO を一括作成
+# ログメトリクス・Service Monitoring・可用性 SLO 2本・Burn-Rate アラート・死活監視アラートを一括作成
 python3 ./target-app/scripts/setup_slo_monitoring.py
 ```
 

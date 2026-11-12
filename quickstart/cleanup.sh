@@ -106,7 +106,7 @@ collect_targets() {
   if has_subnet; then FOUND+=("サブネット: ${SUBNET_NAME}"); fi
   if has_vpc; then FOUND+=("VPC: ${VPC_NAME}（残っているファイアウォール ルールを含む）"); fi
   # 次の 2 行は Python スクリプトで削除する。存在の確認もそのスクリプトが行う
-  FOUND+=("可用性 SLO 2 本と、そのためのログベースの指標（登録されていれば削除）")
+  FOUND+=("可用性 SLO 2 本・SLO Burn-Rate アラート・エージェント死活監視アラートと各ログベース指標（登録されていれば削除）")
   FOUND+=("通知メール用の連携: ${EMAIL_NOTIFY_INTEGRATION}（登録されていれば削除）")
   if has_sink; then FOUND+=("Log Sink: ${SINK_NAME}"); fi
   for name in "${ALERT_PUBSUB_SUBSCRIPTION}" "${APPROVAL_PUBSUB_SUBSCRIPTION}"; do

@@ -50,11 +50,11 @@ flowchart LR
   2. **着信公開 URL ゼロの双方向通信**: `--ingress internal` と `--no-default-url` で外部からの着信を完全遮断します。Pub/Sub StreamingPull と Slack Socket Mode はどちらもコンテナからの外向き TLS 通信であるため、公開 URL なしで監視と承認ボタン連携が成立します。Slack を使えない場合の代替ルートであるメール通知と承認コマンドも、外向き通信だけで動作します。
   3. **調査の柔軟性と変更の厳格性の分離**: 統計計算スクリプトは外向き通信・認証情報を遮断した **Cloud Run sandboxes（`sandbox do`）** 内で実行し、GKE の変更は Namespace 固定・回数上限付きの型付き関数のみに限定します。
   4. **鮮度管理付きの自律成長型知識ベース**: 初見障害は人間承認を経て**事後エラー率 1.0% 未満への回復が実証された場合のみ** BigQuery `incident_runbooks` へ自動登録し、`AI.EMBED` 生成列で自動ベクトル化します。一方、90 日以上未検証の手順は人間再承認へ自動降格し、却下・未回復手順は自動凍結します。
-  5. **Error Budget 温存効果の定量証明**: Cloud Monitoring の公式 SLO モニタリングと連動し、約 1〜2 分の自動復旧によって「従来の人間手動対応（例: 30 分）と比べてどれだけ Error Budget を守れたか」を数値で証明できます。
+  5. **Error Budget 温存効果の定量証明**: Cloud Monitoring の公式 SLO モニタリングと連動し、約 1〜2 分の自動復旧によって「従来の人間手動対応［既定 30 分仮定］と比べてどれだけ Error Budget を温存できたか」を推定値として算出し、実測 SLO 残量とともに証明できます。
 * **できないこと・不向きなこと（設計上の明確な境界線）**:
   1. **全量生ログの直接 LLM 監視には不向き**: 平常時の大量ログを LLM に直接読ませるとコストと遅延が破綻します。一次抽出は必ず Cloud Logging シンクやアラートで行います。
   2. **DB スキーマ破損やロック競合の無断自動修復は行わない**: ステートフルな DB 障害でアプリを無断再起動すると被害が拡大するため、自動的に `REQUIRE_APPROVAL` へ振り分けて人間へ判断を委ねます。
-  3. **リージョンと製品ステージの制約**: Cloud Run instances および sandboxes は Preview 機能であり、`us-central1`・`us-east1`・`europe-west1` では利用できません。本手順では対応リージョンである **`asia-northeast1`（東京）** を使用します。
+  3. **リージョンと製品ステージの制約**: Cloud Run instances および sandboxes は Preview（Pre-GA）機能であり、本構成は GA 後の本番適用を見据えた検証用リファレンス設計です。`us-central1`・`us-east1`・`europe-west1` は非対応のため、対応リージョンである **`asia-northeast1`（東京）** を使用します。現時点で SLA 付き GA 基盤が必要な場合は第 6 章の GKE Standard `microVM` 構成を選択してください。
 
 ---
 

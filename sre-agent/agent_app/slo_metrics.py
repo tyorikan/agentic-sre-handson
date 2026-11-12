@@ -150,8 +150,8 @@ def calculate_error_budget_impact(
         mode_label = "自動復旧" if decision == "AUTO_REMEDIATE" else "人の承認による復旧"
         summary = (
             f"実測 MTTR `{mttr_sec:.0f}秒` (`{actual_min:.2f}分`) — "
-            f"手動対応基準 `{manual_min:.0f}分` と比べ Error Budget 消費を **`{saved_min:.1f}分` 削減** "
-            f"[月次 99.9% 許容枠 43.2分のうち消費を `{consumed_pct:.1f}%` に抑え、`{saved_pct:.1f}%` 相当を{mode_label}で温存]"
+            f"手動対応基準 `{manual_min:.0f}分`（仮定）と比べ Error Budget 消費を **推定 `{saved_min:.1f}分` 削減** "
+            f"[月次 99.9% 許容枠 43.2分のうち実測消費 `{consumed_pct:.1f}%`、`{saved_pct:.1f}%` 相当を{mode_label}で温存（推定値）]"
         )
         return ErrorBudgetImpact(
             mttr_seconds=mttr_sec,

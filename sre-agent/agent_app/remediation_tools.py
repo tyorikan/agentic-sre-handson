@@ -157,8 +157,61 @@ class GkeAppsV1RemediationExecutor:
             time.sleep(3)
         return False, datetime.now(timezone.utc)
 
+    @staticmethod
+    def _normalized_pod_template(rs: k8s_client.V1ReplicaSet) -> dict[str, object]:
+        """比較・パッチ適用向けに pod-template-hash と再起動時刻アノテーションを除いたテンプレート辞書を返す。"""
+        template_dict = k8s_client.ApiClient().sanitize_for_serialization(rs.spec.template)
+        meta = template_dict.get("metadata") or {}
+        labels = meta.get("labels") or {}
+        labels.pop("pod-template-hash", None)
+        return template_dict
+
+    @classmethod
+    def _is_failed_replicaset(cls, rs: k8s_client.V1ReplicaSet) -> bool:
+        """過去ロールアウト失敗またはロールバック元として不健全と記録された ReplicaSet か判定する。"""
+        ann = (rs.metadata.annotations or {}) if rs.metadata else {}
+        if ann.get("sre-agent/unhealthy-revision") == "true":
+            return True
+        status = getattr(rs, "status", None)
+        conditions = getattr(status, "conditions", None) or []
+        if any(getattr(c, "type", "") == "ReplicaFailure" and getattr(c, "status", "") == "True" for c in conditions):
+            return True
+        spec_replicas = getattr(getattr(rs, "spec", None), "replicas", 0) or 0
+        ready_replicas = getattr(status, "ready_replicas", 0) or 0
+        # スケールダウン済みの過去正常 RS は spec.replicas==0 になるため除外せず、稼働要求中なのに Ready=0 の停滞 RS のみ除外
+        return spec_replicas > 0 and ready_replicas == 0
+
+    @classmethod
+    def _select_rollback_target_rs(
+        cls,
+        sorted_rs: list[k8s_client.V1ReplicaSet],
+    ) -> k8s_client.V1ReplicaSet | None:
+        """現行 RS と同一仕様または失敗済みの RS を除外し、直近の健全な ReplicaSet を選定する。"""
+        current_tpl = dict(cls._normalized_pod_template(sorted_rs[0]))
+        current_ann = dict((current_tpl.get("metadata") or {}).get("annotations") or {})
+        current_ann.pop("kubectl.kubernetes.io/restartedAt", None)
+
+        candidates: list[k8s_client.V1ReplicaSet] = []
+        for candidate in sorted_rs[1:]:
+            if cls._is_failed_replicaset(candidate):
+                continue
+            cand_tpl = dict(cls._normalized_pod_template(candidate))
+            cand_ann = dict((cand_tpl.get("metadata") or {}).get("annotations") or {})
+            cand_ann.pop("kubectl.kubernetes.io/restartedAt", None)
+            if cand_tpl.get("spec") == current_tpl.get("spec") and cand_ann == current_ann:
+                continue
+            candidates.append(candidate)
+
+        if not candidates:
+            return None
+        for candidate in candidates:
+            ann = (candidate.metadata.annotations or {}) if candidate.metadata else {}
+            if ann.get("sre-agent/last-known-good") == "true":
+                return candidate
+        return candidates[0]
+
     def rollback_deployment(self, namespace: str, deployment_name: str) -> str:
-        """ReplicaSet の revision 履歴から 1 つ前のリビジョンの PodTemplate を特定し JSON Patch replace で戻す。"""
+        """ReplicaSet 履歴から失敗版を除外して直近の健全な PodTemplate を特定し JSON Patch replace で戻す。"""
         apps_v1 = self._build_apps_v1_client()
         dep = apps_v1.read_namespaced_deployment(name=deployment_name, namespace=namespace)
         dep_uid = getattr(dep.metadata, "uid", None)
@@ -181,14 +234,28 @@ class GkeAppsV1RemediationExecutor:
         if len(sorted_rs) < 2:
             raise RuntimeError(f"Deployment {namespace}/{deployment_name} にロールバック可能な前リビジョンが存在しません。")
 
-        current_rev = _rev(sorted_rs[0])
-        previous_rs = sorted_rs[1]
+        current_rs = sorted_rs[0]
+        current_rev = _rev(current_rs)
+        previous_rs = self._select_rollback_target_rs(sorted_rs)
+        if previous_rs is None:
+            raise RuntimeError(
+                f"Deployment {namespace}/{deployment_name} にロールバック可能な健全な過去リビジョンが見つかりません。"
+            )
         previous_rev = _rev(previous_rs)
 
-        # pod-template-hash ラベルを除去した前リビジョンのテンプレートで /spec/template を完全置換
-        template_dict = k8s_client.ApiClient().sanitize_for_serialization(previous_rs.spec.template)
-        labels = template_dict.get("metadata", {}).get("labels", {})
-        labels.pop("pod-template-hash", None)
+        # 不良リビジョンが次回以降の連続ロールバック先として再び選ばれないよう印を残す（失敗してもロールバック本体は継続）
+        if current_rs.metadata and current_rs.metadata.name and hasattr(apps_v1, "patch_namespaced_replica_set"):
+            try:
+                apps_v1.patch_namespaced_replica_set(
+                    name=current_rs.metadata.name,
+                    namespace=namespace,
+                    body={"metadata": {"annotations": {"sre-agent/unhealthy-revision": "true"}}},
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        # pod-template-hash ラベルを除去した健全リビジョンのテンプレートで /spec/template を完全置換
+        template_dict = self._normalized_pod_template(previous_rs)
 
         patch_ops: list[dict[str, object]] = [
             {"op": "replace", "path": "/spec/template", "value": template_dict},
