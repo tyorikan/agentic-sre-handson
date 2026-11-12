@@ -150,6 +150,10 @@ cp .env.example .env
 source .env
 
 gcloud config set project "${GOOGLE_CLOUD_PROJECT}"
+
+# ローカル端末で実施する場合のみ：Python 管理スクリプト（SLO 登録・通知メール設定・承認コマンド）用の認証情報を設定します（Cloud Shell では不要）
+gcloud auth application-default login
+gcloud auth application-default set-quota-project "${GOOGLE_CLOUD_PROJECT}"
 ```
 
 ### Step 2.2 Google Cloud API の有効化と Firestore 作成
@@ -282,5 +286,6 @@ gcloud projects get-iam-policy "${GOOGLE_CLOUD_PROJECT}" \
 * [Create and manage Cloud Run instances](https://docs.cloud.google.com/run/docs/instances/create-and-manage-instances) — Cloud Run instances の概要と対応リージョン
 * [Google Cloud MCP servers overview](https://docs.cloud.google.com/mcp/overview) — `roles/mcp.toolUser` を用いた公式リモート MCP サーバーの利用方法
 * [IAM least privilege best practices](https://docs.cloud.google.com/iam/docs/using-iam-securely) — サービスアカウントの最小権限設計ガイド
+* [Set up Application Default Credentials for a local development environment](https://docs.cloud.google.com/docs/authentication/set-up-adc-local-dev-environment) — ローカル端末と Cloud Shell における ADC の設定方法
 
 次へ進む 👉 [第 1 章：監視対象 GKE・イベントストリーム・可用性 SLO の構築](01-target-gke-and-alerting.md)

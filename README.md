@@ -109,7 +109,7 @@ flowchart LR
 
 ## 3. ローカル環境でのクイックテスト（クラウド課金 \$0）
 
-Google Cloud へデプロイする前に、手元の Python 3.11+ 仮想環境で重複排除・サンドボックス隔離・100 件検索・ADK 2.x 3 分岐・Slack 再開・鮮度管理・Error Budget 温存計算・メール通知と承認コマンド・クイックスタートのスクリプトの全 88 テストを実行できます。
+Google Cloud へデプロイする前に、手元の Python 3.11+ 仮想環境で重複排除・サンドボックス隔離・100 件検索・ADK 2.x 3 分岐・Slack 再開・鮮度管理・Error Budget 温存計算・メール通知と承認コマンド・クイックスタートのスクリプトの全 89 テストを実行できます。
 
 ```bash
 python3 -m venv .venv
@@ -165,7 +165,7 @@ pytest -v
 ├── sre-agent/                       # Cloud Run instances 常駐エージェント本体 (ADK 2.x + SLO 効果計測)
 ├── quickstart/                      # クイックスタート用: 環境構築・エージェントのデプロイ・後片付けのスクリプト
 ├── appendix/                        # 付録: GKE Standard microVM / Model Armor / pass^3 評価スクリプト
-├── tests/                           # ローカル自動テストスイート (全 88 件)
+├── tests/                           # ローカル自動テストスイート (全 89 件)
 └── docs/                            # クイックスタート・全 7 章のステップバイステップ Codelab 教材 & 高精細構成図
 ```
 

@@ -330,3 +330,29 @@ def test_mail_count_in_setup_matches_the_documented_drills() -> None:
 
     assert f"合計 {count.group(1)} 通" in guide
     assert '--min-daily-limit "${QUICKSTART_EMAIL_COUNT}"' in _script("setup.sh")
+
+
+def test_full_course_cleanup_revokes_the_same_roles_before_deleting_service_accounts() -> None:
+    """フル版 第 6 章の削除手順も、サービスアカウントを削除する前に付与済みの全ロールを取り消すこと。"""
+    cleanup_doc = _doc_commands(DOC_CLEANUP)
+    revoked = {
+        sa_name: re.findall(r"roles/[A-Za-z.]+", roles)
+        for sa_name, roles in re.findall(
+            r'^revoke_roles "(sre-[a-z-]+)@\$\{GOOGLE_CLOUD_PROJECT\}\.iam\.gserviceaccount\.com" \\\n((?:\s+roles/\S+(?: \\)?\n?)+)',
+            cleanup_doc,
+            flags=re.MULTILINE,
+        )
+    }
+    library = _script("lib.sh")
+    expected = {
+        "sre-cloudbuild-sa": _bash_array(library, "BUILD_SA_ROLES"),
+        "sre-gke-node-sa": _bash_array(library, "NODE_SA_ROLES"),
+        "sre-autonomous-agent-sa": _bash_array(library, "AGENT_SA_ROLES"),
+    }
+    assert {sa: sorted(roles) for sa, roles in revoked.items()} == {
+        sa: sorted(roles) for sa, roles in expected.items()
+    }
+    # BigQuery 接続用サービスアカウントへ付与した roles/aiplatform.user の取り消しも記載されていること
+    assert '--member="serviceAccount:${BQ_CONN_SA}"' in cleanup_doc
+    assert cleanup_doc.index("revoke_roles") < cleanup_doc.index("gcloud iam service-accounts delete")
+

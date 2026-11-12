@@ -183,6 +183,17 @@ gcloud pubsub topics delete sre-approval-decisions \
 python3 ./target-app/scripts/setup_email_notification.py --delete || true
 
 # 6. BigQuery データセット・Cloud Resource Connection・Artifact Registry の削除（任意）
+if bq show --connection --location="${GOOGLE_CLOUD_REGION}" "${GOOGLE_CLOUD_PROJECT}.${GOOGLE_CLOUD_REGION}.${BQ_CONNECTION_ID:-sre_genai_conn}" >/dev/null 2>&1; then
+  BQ_CONN_SA=$(bq show --format=json --connection \
+    --location="${GOOGLE_CLOUD_REGION}" \
+    "${GOOGLE_CLOUD_PROJECT}.${GOOGLE_CLOUD_REGION}.${BQ_CONNECTION_ID:-sre_genai_conn}" \
+    | python3 -c "import sys, json; print(json.load(sys.stdin)['cloudResource']['serviceAccountId'])")
+  gcloud projects remove-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
+    --member="serviceAccount:${BQ_CONN_SA}" \
+    --role="roles/aiplatform.user" \
+    --condition=None \
+    --quiet >/dev/null 2>&1 || true
+fi
 bq rm -r -f -d "${GOOGLE_CLOUD_PROJECT}:${BQ_DATASET}"
 bq rm --connection --location="${GOOGLE_CLOUD_REGION}" --project_id="${GOOGLE_CLOUD_PROJECT}" -f "${BQ_CONNECTION_ID:-sre_genai_conn}" || true
 
@@ -192,8 +203,46 @@ gcloud artifacts repositories delete sre-handson \
   --quiet
 
 # （任意）Secret Manager シークレットと 3 つの専用 SA を削除する場合
+# IAM ポリシーに deleted:serviceAccount:... が残らないよう、先にロールを取り消してから削除します
 gcloud secrets delete sre-slack-bot-token --project="${GOOGLE_CLOUD_PROJECT}" --quiet || true
 gcloud secrets delete sre-slack-app-token --project="${GOOGLE_CLOUD_PROJECT}" --quiet || true
+
+revoke_roles() {
+  local sa_email="$1"
+  shift
+  for role in "$@"; do
+    gcloud projects remove-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
+      --member="serviceAccount:${sa_email}" \
+      --role="${role}" \
+      --condition=None \
+      --quiet >/dev/null 2>&1 || true
+  done
+}
+
+revoke_roles "sre-cloudbuild-sa@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com" \
+  roles/storage.objectViewer \
+  roles/artifactregistry.writer \
+  roles/logging.logWriter
+
+revoke_roles "sre-gke-node-sa@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com" \
+  roles/container.defaultNodeServiceAccount \
+  roles/artifactregistry.reader
+
+revoke_roles "sre-autonomous-agent-sa@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com" \
+  roles/monitoring.viewer \
+  roles/logging.viewer \
+  roles/mcp.toolUser \
+  roles/serviceusage.serviceUsageConsumer \
+  roles/bigquery.dataEditor \
+  roles/bigquery.jobUser \
+  roles/bigquery.connectionUser \
+  roles/datastore.user \
+  roles/pubsub.subscriber \
+  roles/aiplatform.user \
+  roles/container.clusterViewer \
+  roles/secretmanager.secretAccessor \
+  roles/integrations.integrationInvoker
+
 for SA_NAME in sre-autonomous-agent-sa sre-gke-node-sa sre-cloudbuild-sa; do
   gcloud iam service-accounts delete "${SA_NAME}@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com" \
     --project="${GOOGLE_CLOUD_PROJECT}" \
