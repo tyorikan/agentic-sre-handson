@@ -20,43 +20,43 @@ Cloud Logging / Cloud Monitoring のイベントストリームを 24 時間常�
 <summary>詳細: Mermaid ソースを表示</summary>
 
 ```mermaid
-flowchart LR
-    subgraph S1["① 監視対象 GKE & イベント転送"]
-        direction TB
-        OrderApp["注文 API: order-service<br/>Namespace: sre-demo-app"]
-        LogSink["Cloud Logging シンク<br/>ERROR / CRITICAL のみ抽出"]
+flowchart TB
+    subgraph S1["① 監視対象 & 異常検知"]
+        direction LR
+        OrderApp["監視対象 GKE<br/>order-service / NS: sre-demo-app"]
+        LogSink["Logging & SLO 検知<br/>ERROR 抽出 + SLO 10分急燃焼"]
         PubSub["Cloud Pub/Sub<br/>sre-alert-stream-sub"]
-        OrderApp -->|"構造化 JSON ログ"| LogSink --> PubSub
+        OrderApp -->|"ログ & SLI"| LogSink -->|"異常通知"| PubSub
     end
 
-    subgraph S2["② 常駐エージェント基盤: Cloud Run instances / ingress: internal・URL 非公開"]
-        direction TB
-        Dedup["1. 重複排除・テレメトリ補完<br/>15分クールダウン + 直近90秒エラー率算出"]
-        Diag["2. 並列診断 JoinNode<br/>Cloud Run sandbox + BigQuery 照合"]
-        Decide["3. Gemini 3.8 Flash 相関推論<br/>公式リモート MCP 読取 + 構造化出力"]
-        Guard["4. 安全ガードレール<br/>許可NS・類似度0.85・鮮度90日・1時間1回上限"]
+    subgraph S2["② 閉域 Cloud Run instance — URL 非公開・外向き通信のみ"]
+        direction LR
+        Dedup["1. 重複排除・補完<br/>15分排他リース + 直近90秒エラー率"]
+        Diag["2. 並列診断 JoinNode<br/>Cloud Run sandbox + AI.SEARCH 照合"]
+        Decide["3. Gemini 3.8 Flash<br/>公式リモート MCP 読取 + 相関推論"]
+        Guard["4. 安全ガードレール<br/>許可NS・推奨一致・鮮度90日・1回/h・静観誘導棄却"]
         Dedup --> Diag --> Decide --> Guard
     end
 
-    subgraph S3["③ 観測・SLO・自律成長知識ストア"]
-        direction TB
-        BQ["BigQuery: sre_agent_ops<br/>AI.EMBED 自動ベクトル生成列<br/>鮮度管理 & Saved Budget 監査"]
-        MCP["公式リモート MCP & Service Monitoring<br/>Monitoring / Logging / GKE 読取<br/>日次 99.0%・月次 99.9% 可用性 SLO"]
-        FS["Cloud Firestore<br/>ADK 中断セッション・承認チケット"]
+    subgraph S3["③ 観測・SLO・分散状態・自律成長知識基盤"]
+        direction LR
+        BQ["BigQuery 知識ベース<br/>AI.EMBED 自動ベクトル列 & 監査履歴"]
+        MCP["公式 MCP & 可用性 SLO<br/>Monitoring / Logging / GKE / SLO"]
+        FS["Cloud Firestore<br/>中断セッション・冗長2台排他リース"]
     end
 
-    subgraph S4["④ 3分岐アクション & 自律学習還流"]
-        direction TB
-        R1["ルート A: 静観 OBSERVE<br/>一過性瞬断は再起動ゼロで報告"]
-        R2["ルート B: 自動復旧 AUTO_REMEDIATE<br/>AppsV1 Rollback/Restart + Saved Budget 算出"]
-        R3["ルート C: 人間承認 REQUIRE_APPROVAL<br/>回復時に新規 Runbook 登録 / 再承認で鮮度更新"]
+    subgraph S4["④ 3分岐アクション & 自律還流"]
+        direction LR
+        R1["A: 静観 OBSERVE<br/>一過性瞬断は操作ゼロ"]
+        R2["B: 自動復旧<br/>健全版 Rollback/Restart + 推定温存記録"]
+        R3["C: 人間承認再開<br/>Slack またはメール+CLI"]
     end
 
     PubSub -->|"StreamingPull"| Dedup
     Diag <-->|"AI.SEARCH"| BQ
-    Decide <-->|"Read-Only 照会"| MCP
+    Decide <-->|"Read-Only"| MCP
     Guard --> R1 & R2 & R3
-    R3 <-->|"状態永続化"| FS
+    R3 <-->|"状態・リース共有"| FS
     R3 -.->|"自律ナレッジ登録 MERGE"| BQ
 
     classDef surface fill:#ffffff,stroke:#4285F4,stroke-width:1.5px,color:#202124;
