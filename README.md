@@ -2,6 +2,10 @@
 
 Cloud Logging / Cloud Monitoring のイベントストリームを 24 時間常時待ち受け、異常検知時に**「マルチシグナル相関分析」「隔離サンドボックスでの統計解析」「BigQuery 自律埋め込み知識ベース（`AI.EMBED` / `AI.SEARCH`）との照合」**を実行し、**静観・GKE 自動復旧・Slack 承認連携・解決ナレッジの自律昇格・Error Budget 温存効果の定量計測**までを一気通貫で構築するハンズオンリポジトリです。
 
+![Agentic SRE ハンズオン 全体概要アニメーション](docs/images/overview-demo.webp)
+
+> **全体概要動画**: 上記は全 6 シーンの要点を約 22 秒に凝縮した自動ループプレビューです。日本語ナレーション・BGM・チャプター付きのフル HD 完全版（約 80 秒）は [docs/videos/overview-demo.mp4](docs/videos/overview-demo.mp4)（外部字幕: [overview-demo.srt](docs/videos/overview-demo.srt)）から視聴・ダウンロードできます。
+
 ---
 
 ## 1. 全体アーキテクチャと設計の特徴
@@ -176,7 +180,7 @@ pytest -v
 ├── quickstart/                      # クイックスタート用: 環境構築・エージェントのデプロイ・後片付けのスクリプト
 ├── appendix/                        # 付録: GKE Standard microVM / Model Armor / pass^3 評価スクリプト
 ├── tests/                           # ローカル自動テストスイート (全 93 件)
-└── docs/                            # クイックスタート・全 7 章のステップバイステップ Codelab 教材 & 高精細構成図
+└── docs/                            # クイックスタート・全 7 章 Codelab 教材・構成図 (images/)・概要解説動画 (videos/)
 ```
 
 ---
