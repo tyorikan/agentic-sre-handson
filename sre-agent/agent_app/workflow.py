@@ -468,7 +468,7 @@ class SreIncidentOrchestrator:
 
         @node(name="approved_remediate_node", require_confirmation=True)
         async def approved_remediate_node(ctx: Context) -> dict[str, Any]:
-            """Slack の Interactive 承認ボタンで Approve が押された後にのみ本体が実行されるノード。"""
+            """人が承認した後（Slack のボタンまたは承認コマンド）にのみ本体が実行されるノード。"""
             alert = AlertEvent.model_validate(ctx.state["alert"])
             decision = TriageDecision.model_validate(ctx.state["final_decision"])
 
@@ -572,7 +572,7 @@ class SreIncidentOrchestrator:
                 matched_runbook_id=final_decision.matched_runbook_id,
                 similarity_score=final_decision.similarity_score,
                 verification_passed=False,
-                summary=f"[Slack 承認待機] {final_decision.rationale}",
+                summary=f"[承認待機] {final_decision.rationale}",
             )
             return WorkflowRunResult(
                 alert=alert,
@@ -608,8 +608,13 @@ class SreIncidentOrchestrator:
         confirmation_call_id: str,
         approved: bool,
         approver_id: str,
+        approver_label: str | None = None,
     ) -> RemediationOutcome:
-        """Slack Interactive ボタンの承認/却下結果を受け取り、停止していた ADK ワークフローを再開する。"""
+        """Slack のボタンまたは承認コマンドによる承認/却下を受け取り、停止していた ADK ワークフローを再開する。
+
+        approver_id は監査記録に残す操作者の識別子。approver_label は通知文面での表示名で、
+        省略時は approver_id を使う（Slack 経由の場合は呼び出し側がメンション記法を渡す）。
+        """
         fn_part = types.Part.from_function_response(
             name="adk_request_input",
             response={"confirmed": approved},
@@ -662,7 +667,7 @@ class SreIncidentOrchestrator:
             return RemediationOutcome(
                 executed=False,
                 action_status="REJECTED",
-                detail_message=f"承認者 <@{approver_id}> が自動操作を却下し、手動対応へ切り替えました。{demote_suffix}",
+                detail_message=f"承認者 {approver_label or approver_id} が自動操作を却下し、手動対応へ切り替えました。{demote_suffix}",
                 verification_passed=False,
                 demoted_runbook_id=demoted_id,
             )

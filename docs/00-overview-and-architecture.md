@@ -47,7 +47,7 @@ flowchart LR
 
 * **本番で機能する 5 つの理由**:
   1. **Out-of-Band（帯域外）常駐監視**: 監視対象の GKE とは独立した **Cloud Run instances** 上で稼働するため、GKE 側が障害に陥っても外部から復旧 API を実行できます。
-  2. **着信公開 URL ゼロの双方向通信**: `--ingress internal` と `--no-default-url` で外部からの着信を完全遮断します。Pub/Sub StreamingPull と Slack Socket Mode はどちらもコンテナからの外向き TLS 通信であるため、公開 URL なしで監視と承認ボタン連携が成立します。
+  2. **着信公開 URL ゼロの双方向通信**: `--ingress internal` と `--no-default-url` で外部からの着信を完全遮断します。Pub/Sub StreamingPull と Slack Socket Mode はどちらもコンテナからの外向き TLS 通信であるため、公開 URL なしで監視と承認ボタン連携が成立します。Slack を使えない場合の代替ルートであるメール通知と承認コマンドも、外向き通信だけで動作します。
   3. **調査の柔軟性と変更の厳格性の分離**: 統計計算スクリプトは外向き通信・認証情報を遮断した **Cloud Run sandboxes（`sandbox do`）** 内で実行し、GKE の変更は Namespace 固定・回数上限付きの型付き関数のみに限定します。
   4. **鮮度管理付きの自律成長型知識ベース**: 初見障害は人間承認を経て**事後エラー率 1.0% 未満への回復が実証された場合のみ** BigQuery `incident_runbooks` へ自動登録し、`AI.EMBED` 生成列で自動ベクトル化します。一方、90 日以上未検証の手順は人間再承認へ自動降格し、却下・未回復手順は自動凍結します。
   5. **Error Budget 温存効果の定量証明**: Cloud Monitoring の公式 SLO モニタリングと連動し、約 1〜2 分の自動復旧によって「従来の人間手動対応（例: 30 分）と比べてどれだけ Error Budget を守れたか」を数値で証明できます。
@@ -102,6 +102,7 @@ flowchart LR
 | `roles/bigquery.admin` | 第 2・5・6 章：データセット・Cloud Resource Connection・`AI.EMBED` テーブル管理 |
 | `roles/run.admin` | 第 5・6 章：Cloud Run instance のデプロイ・停止・削除 |
 | `roles/secretmanager.admin` | 第 4・6 章：Slack 連携トークンの登録・削除（Slack 省略時は不要） |
+| `roles/integrations.integrationAdmin` | 第 4・6 章：通知メール用の連携の登録・削除（Slack を使う場合は不要） |
 
 ```bash
 # 方法 B の場合のみ：プロジェクト管理者がハンズオン実施ユーザーへ最小ロール一式を付与するコマンド例
@@ -124,7 +125,8 @@ for ROLE in \
   roles/monitoring.editor \
   roles/bigquery.admin \
   roles/run.admin \
-  roles/secretmanager.admin; do
+  roles/secretmanager.admin \
+  roles/integrations.integrationAdmin; do
   gcloud projects add-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
     --member="user:${HANDSON_USER_EMAIL}" \
     --role="${ROLE}" \
@@ -132,6 +134,8 @@ for ROLE in \
     --quiet
 done
 ```
+
+メール通知と承認コマンドの代替ルートは、オーナー権限でのみ検証しています。方法 B の最小ロール構成では、Application Integration のリージョンの有効化に追加の権限が必要になる可能性があります。
 
 ### Step 2.1 リポジトリの取得と環境変数の設定
 

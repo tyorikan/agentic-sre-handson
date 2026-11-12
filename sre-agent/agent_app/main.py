@@ -1,8 +1,10 @@
 """常駐自律型 SRE エージェント エントリポイント (`main.py`)。
 
-Cloud Run instances 上で単一常駐プロセスとして稼働し、以下の 2 つの外向きストリームを並行処理します。
+Cloud Run instances 上で単一常駐プロセスとして稼働し、以下の外向きストリームを並行処理します。
   1. Cloud Pub/Sub StreamingPull によるアラート・異常ログの常時待ち受け
   2. Slack Socket Mode による双方向 Interactive 承認イベントの常時待ち受け
+  3. 【Slack を使えない場合の代替ルート】承認専用サブスクリプションの StreamingPull による
+     承認コマンドからの承認・却下の待ち受け（APPROVAL_PUBSUB_SUBSCRIPTION 設定時のみ）
 
 着信 HTTP ポートを一切開けずに動作するため、`--ingress internal --no-default-url` の
 完全閉域インスタンス構成で安全に運用できます。
@@ -21,6 +23,7 @@ from typing import Any
 from aiohttp import web
 from google.cloud import pubsub_v1
 
+from .approval_decisions import handle_approval_decision_message
 from .config import AgentSettings, load_settings
 from .dedup_store import BigQueryEventStoreBackend, IncidentGuardrailManager
 from .models import AlertEvent
@@ -151,7 +154,7 @@ async def _start_health_server(port: int) -> web.AppRunner:
 
 
 async def run_daemon(settings: AgentSettings) -> None:
-    """Pub/Sub StreamingPull・Slack Socket Mode・最小 /healthz 応答を並行稼働させる常駐メインループ。"""
+    """Pub/Sub StreamingPull・Slack Socket Mode・承認コマンドの待ち受け・最小 /healthz 応答を並行稼働させる常駐メインループ。"""
     health_port = int(os.getenv("PORT", "8080"))
     health_runner = await _start_health_server(health_port)
     _log_json("INFO", "ヘルスチェック用内部ポートを起動しました。", port=health_port)
@@ -183,7 +186,13 @@ async def run_daemon(settings: AgentSettings) -> None:
         loop.add_signal_handler(sig, stop_event.set)
 
     await slack_coordinator.start_socket_mode()
-    _log_json("INFO", "Slack Socket Mode 接続準備完了（未設定時はローカルログモード）。")
+    _log_json(
+        "INFO",
+        "通知と承認の経路を初期化しました。",
+        slack_enabled=bool(settings.slack_bot_token and settings.slack_app_token),
+        email_enabled=bool(settings.email_integration_name),
+        approval_command_enabled=bool(settings.approval_subscription),
+    )
 
     subscriber = pubsub_v1.SubscriberClient()
     sub_path = subscriber.subscription_path(settings.project_id, settings.alert_subscription)
@@ -212,6 +221,41 @@ async def run_daemon(settings: AgentSettings) -> None:
         callback=_callback,
         flow_control=pubsub_v1.types.FlowControl(max_messages=5),
     )
+    approval_pull_future = None
+    if settings.approval_subscription:
+        approval_sub_path = subscriber.subscription_path(settings.project_id, settings.approval_subscription)
+
+        def _approval_callback(message: pubsub_v1.subscriber.message.Message) -> None:
+            # 承認・却下は人の判断なので、失敗しても自動で再配信させない（必ず ack する）
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    handle_approval_decision_message(
+                        message.data,
+                        slack_coordinator,
+                        published_at=message.publish_time,
+                    ),
+                    loop,
+                )
+                handled = fut.result(timeout=300)
+                _log_json(
+                    "INFO" if handled.status == "applied" else "WARNING",
+                    "承認コマンドからの承認・却下を処理しました。",
+                    incident_id=handled.incident_id,
+                    status=handled.status,
+                    detail=handled.detail,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _log_json("ERROR", f"承認コマンドからの承認・却下の処理中に例外が発生しました（自動再試行はしません）: {exc}")
+            finally:
+                message.ack()
+
+        approval_pull_future = subscriber.subscribe(
+            approval_sub_path,
+            callback=_approval_callback,
+            flow_control=pubsub_v1.types.FlowControl(max_messages=1),
+        )
+        _log_json("INFO", "承認コマンドからの承認・却下の待ち受けを開始しました。", subscription=approval_sub_path)
+
     _log_json(
         "INFO",
         "常駐自律型 SRE エージェントが稼働開始しました。",
@@ -225,6 +269,8 @@ async def run_daemon(settings: AgentSettings) -> None:
     finally:
         _log_json("INFO", "シャットダウンシグナルを受信しました。接続を安全に終了します...")
         streaming_pull_future.cancel()
+        if approval_pull_future is not None:
+            approval_pull_future.cancel()
         subscriber.close()
         await slack_coordinator.close_socket_mode()
         await health_runner.cleanup()

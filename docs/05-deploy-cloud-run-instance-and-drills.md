@@ -25,24 +25,26 @@ flowchart LR
 
     subgraph Outbound["すべて外向き TLS / WSS 通信のみで接続"]
         direction TB
-        PS["1. Cloud Pub/Sub<br/>StreamingPull"]
+        PS["1. Cloud Pub/Sub<br/>StreamingPull: アラート用 + 承認専用"]
         GCP["2. 公式 MCP / BigQuery / Firestore<br/>Gemini 3.8 Flash"]
         GKE["3. 監視対象 GKE<br/>sre-demo-app/order-service"]
         Slack["4. Slack ワークスペース<br/>Socket Mode 外向き WSS"]
+        Mail["5. Application Integration<br/>通知メール送信: Slack を使えない場合の代替"]
     end
 
-    Daemon --> PS & GCP & GKE
+    Daemon --> PS & GCP & GKE & Mail
     Daemon <--> Slack
 
     classDef block fill:#fce8e6,stroke:#c5221f,stroke-width:2px,color:#202124;
     classDef core fill:#ffffff,stroke:#1a73e8,stroke-width:2px,color:#202124;
     class Internet block;
-    class SubSB,Daemon,PS,GCP,GKE,Slack core;
+    class SubSB,Daemon,PS,GCP,GKE,Slack,Mail core;
 ```
 
 </details>
 
 * **なぜ Cloud Run Services ではなく Cloud Run instances なのか**: リクエスト駆動でスケールトゥゼロする Cloud Run Services と異なり、Cloud Run instances は単一コンテナを常時稼働させて Pub/Sub StreamingPull と Slack Socket Mode WebSocket を維持でき、さらに `--sandbox-launcher` で隔離サンドボックスを即起動できます。
+* **代替ルートも外向き通信だけで成立**: 通知メールの送信は Application Integration の API 呼び出し、承認コマンドからの承認は承認専用サブスクリプションの StreamingPull で受け取るため、着信 URL は不要です。
 
 ---
 
@@ -70,6 +72,8 @@ gcloud builds submit . \
 
 `--sandbox-launcher`・`--ingress=internal`・`--no-default-url` を指定して起動します。`INITIAL_STABILIZATION_SECONDS=30` により一過性スパイクと持続障害を正確に識別し、訓練の連続実行用に `ALLOW_DRILL_COOLDOWN_RESET=true` を有効化します（本番運用時は `false` に戻してください）。
 
+第 4 章で準備した通知と承認の経路は、このコマンドがそのまま反映します。Slack のシークレットがあれば Slack 連携が、`.env` に `EMAIL_NOTIFY_INTEGRATION` と `APPROVAL_PUBSUB_SUBSCRIPTION` があればメール通知と承認コマンドが有効になります。
+
 ```bash
 SLACK_SECRET_FLAGS=()
 if gcloud secrets describe sre-slack-bot-token --project="${GOOGLE_CLOUD_PROJECT}" >/dev/null 2>&1; then
@@ -89,7 +93,7 @@ gcloud beta run instances deploy sre-autonomous-agent \
   --sandbox-launcher \
   --ingress=internal \
   --no-default-url \
-  --set-env-vars="^@^GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}@GOOGLE_CLOUD_REGION=${GOOGLE_CLOUD_REGION}@GOOGLE_CLOUD_LOCATION=global@GOOGLE_GENAI_USE_ENTERPRISE=True@SRE_TRIAGE_MODEL=${SRE_TRIAGE_MODEL}@SRE_EMBEDDING_MODEL=${SRE_EMBEDDING_MODEL}@ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false@ALERT_PUBSUB_SUBSCRIPTION=${ALERT_PUBSUB_SUBSCRIPTION}@BQ_DATASET=${BQ_DATASET}@BQ_CONNECTION_ID=${BQ_CONNECTION_ID:-sre_genai_conn}@ENABLE_AUTONOMOUS_KB_LEARNING=${ENABLE_AUTONOMOUS_KB_LEARNING:-true}@RUNBOOK_FRESHNESS_TTL_DAYS=${RUNBOOK_FRESHNESS_TTL_DAYS:-90}@ALLOW_DRILL_COOLDOWN_RESET=true@GKE_CLUSTER_NAME=${GKE_CLUSTER_NAME}@GKE_CLUSTER_LOCATION=${GKE_CLUSTER_LOCATION}@ALLOWED_K8S_NAMESPACES=${ALLOWED_K8S_NAMESPACES}@SANDBOX_MODE=cloud_run@INITIAL_STABILIZATION_SECONDS=30@SLO_SERVICE_ID=${SLO_SERVICE_ID:-order-service-slo}@SLO_DAILY_ID=${SLO_DAILY_ID:-order-availability-daily-99}@SLO_MONTHLY_ID=${SLO_MONTHLY_ID:-order-availability-monthly-999}@MANUAL_BASELINE_MTTR_MINUTES=${MANUAL_BASELINE_MTTR_MINUTES:-30.0}@SESSION_BACKEND=firestore@FIRESTORE_DATABASE=(default)@SLACK_ALERT_CHANNEL_ID=${SLACK_ALERT_CHANNEL_ID}@SLACK_ALLOWED_APPROVER_IDS=${SLACK_ALLOWED_APPROVER_IDS:-}" \
+  --set-env-vars="^@^GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}@GOOGLE_CLOUD_REGION=${GOOGLE_CLOUD_REGION}@GOOGLE_CLOUD_LOCATION=global@GOOGLE_GENAI_USE_ENTERPRISE=True@SRE_TRIAGE_MODEL=${SRE_TRIAGE_MODEL}@SRE_EMBEDDING_MODEL=${SRE_EMBEDDING_MODEL}@ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false@ALERT_PUBSUB_SUBSCRIPTION=${ALERT_PUBSUB_SUBSCRIPTION}@BQ_DATASET=${BQ_DATASET}@BQ_CONNECTION_ID=${BQ_CONNECTION_ID:-sre_genai_conn}@ENABLE_AUTONOMOUS_KB_LEARNING=${ENABLE_AUTONOMOUS_KB_LEARNING:-true}@RUNBOOK_FRESHNESS_TTL_DAYS=${RUNBOOK_FRESHNESS_TTL_DAYS:-90}@ALLOW_DRILL_COOLDOWN_RESET=true@GKE_CLUSTER_NAME=${GKE_CLUSTER_NAME}@GKE_CLUSTER_LOCATION=${GKE_CLUSTER_LOCATION}@ALLOWED_K8S_NAMESPACES=${ALLOWED_K8S_NAMESPACES}@SANDBOX_MODE=cloud_run@INITIAL_STABILIZATION_SECONDS=30@SLO_SERVICE_ID=${SLO_SERVICE_ID:-order-service-slo}@SLO_DAILY_ID=${SLO_DAILY_ID:-order-availability-daily-99}@SLO_MONTHLY_ID=${SLO_MONTHLY_ID:-order-availability-monthly-999}@MANUAL_BASELINE_MTTR_MINUTES=${MANUAL_BASELINE_MTTR_MINUTES:-30.0}@SESSION_BACKEND=firestore@FIRESTORE_DATABASE=(default)@SLACK_ALERT_CHANNEL_ID=${SLACK_ALERT_CHANNEL_ID}@SLACK_ALLOWED_APPROVER_IDS=${SLACK_ALLOWED_APPROVER_IDS:-}@EMAIL_NOTIFY_INTEGRATION=${EMAIL_NOTIFY_INTEGRATION:-}@APPROVAL_PUBSUB_SUBSCRIPTION=${APPROVAL_PUBSUB_SUBSCRIPTION:-}" \
   ${SLACK_SECRET_FLAGS[@]+"${SLACK_SECRET_FLAGS[@]}"} \
   --project="${GOOGLE_CLOUD_PROJECT}"
 ```
@@ -100,6 +104,13 @@ gcloud beta run instances deploy sre-autonomous-agent \
 gcloud beta run instances describe sre-autonomous-agent \
   --region="${GOOGLE_CLOUD_REGION}" \
   --project="${GOOGLE_CLOUD_PROJECT}"
+
+# 有効になった通知と承認の経路を確認するコマンド（Slack・メール通知・承認コマンドの順に True / False を表示）
+gcloud logging read \
+  'resource.labels.instance_name="sre-autonomous-agent" AND jsonPayload.message:"通知と承認の経路"' \
+  --limit=1 \
+  --project="${GOOGLE_CLOUD_PROJECT}" \
+  --format='value(jsonPayload.slack_enabled,jsonPayload.email_enabled,jsonPayload.approval_command_enabled)'
 
 # 判定ステップの構造化 JSON ログを確認するコマンド
 gcloud logging read \
@@ -120,6 +131,33 @@ gcloud logging read \
 ```bash
 source .venv/bin/activate
 python3 ./target-app/scripts/check_slo_budget.py --save-baseline /tmp/slo_before_drills.json
+```
+
+### 承認待ちへの対応方法（訓練 3 と訓練 4 で使用）
+
+承認待ちの通知が届いたら、準備した経路で承認または却下します。
+
+| 経路 | 操作 |
+|---|---|
+| Slack | 届いたカードの `[Approve & Execute]` または `[Reject]` を押す |
+| メール通知と承認コマンド | 承認待ちのメールに書かれたコマンドを実行し、判定内容を確認して `approve` か `reject` を入力する |
+
+```bash
+# 承認コマンドの場合。インシデント ID は承認待ちのメールに記載されています
+python3 ./target-app/scripts/approve_incident.py <INCIDENT_ID>
+
+# メールが届かない場合は、引数なしで実行すると承認待ちの一覧を表示します
+python3 ./target-app/scripts/approve_incident.py
+```
+
+承認コマンドは承認または却下を発行したら終了し、結果は承認結果のメールで届きます。結果が届かない場合は、エージェントが承認をどう処理したかをログで確認します。`STATUS` が `applied` 以外の承認は実行されていません。
+
+```bash
+gcloud logging read \
+  'resource.labels.instance_name="sre-autonomous-agent" AND jsonPayload.message:"承認コマンドからの承認・却下を処理しました"' \
+  --limit=3 \
+  --project="${GOOGLE_CLOUD_PROJECT}" \
+  --format='table(timestamp,jsonPayload.incident_id,jsonPayload.status,jsonPayload.detail)'
 ```
 
 ---
@@ -169,7 +207,7 @@ sequenceDiagram
 ```
 
 **確認ポイント**:
-* Slack（または Cloud Logging）に `OBSERVE`（類似事例 `INC-013`）と「不要な Pod 再起動による二次障害・追加バジェット流出を防止」のレポートが届き、Deployment リビジョンが変化していないこと。
+* Slack またはメールに `OBSERVE`（類似事例 `INC-013`）と「不要な Pod 再起動による二次障害・追加バジェット流出を防止」のレポートが届き、Deployment リビジョンが変化していないこと。
 
 ---
 
@@ -227,11 +265,11 @@ python3 ./target-app/scripts/check_slo_budget.py --compare-baseline /tmp/slo_bef
 
 **確認ポイント**:
 * `order-service` が自動的に `version=v1.0.0` へロールバックされ、実測 MTTR 約 70〜90 秒（約 1.3 分）で回復していること。
-* `check_slo_budget.py --compare-baseline` および Slack 完了カードにおいて、**手動対応 30 分なら月次 99.9% バジェット（43.2 分）の約 70% を失っていたところを数 % の消費に抑え、約 27〜28 分の Error Budget を温存できたこと**が確認できること。
+* `check_slo_budget.py --compare-baseline` と自動復旧完了の通知において、**手動対応 30 分なら月次 99.9% バジェット（43.2 分）の約 70% を失っていたところを数 % の消費に抑え、約 27〜28 分の Error Budget を温存できたこと**が確認できること。
 
 ---
 
-### 訓練 3：高リスク DB ロック競合 → 「自動一時停止 ＆ Slack 承認引継」の検証
+### 訓練 3：高リスク DB ロック競合 → 「自動一時停止 ＆ 人間承認引継」の検証
 
 DB コネクションスロット枯渇と行ロック待ち（`DB_CONN_SLOTS_EXHAUSTED_500`）を注入します。
 
@@ -276,7 +314,10 @@ sequenceDiagram
 ```
 
 **確認ポイント**:
-* エージェントが無断再起動を行わず一時停止し、Slack で `[Approve & Execute]` を押した瞬間に `⏳ 承認受付・実行中...` → `✅ 承認・実行完了` へ更新されること（`MANUAL_INTERVENTION` のため架空の復旧時間は計上せず、手動調査引継として記録されます）。
+* エージェントが無断再起動を行わず一時停止し、承認待ちの通知が届くこと。
+* **Slack で承認した場合**: `[Approve & Execute]` を押した瞬間に `⏳ 承認受付・実行中...` → `✅ 承認・実行完了` へ更新されること。
+* **承認コマンドで承認した場合**: `approve` を入力した数秒後に、件名 `承認・手動対応へ引き継ぎ` のメールが届くこと。
+* `MANUAL_INTERVENTION` のため架空の復旧時間は計上せず、手動調査引継として記録されること。
 * 確認後、擬似障害を解除します。
 
 ```bash
@@ -340,11 +381,11 @@ sequenceDiagram
 
 </details>
 
-#### ステップ A：1 回目の注入（Slack 承認 → ローリング再起動 → `AUTO-*` 自律登録）
+#### ステップ A：1 回目の注入（承認 → ローリング再起動 → `AUTO-*` 自律登録）
 
 ```bash
 ./target-app/scripts/inject_novel_tax_corrupt.sh
-# Slack に届いたカードで [Approve & Execute] をクリックします
+# 承認待ちの通知が届いたら承認します（Slack のボタン、または承認コマンド）
 ```
 
 #### ステップ B：`AI.EMBED` 自動埋め込み完了の確認とクールダウン解除
@@ -379,7 +420,7 @@ bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGIO
 ./target-app/scripts/reset_fault.sh --reset-cooldown
 sleep 8
 ./target-app/scripts/inject_novel_tax_corrupt.sh
-# Slack に「⏳ 承認待機・鮮度期限切れ再評価」が届くことを確認し、[Approve & Execute] で鮮度を復活させます
+# 「鮮度期限切れの再評価」の承認待ち通知が届くことを確認し、承認して鮮度を復活させます
 ```
 
 ---
@@ -413,6 +454,7 @@ bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGIO
 `AGENTS.md` と `.env` を読み込み、第5章（`docs/05-deploy-cloud-run-instance-and-drills.md`）のデプロイ・4 大障害訓練・Error Budget 比較を順番に実行してください。
 - ビルドと `gcloud beta run instances deploy` はコマンド全文を提示し、私の `y` 承認後に実行すること。
 - 訓練開始前に `check_slo_budget.py --save-baseline` を実行し、訓練 1〜4 の実施後に `--compare-baseline` の実測差分と BigQuery `incident_events` の `mttr_sec`・`saved_budget_min` 一覧を表形式で報告すること。
+- 承認待ちへの承認と却下は私が行うため、Slack のボタン操作や `approve_incident.py` への `approve`・`reject` の入力を代行しないこと。
 ```
 
 ---

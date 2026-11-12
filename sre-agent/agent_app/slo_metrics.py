@@ -3,7 +3,7 @@
 役割:
   1. 異常検知時刻（`AlertEvent.observed_at`）から回復検証完了時刻までの実測 MTTR（秒・分）を算出する。
   2. 人間オンコール対応時の標準復旧時間（既定 30.0 分）と比較し、早期の自動復旧または
-     Slack 承認復旧によって消費を回避できた Error Budget 分数・割合を算出する。
+     人の承認による復旧によって消費を回避できた Error Budget 分数・割合を算出する。
   3. Cloud Monitoring API v3 の SLO 時系列セレクタ（`select_slo_budget_fraction`,
      `select_slo_budget`, `select_slo_compliance`, `select_slo_burn_rate`）を呼び出し、
      日次 99.0% SLO（許容 14.4 分/日）および月次 99.9% SLO（許容 43.2 分/月）の実測残量を取得する。
@@ -146,7 +146,8 @@ def calculate_error_budget_impact(
         saved_min = round(max(0.0, manual_min - actual_min), 2)
         consumed_pct = round((actual_min / MONTHLY_999_TOTAL_BUDGET_MINUTES) * 100.0, 1)
         saved_pct = round((saved_min / MONTHLY_999_TOTAL_BUDGET_MINUTES) * 100.0, 1)
-        mode_label = "自動復旧" if decision == "AUTO_REMEDIATE" else "Slack 承認復旧"
+        # 承認の経路（Slack のボタン・承認コマンド）によらず同じ表記にする
+        mode_label = "自動復旧" if decision == "AUTO_REMEDIATE" else "人の承認による復旧"
         summary = (
             f"実測 MTTR `{mttr_sec:.0f}秒` (`{actual_min:.2f}分`) — "
             f"手動対応基準 `{manual_min:.0f}分` と比べ Error Budget 消費を **`{saved_min:.1f}分` 削減** "

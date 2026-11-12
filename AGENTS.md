@@ -14,6 +14,8 @@
    - `gcloud projects delete`、未承認の `gcloud container clusters delete`、`bq rm -r` などの破壊的操作を自律実行しないでください。クリーンアップ章で人間が明示的に指示した場合のみ実行可能です。
 4. **秘密情報の保護**:
    - Slack トークン（`xoxb-*`, `xapp-*`）や個人・顧客固有の識別子をソースコードや Markdown にハードコードせず、`.env`（Git 管理対象外）または Secret Manager から読み込んでください。
+5. **承認と却下は人が行う**:
+   - 承認待ちインシデントへの承認と却下は、人が内容を確認して行う操作です。Slack のボタン操作や、承認コマンド `target-app/scripts/approve_incident.py` への `approve`・`reject` の入力を代行しないでください。引数なしで実行する承認待ちの一覧表示は行って構いません。
 
 ---
 
@@ -27,7 +29,8 @@
    - **Phase 2（復旧操作）**: 任意の `kubectl` シェル文字列を LLM に生成・実行させてはなりません。必ず `sre-agent/agent_app/remediation_tools.py` の型付き関数（許可 Namespace・類似度 `0.85` 以上・Runbook 鮮度 `90` 日以内・1 時間 `1` 回上限・事後エラー率回復確認付き）のみを使用してください。
 3. **外部公開エンドポイントの遮断**:
    - Cloud Run instance のデプロイ時は `--sandbox-launcher --ingress internal --no-default-url` を維持し、Slack との双方向承認連携は外向き WebSocket 接続（Slack Socket Mode）で行ってください。
+   - Slack の代替ルートも外向き接続だけで構成します。通知メールは Application Integration の API 呼び出しで送り、承認コマンドからの承認は、アラート用とは別の承認専用 Pub/Sub サブスクリプションで受け取ります。承認イベントをアラート用トピックで受け付けないでください。
 4. **SLO・Error Budget 効果の誠実な計測**:
    - `sre-agent/agent_app/slo_metrics.py` において、実測 MTTR と温存 Error Budget 分数（Saved Error Budget）は型付き復旧を実行し事後回復が確認されたケースのみ計上し、静観や手動調査引き継ぎ時に架空の短縮時間を計上しないでください。
 5. **仮想環境での検証**:
-   - コード変更後は必ず `.venv` 仮想環境上で `pytest -v` を実行し、全テスト（26 件）が通過することを確認してください。
+   - コード変更後は必ず `.venv` 仮想環境上で `pytest -v` を実行し、全テスト（51 件）が通過することを確認してください。

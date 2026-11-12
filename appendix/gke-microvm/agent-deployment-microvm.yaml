@@ -103,5 +103,10 @@ spec:
               value: "firestore"
             - name: FIRESTORE_DATABASE
               value: "(default)"
+            # Slack を使えない場合の代替ルート（空のままなら無効。Slack と併用も可能）
+            - name: EMAIL_NOTIFY_INTEGRATION
+              value: ""
+            - name: APPROVAL_PUBSUB_SUBSCRIPTION
+              value: ""
             - name: SLACK_ALERT_CHANNEL_ID
               value: "YOUR_SLACK_CHANNEL_ID"

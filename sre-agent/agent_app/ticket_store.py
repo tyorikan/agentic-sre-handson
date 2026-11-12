@@ -19,8 +19,16 @@ from .config import AgentSettings
 from .models import AlertEvent, TriageDecision
 
 
+def ticket_document_id(incident_id: str) -> str:
+    """インシデント ID から Firestore のドキュメント ID を作る（'/' を含められないため置き換える）。
+
+    エージェントと承認コマンドが同じチケットを指すよう、両方からこの関数を使う。
+    """
+    return incident_id.replace("/", "_")
+
+
 class StoredApprovalTicket(BaseModel):
-    """永続化可能な Slack 承認待ちチケット。"""
+    """永続化可能な承認待ちチケット（Slack のボタンと承認コマンドの両方から再開に使う）。"""
 
     incident_id: str
     alert: AlertEvent
@@ -117,9 +125,7 @@ class FirestoreApprovalTicketStore:
         self._known_pending: set[str] = set()
 
     def _doc_ref(self, incident_id: str) -> Any:
-        # Firestore ドキュメント ID に '/' が含まれないよう安全にサニタイズ
-        safe_id = incident_id.replace("/", "_")
-        return self._client.collection(self._collection_name).document(safe_id)
+        return self._client.collection(self._collection_name).document(ticket_document_id(incident_id))
 
     async def save_ticket(self, ticket: StoredApprovalTicket) -> None:
         await self._doc_ref(ticket.incident_id).set(ticket.model_dump(mode="json"))

@@ -88,6 +88,16 @@ class AgentSettings:
         default_factory=lambda: _split_csv(os.getenv("SLACK_ALLOWED_APPROVER_IDS", ""))
     )
 
+    # Slack を使えない場合の代替ルート（メール通知 + 承認コマンド）。どちらも空なら無効
+    # メール通知: Application Integration に登録したメール送信用の連携名（宛先は連携の定義に固定）
+    email_integration_name: str = field(default_factory=lambda: os.getenv("EMAIL_NOTIFY_INTEGRATION", ""))
+    email_integration_location: str = field(
+        default_factory=lambda: os.getenv("EMAIL_NOTIFY_LOCATION")
+        or os.getenv("GOOGLE_CLOUD_REGION", "asia-northeast1")
+    )
+    # 承認コマンド: 承認・却下を受け取る専用サブスクリプション（監視対象のログが流れるアラート用とは別）
+    approval_subscription: str = field(default_factory=lambda: os.getenv("APPROVAL_PUBSUB_SUBSCRIPTION", ""))
+
     # ADK セッション・承認待ちチケット永続化（Human-in-the-Loop 一時停止と再開で使用）
     # 本番は "firestore"（インスタンス再起動耐性）、ローカル開発・単体テスト時は "sqlite" を選択
     session_backend: str = field(default_factory=lambda: os.getenv("SESSION_BACKEND", "sqlite"))

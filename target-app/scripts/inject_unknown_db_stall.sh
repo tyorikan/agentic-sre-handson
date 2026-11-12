@@ -2,7 +2,7 @@
 # ============================================================================
 # シナリオ 3 障害注入スクリプト: 未知/高リスクの DB コネクション枯渇・ロック競合 (DB_POOL_EXHAUSTED)
 # 挙動: DB 最大接続到達とロック待ちエラー (DB_CONN_SLOTS_EXHAUSTED_500) を発生させます。
-# 期待される SRE エージェントの判断: REQUIRE_APPROVAL（自動変更を停止し、Slack に Approve/Reject ボタンを送信）
+# 期待される SRE エージェントの判断: REQUIRE_APPROVAL（自動変更を停止し、承認待ちを Slack またはメールで通知）
 # ============================================================================
 set -euo pipefail
 
@@ -39,5 +39,5 @@ kubectl run fault-injector-db \
     echo ''
   "
 
-echo "[Scenario 3] 注入完了。Slack に届く調査レポートと [Approve / Reject] ボタンを確認してください。"
+echo "[Scenario 3] 注入完了。Slack またはメールに届く承認待ちの通知を確認してください。"
 echo "検証後に手動で障害モードを解除する場合は ./target-app/scripts/reset_fault.sh を実行してください。"

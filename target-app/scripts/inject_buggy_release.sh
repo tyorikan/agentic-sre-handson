@@ -36,4 +36,4 @@ kubectl run fault-traffic-v2 \
     echo ''
   "
 
-echo "[Scenario 2] トラフィック送信完了。常駐 SRE エージェントによる自動ロールバックと Slack 事後レポートを確認してください。"
+echo "[Scenario 2] トラフィック送信完了。常駐 SRE エージェントによる自動ロールバックと、Slack またはメールに届く事後レポートを確認してください。"

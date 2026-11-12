@@ -171,7 +171,18 @@ gcloud pubsub topics delete sre-alert-stream \
   --project="${GOOGLE_CLOUD_PROJECT}" \
   --quiet
 
-# 5. BigQuery データセット・Cloud Resource Connection・Artifact Registry の削除（任意）
+# 5. 代替ルートを設定した場合のみ: 承認専用の Pub/Sub とメール送信用の連携の削除
+gcloud pubsub subscriptions delete sre-approval-decisions-sub \
+  --project="${GOOGLE_CLOUD_PROJECT}" \
+  --quiet || true
+
+gcloud pubsub topics delete sre-approval-decisions \
+  --project="${GOOGLE_CLOUD_PROJECT}" \
+  --quiet || true
+
+python3 ./target-app/scripts/setup_email_notification.py --delete || true
+
+# 6. BigQuery データセット・Cloud Resource Connection・Artifact Registry の削除（任意）
 bq rm -r -f -d "${GOOGLE_CLOUD_PROJECT}:${BQ_DATASET}"
 bq rm --connection --location="${GOOGLE_CLOUD_REGION}" --project_id="${GOOGLE_CLOUD_PROJECT}" -f "${BQ_CONNECTION_ID:-sre_genai_conn}" || true
 
@@ -190,6 +201,8 @@ for SA_NAME in sre-autonomous-agent-sa sre-gke-node-sa sre-cloudbuild-sa; do
 done
 ```
 
+代替ルートを設定した場合、Application Integration のリージョンの有効化と、有効化時に自動作成された連携 `ExecuteConnection` は残ります。Application Integration は使った分だけの従量課金のため、連携を実行しない限り料金は発生しません。
+
 ---
 
 ## Links and References
@@ -197,3 +210,4 @@ done
 * [GKE Sandbox overview (microVMs vs gVisor)](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/sandbox-pods) — GKE Sandbox の隔離方式比較と制限事項
 * [Model Armor overview](https://docs.cloud.google.com/model-armor/overview) — プロンプトインジェクションおよび機密データ保護機能の概要
 * [ADK Evaluation guide](https://adk.dev/evaluate/) — エージェントの軌跡と最終応答品質の自動評価ガイド
+* [Application Integration pricing](https://cloud.google.com/application-integration/pricing) — 連携の実行回数に応じた従量課金と無料枠

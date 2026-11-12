@@ -6,10 +6,18 @@ Cloud Run instance のインバウンド URL を完全に無効化（`--ingress 
 1. 静観（OBSERVE）および自動復旧（AUTO_REMEDIATE）の事後レポート通知（Block Kit）
 2. 未知障害・高リスク障害時の `[Approve]` / `[Reject]` ボタン送信と、押下者の権限検証
 3. 承認ボタン押下をトリガーとした ADK 2.x 中断セッションの再開（Resume）
+
+Slack を使えない環境向けの代替ルートもこのモジュールが担います。
+
+- Slack へ通知するのと同じ箇所から、通知メールも送ります（`email_notifier.py`）。
+- 承認・却下は承認コマンドから受け取り、Slack のボタンと同じ再開処理へ渡します（`approval_decisions.py`）。
+
+通知は送信先ごとに独立して送ります。通知の失敗はログへ記録するだけで、判定・復旧・承認の処理は止めません。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from dataclasses import dataclass
@@ -19,6 +27,14 @@ from slack_bolt.adapter.socket_mode.aiohttp import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
 from .config import AgentSettings
+from .email_notifier import (
+    ApplicationIntegrationEmailSender,
+    EmailSender,
+    NotificationEmail,
+    build_approval_request_email,
+    build_approval_result_email,
+    build_result_email,
+)
 from .models import RemediationOutcome
 from .ticket_store import (
     ApprovalTicketStore,
@@ -184,8 +200,27 @@ def build_approval_request_blocks(result: WorkflowRunResult) -> list[dict[str, A
     return blocks
 
 
+def _log_notification_failure(channel: str, stage: str, incident_id: str, exc: Exception) -> None:
+    """通知の失敗を構造化ログへ記録する（判定・復旧・承認の処理は止めない）。"""
+    sys.stdout.write(
+        json.dumps(
+            {
+                "severity": "ERROR",
+                "event": "notification_failed",
+                "channel": channel,
+                "stage": stage,
+                "incident_id": incident_id,
+                "message": f"通知の送信に失敗しました。判定と復旧の処理は続行します: {exc}",
+            },
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
+    sys.stdout.flush()
+
+
 class SlackHitlCoordinator:
-    """Slack 通知および Interactive 承認ボタンによる ADK ワークフロー再開コーディネーター。"""
+    """通知（Slack・メール）と、人の承認による ADK ワークフロー再開のコーディネーター。"""
 
     def __init__(
         self,
@@ -193,6 +228,7 @@ class SlackHitlCoordinator:
         orchestrator: SreIncidentOrchestrator,
         *,
         ticket_store: ApprovalTicketStore | None = None,
+        email_sender: EmailSender | None = None,
     ) -> None:
         self._settings = settings
         self._orchestrator = orchestrator
@@ -211,6 +247,14 @@ class SlackHitlCoordinator:
             self._register_bolt_handlers(self._bolt_app)
             self._socket_handler = AsyncSocketModeHandler(self._bolt_app, settings.slack_app_token)
 
+        self._email_sender: EmailSender | None
+        if email_sender is not None:
+            self._email_sender = email_sender
+        elif settings.email_integration_name:
+            self._email_sender = ApplicationIntegrationEmailSender(settings)
+        else:
+            self._email_sender = None
+
     @property
     def pending_tickets(self) -> dict[str, PendingApprovalTicket]:
         return dict(self._pending)
@@ -222,19 +266,18 @@ class SlackHitlCoordinator:
         return slack_user_id in self._settings.slack_allowed_approvers
 
     async def notify_workflow_result(self, result: WorkflowRunResult) -> None:
-        """ワークフロー結果を Slack へ通知する（承認待ちの場合は永続チケット保存後にボタン送信）。"""
-        blocks = (
-            build_approval_request_blocks(result)
-            if result.paused_for_approval
-            else build_report_blocks(result)
-        )
-        fallback_text = f"[{result.alert.incident_id}] SRE Agent Decision: {result.decision.decision}"
+        """ワークフロー結果を Slack とメールへ通知する（承認待ちの場合は先に永続チケットを保存する）。
+
+        通知は送信先ごとに独立して送る。片方が失敗してももう片方は送り、失敗はログへ記録するだけにする。
+        判定と復旧はこの時点で完了しているため、通知の失敗を理由にやり直させない。
+        """
+        incident_id = result.alert.incident_id
 
         stored_ticket: StoredApprovalTicket | None = None
         if result.paused_for_approval and result.confirmation_call_id:
-            # Slack ボタン押下と保存のレースを防ぐため、メッセージ送信前に永続化しておく
+            # 承認操作と保存のレースを防ぐため、通知を送る前に永続化しておく
             stored_ticket = StoredApprovalTicket(
-                incident_id=result.alert.incident_id,
+                incident_id=incident_id,
                 alert=result.alert,
                 decision=result.decision,
                 session_id=result.session_id,
@@ -242,32 +285,31 @@ class SlackHitlCoordinator:
                 confirmation_call_id=result.confirmation_call_id,
             )
             await self._ticket_store.save_ticket(stored_ticket)
-            self._pending[result.alert.incident_id] = PendingApprovalTicket(run_result=result)
+            self._pending[incident_id] = PendingApprovalTicket(run_result=result)
 
-        if self._bolt_app and self._settings.slack_channel_id:
-            resp = await self._bolt_app.client.chat_postMessage(
-                channel=self._settings.slack_channel_id,
-                text=fallback_text,
-                blocks=blocks,
+        slack_enabled = bool(self._bolt_app and self._settings.slack_channel_id)
+        if slack_enabled:
+            try:
+                await self._post_to_slack(result, stored_ticket)
+            except Exception as exc:  # noqa: BLE001
+                _log_notification_failure("slack", "post", incident_id, exc)
+
+        if self._email_sender is not None:
+            email = (
+                build_approval_request_email(result.alert, result.decision)
+                if result.paused_for_approval
+                else build_result_email(result.alert, result.decision, result.outcome)
             )
-            if stored_ticket is not None:
-                channel_id = str(resp["channel"])
-                message_ts = str(resp["ts"])
-                updated_ticket = stored_ticket.model_copy(
-                    update={"channel_id": channel_id, "message_ts": message_ts}
-                )
-                await self._ticket_store.save_ticket(updated_ticket)
-                if result.alert.incident_id in self._pending:
-                    self._pending[result.alert.incident_id].channel_id = channel_id
-                    self._pending[result.alert.incident_id].message_ts = message_ts
-        else:
-            # Slack 未設定環境（ローカル検証等）では構造化ログとして出力
+            await self._send_email(email, incident_id, "post")
+
+        if not slack_enabled and self._email_sender is None:
+            # 通知先が未設定の環境（ローカル検証等）では構造化ログとして出力
             sys.stdout.write(
                 json.dumps(
                     {
                         "severity": "INFO",
                         "event": "slack_notification_fallback",
-                        "incident_id": result.alert.incident_id,
+                        "incident_id": incident_id,
                         "paused_for_approval": result.paused_for_approval,
                         "decision": result.decision.model_dump(),
                         "outcome": result.outcome.model_dump() if result.outcome else None,
@@ -278,6 +320,60 @@ class SlackHitlCoordinator:
             )
             sys.stdout.flush()
 
+    async def _post_to_slack(self, result: WorkflowRunResult, stored_ticket: StoredApprovalTicket | None) -> None:
+        """Slack へ通知カードを投稿し、承認待ちの場合は投稿先をチケットへ記録する。"""
+        assert self._bolt_app is not None
+        blocks = (
+            build_approval_request_blocks(result)
+            if result.paused_for_approval
+            else build_report_blocks(result)
+        )
+        resp = await self._bolt_app.client.chat_postMessage(
+            channel=self._settings.slack_channel_id,
+            text=f"[{result.alert.incident_id}] SRE Agent Decision: {result.decision.decision}",
+            blocks=blocks,
+        )
+        if stored_ticket is not None:
+            channel_id = str(resp["channel"])
+            message_ts = str(resp["ts"])
+            updated_ticket = stored_ticket.model_copy(
+                update={"channel_id": channel_id, "message_ts": message_ts}
+            )
+            await self._ticket_store.save_ticket(updated_ticket)
+            if result.alert.incident_id in self._pending:
+                self._pending[result.alert.incident_id].channel_id = channel_id
+                self._pending[result.alert.incident_id].message_ts = message_ts
+
+    async def _send_email(self, email: NotificationEmail, incident_id: str, stage: str) -> None:
+        """通知メールを送る。未設定なら何もしない。失敗はログへ記録して処理を続ける。"""
+        if self._email_sender is None:
+            return
+        try:
+            await asyncio.to_thread(self._email_sender.send, email)
+        except Exception as exc:  # noqa: BLE001
+            _log_notification_failure("email", stage, incident_id, exc)
+
+    async def _update_slack_card(
+        self,
+        ticket: StoredApprovalTicket,
+        *,
+        text: str,
+        blocks: list[dict[str, Any]],
+        stage: str,
+    ) -> None:
+        """Slack の通知カードを書き換える。投稿先がなければ何もしない。失敗はログへ記録して処理を続ける。"""
+        if not (self._bolt_app and ticket.channel_id and ticket.message_ts):
+            return
+        try:
+            await self._bolt_app.client.chat_update(
+                channel=ticket.channel_id,
+                ts=ticket.message_ts,
+                text=text,
+                blocks=blocks,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log_notification_failure("slack", stage, ticket.incident_id, exc)
+
     async def process_approval_decision(
         self,
         *,
@@ -285,56 +381,90 @@ class SlackHitlCoordinator:
         slack_user_id: str,
         approved: bool,
     ) -> RemediationOutcome:
-        """ボタン押下イベントを検証し、永続チケットと中断 ADK セッションから処理を再開する。"""
+        """Slack のボタン押下を検証し、永続チケットと中断 ADK セッションから処理を再開する。"""
         if not self.is_user_authorized(slack_user_id):
             raise PermissionError(
                 f"Slack ユーザー '{slack_user_id}' は承認許可リストに含まれていないため操作を拒否しました。"
             )
+        return await self._resolve_approval(
+            incident_id=incident_id,
+            approver_id=slack_user_id,
+            approver_label=f"<@{slack_user_id}>",
+            approved=approved,
+        )
 
+    async def process_command_decision(
+        self,
+        *,
+        incident_id: str,
+        approver: str,
+        approved: bool,
+    ) -> RemediationOutcome:
+        """承認コマンドからの承認・却下で、永続チケットと中断 ADK セッションから処理を再開する。
+
+        承認できるのは承認専用トピックへの発行権限を持つ主体。approver は自己申告のため、
+        監査記録と通知の表示にだけ使い、権限の判定には使わない。
+        """
+        return await self._resolve_approval(
+            incident_id=incident_id,
+            approver_id=approver,
+            approver_label=approver,
+            approved=approved,
+        )
+
+    async def _resolve_approval(
+        self,
+        *,
+        incident_id: str,
+        approver_id: str,
+        approver_label: str,
+        approved: bool,
+    ) -> RemediationOutcome:
+        """承認・却下の共通処理。チケットは 1 回だけ取得でき、二重の承認は KeyError で拒否する。"""
         ticket = await self._ticket_store.claim_ticket(incident_id)
         if ticket is None or not ticket.confirmation_call_id:
             raise KeyError(f"incident_id='{incident_id}' の承認待ちセッションが存在しないか、既に処理済みです。")
 
         self._pending.pop(incident_id, None)
 
-        # ボタン押下直後（< 0.5秒）にボタンを消去して「承認受付・実行中...」へ即時更新し、二度押しと待機不安を防ぐ
-        if self._bolt_app and ticket.channel_id and ticket.message_ts:
-            if approved:
-                progress_label = "⏳ 承認受付・実行中..."
-                if ticket.decision.remediation_type in ("ROLLBACK_DEPLOYMENT", "RESTART_DEPLOYMENT"):
-                    progress_detail = (
-                        f"`{ticket.decision.remediation_type}` の実行と事後エラー率プローブ検証を行っています"
-                        "（完了まで約 30〜45 秒かかります。完了次第このカードが自動更新されます）..."
-                    )
-                else:
-                    progress_detail = "オンコール引き継ぎの監査記録と Runbook 鮮度更新を実行しています..."
+        # 承認の受付直後にボタンを消去して「承認受付・実行中...」へ更新し、二度押しと待機不安を防ぐ。
+        # 書き換えに失敗しても、承認された処理は続行する。
+        if approved:
+            progress_label = "⏳ 承認受付・実行中..."
+            if ticket.decision.remediation_type in ("ROLLBACK_DEPLOYMENT", "RESTART_DEPLOYMENT"):
+                progress_detail = (
+                    f"`{ticket.decision.remediation_type}` の実行と事後エラー率プローブ検証を行っています"
+                    "（完了まで約 30〜45 秒かかります。完了次第このカードが自動更新されます）..."
+                )
             else:
-                progress_label = "⏳ 却下受付・手動対応へ切替中..."
-                progress_detail = "自動処置を中止し、監査ログおよび知識ベースの更新を実行しています..."
+                progress_detail = "オンコール引き継ぎの監査記録と Runbook 鮮度更新を実行しています..."
+        else:
+            progress_label = "⏳ 却下受付・手動対応へ切替中..."
+            progress_detail = "自動処置を中止し、監査ログおよび知識ベースの更新を実行しています..."
 
-            await self._bolt_app.client.chat_update(
-                channel=ticket.channel_id,
-                ts=ticket.message_ts,
-                text=f"[{incident_id}] {progress_label} by <@{slack_user_id}>",
-                blocks=[
-                    {
-                        "type": "header",
-                        "text": {"type": "plain_text", "text": f"SRE Agent Report [{incident_id}]"},
+        await self._update_slack_card(
+            ticket,
+            text=f"[{incident_id}] {progress_label} by {approver_label}",
+            blocks=[
+                {
+                    "type": "header",
+                    "text": {"type": "plain_text", "text": f"SRE Agent Report [{incident_id}]"},
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"*{progress_label}* (操作者: {approver_label})\n"
+                            f"*対象:* `{ticket.decision.target_namespace}/{ticket.decision.target_deployment}`  |  "
+                            f"*操作種別:* `{ticket.decision.remediation_type}`\n"
+                            f"*進行状況:* {progress_detail}"
+                        ),
                     },
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": (
-                                f"*{progress_label}* (操作者: <@{slack_user_id}>)\n"
-                                f"*対象:* `{ticket.decision.target_namespace}/{ticket.decision.target_deployment}`  |  "
-                                f"*操作種別:* `{ticket.decision.remediation_type}`\n"
-                                f"*進行状況:* {progress_detail}"
-                            ),
-                        },
-                    },
-                ],
-            )
+                },
+            ],
+            stage="progress",
+        )
 
         try:
             outcome = await self._orchestrator.resume_from_approval(
@@ -344,89 +474,106 @@ class SlackHitlCoordinator:
                 invocation_id=ticket.invocation_id,
                 confirmation_call_id=ticket.confirmation_call_id,
                 approved=approved,
-                approver_id=slack_user_id,
+                approver_id=approver_id,
+                approver_label=approver_label,
             )
         except Exception as exc:
+            # 自動では再試行しない。承認待ちへ戻し、人がもう一度判断できるように知らせる
             await self._ticket_store.release_ticket(incident_id)
-            if self._bolt_app and ticket.channel_id and ticket.message_ts:
-                restore_blocks = build_approval_request_blocks(
-                    WorkflowRunResult(
-                        alert=ticket.alert,
-                        session_id=ticket.session_id,
-                        invocation_id=ticket.invocation_id,
-                        decision=ticket.decision,
-                        paused_for_approval=True,
-                        confirmation_call_id=ticket.confirmation_call_id,
-                        outcome=RemediationOutcome(
-                            executed=False,
-                            action_status="AWAITING_APPROVAL",
-                            detail_message=f"⚠️ 再開処理中に一時エラーが発生したため承認待ち状態へ戻しました: {exc}",
-                        ),
-                    )
+            restore_blocks = build_approval_request_blocks(
+                WorkflowRunResult(
+                    alert=ticket.alert,
+                    session_id=ticket.session_id,
+                    invocation_id=ticket.invocation_id,
+                    decision=ticket.decision,
+                    paused_for_approval=True,
+                    confirmation_call_id=ticket.confirmation_call_id,
+                    outcome=RemediationOutcome(
+                        executed=False,
+                        action_status="AWAITING_APPROVAL",
+                        detail_message=f"⚠️ 再開処理中に一時エラーが発生したため承認待ち状態へ戻しました: {exc}",
+                    ),
                 )
-                await self._bolt_app.client.chat_update(
-                    channel=ticket.channel_id,
-                    ts=ticket.message_ts,
-                    text=f"[{incident_id}] 承認待ち状態へ復元しました",
-                    blocks=restore_blocks,
-                )
+            )
+            await self._update_slack_card(
+                ticket,
+                text=f"[{incident_id}] 承認待ち状態へ復元しました",
+                blocks=restore_blocks,
+                stage="restore",
+            )
+            await self._send_email(
+                build_approval_request_email(ticket.alert, ticket.decision, retry_reason=str(exc)),
+                incident_id,
+                "restore",
+            )
             raise
 
         await self._ticket_store.delete_ticket(incident_id)
 
-        if self._bolt_app and ticket.channel_id and ticket.message_ts:
-            action_label = "✅ 承認・実行完了" if approved else "🛑 却下・手動対応へ移行"
-            kb_note = (
-                f"\n📚 *自律ナレッジ登録:* `{outcome.learned_runbook_id}` を BigQuery `incident_runbooks` へ追加しました"
-                f"（AI.EMBED 自動ベクトル化・次回推奨: `{outcome.learned_recommended_action}`）"
-                if outcome.learned_runbook_id
-                else ""
-            )
-            refresh_note = (
-                f"\n🔄 *Runbook 鮮度更新:* `{outcome.refreshed_runbook_id}` の `last_verified_at` を現在時刻へ更新しました"
-                f"（今後 {self._settings.runbook_freshness_ttl_days} 日間有効）"
-                if outcome.refreshed_runbook_id
-                else ""
-            )
-            demote_note = (
-                f"\n🔒 *自動実行凍結:* `{outcome.demoted_runbook_id}` の推奨区分を `REQUIRE_APPROVAL` へ降格しました"
-                "（今後の無断自動実行を抑止）"
-                if outcome.demoted_runbook_id
-                else ""
-            )
-            slo_gauge_suffix = (
-                f" / 日次99.0%残量 `{outcome.slo_daily_budget_remaining_pct:.1f}%`"
-                if outcome.slo_daily_budget_remaining_pct is not None
-                else ""
-            )
-            slo_note = (
-                f"\n📊 *SLO & Error Budget 効果:* {outcome.slo_impact_summary}{slo_gauge_suffix}"
-                if outcome.slo_impact_summary
-                else ""
-            )
-            await self._bolt_app.client.chat_update(
-                channel=ticket.channel_id,
-                ts=ticket.message_ts,
-                text=f"[{incident_id}] {action_label} by <@{slack_user_id}>",
-                blocks=[
-                    {
-                        "type": "header",
-                        "text": {"type": "plain_text", "text": f"SRE Agent Report [{incident_id}]"},
+        action_label = "✅ 承認・実行完了" if approved else "🛑 却下・手動対応へ移行"
+        kb_note = (
+            f"\n📚 *自律ナレッジ登録:* `{outcome.learned_runbook_id}` を BigQuery `incident_runbooks` へ追加しました"
+            f"（AI.EMBED 自動ベクトル化・次回推奨: `{outcome.learned_recommended_action}`）"
+            if outcome.learned_runbook_id
+            else ""
+        )
+        refresh_note = (
+            f"\n🔄 *Runbook 鮮度更新:* `{outcome.refreshed_runbook_id}` の `last_verified_at` を現在時刻へ更新しました"
+            f"（今後 {self._settings.runbook_freshness_ttl_days} 日間有効）"
+            if outcome.refreshed_runbook_id
+            else ""
+        )
+        demote_note = (
+            f"\n🔒 *自動実行凍結:* `{outcome.demoted_runbook_id}` の推奨区分を `REQUIRE_APPROVAL` へ降格しました"
+            "（今後の無断自動実行を抑止）"
+            if outcome.demoted_runbook_id
+            else ""
+        )
+        slo_gauge_suffix = (
+            f" / 日次99.0%残量 `{outcome.slo_daily_budget_remaining_pct:.1f}%`"
+            if outcome.slo_daily_budget_remaining_pct is not None
+            else ""
+        )
+        slo_note = (
+            f"\n📊 *SLO & Error Budget 効果:* {outcome.slo_impact_summary}{slo_gauge_suffix}"
+            if outcome.slo_impact_summary
+            else ""
+        )
+        # 処置と記録は完了しているため、結果の通知に失敗しても成功として返す
+        await self._update_slack_card(
+            ticket,
+            text=f"[{incident_id}] {action_label} by {approver_label}",
+            blocks=[
+                {
+                    "type": "header",
+                    "text": {"type": "plain_text", "text": f"SRE Agent Report [{incident_id}]"},
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"*{action_label}* (操作者: {approver_label})\n"
+                            f"*対象:* `{ticket.decision.target_namespace}/{ticket.decision.target_deployment}`\n"
+                            f"*結果:* {outcome.detail_message}"
+                            f"{slo_note}{kb_note}{refresh_note}{demote_note}"
+                        ),
                     },
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": (
-                                f"*{action_label}* (操作者: <@{slack_user_id}>)\n"
-                                f"*対象:* `{ticket.decision.target_namespace}/{ticket.decision.target_deployment}`\n"
-                                f"*結果:* {outcome.detail_message}"
-                                f"{slo_note}{kb_note}{refresh_note}{demote_note}"
-                            ),
-                        },
-                    },
-                ],
-            )
+                },
+            ],
+            stage="result",
+        )
+        await self._send_email(
+            build_approval_result_email(
+                ticket.alert,
+                ticket.decision,
+                outcome,
+                approved=approved,
+                approver=approver_id,
+            ),
+            incident_id,
+            "result",
+        )
         return outcome
 
     def _register_bolt_handlers(self, app: AsyncApp) -> None:

@@ -6,7 +6,7 @@ Cloud Logging / Cloud Monitoring のイベントストリームを 24 時間常�
 
 ## 1. 全体アーキテクチャと設計の特徴
 
-監視対象の GKE クラスタが障害に陥っても監視エージェントが共倒れしないよう、エージェント本体は別基盤の **Cloud Run instances（＋ Cloud Run sandboxes）** 上で常駐稼働させます（Out-of-Band 監視）。外部からの着信 URL を完全に無効化（`--ingress internal --no-default-url`）したまま、外向き通信のみで Pub/Sub 購読と双方向 Slack 承認を実現します。
+監視対象の GKE クラスタが障害に陥っても監視エージェントが共倒れしないよう、エージェント本体は別基盤の **Cloud Run instances（＋ Cloud Run sandboxes）** 上で常駐稼働させます（Out-of-Band 監視）。外部からの着信 URL を完全に無効化（`--ingress internal --no-default-url`）したまま、外向き通信のみで Pub/Sub 購読と双方向 Slack 承認を実現します。Slack を使えない場合は、メール通知と承認コマンドの代替ルートを選べます。
 
 ![常駐自律型 SRE エージェント 全体アーキテクチャ構成図](docs/images/00-overall-architecture.png)
 
@@ -72,7 +72,7 @@ flowchart LR
 | **常時監視コスト** | 毎分 LLM に生ログを送りトークン費用が増大する | Log Sink で異常時のみ Pub/Sub 発火し、15 分クールダウン重複排除で同一障害の連続呼び出しを遮断 |
 | **一過性エラー対応** | 通信瞬断でも毎回 Pod を再起動し、再接続ストームで悪化させる | 隔離サンドボックスでエラー率の減衰傾きを計算し、過去事例と照合して**「静観（OBSERVE）」**を自律選択 |
 | **変更操作の安全性** | LLM に自由な `kubectl` シェル文字列を生成させ破壊リスクがある | 読取は公式リモート MCP（Read-Only）、変更は許可 Namespace・1 時間 1 回上限・事後回復検証付きの型付き関数に限定 |
-| **承認連携と再開耐性** | Webhook 受信用に公開 URL が必要で、再起動時に承認待ち状態が消える | **Slack Socket Mode** で外向き接続し、ボタン押下直後に実行中表示へ即時更新。状態は **Firestore** に永続化して再起動後も再開可能 |
+| **承認連携と再開耐性** | Webhook 受信用に公開 URL が必要で、再起動時に承認待ち状態が消える | **Slack Socket Mode** で外向き接続し、ボタン押下直後に実行中表示へ即時更新。状態は **Firestore** に永続化して再起動後も再開可能。Slack を使えない場合は、メール通知と承認コマンドで同じ再開処理を使用 |
 | **ナレッジ蓄積と鮮度管理** | 初期データ検索止まり、または古い手順が無検証で自動実行され続ける | 承認解決済みの初見障害を **`AI.EMBED` 自動埋め込み列**へ登録して次回自動復旧へ昇格。**90 日未検証の手順は人間再承認へ自動降格**し、却下・未回復手順は即凍結 |
 | **導入効果の定量評価** | 「便利になった」という定性評価止まりで信頼性への貢献が測れない | **Cloud Monitoring Service Monitoring SLO**（日次 99.0%・月次 99.9%）を構築し、訓練前後の実測バジェット消費と**自動復旧で温存した Error Budget 分数**を可視化 |
 
@@ -92,7 +92,7 @@ flowchart LR
 | **01** | [01-target-gke-and-alerting.md](docs/01-target-gke-and-alerting.md) | 40 分 | 監視対象 GKE・定常トラフィック Pod、最小権限 RBAC、Log Sink → Pub/Sub、**可用性 SLO 構築** |
 | **02** | [02-bigquery-vector-kb.md](docs/02-bigquery-vector-kb.md) | 30 分 | BigQuery `AI.EMBED` 自動埋め込みテーブル作成、過去インシデント **100 件** 投入、`AI.SEARCH` 検証 |
 | **03** | [03-diagnostic-agent-and-sandbox.md](docs/03-diagnostic-agent-and-sandbox.md) | 35 分 | 公式リモート MCP 厳選接続と、Cloud Run sandboxes（`sandbox do`）による隔離統計解析 |
-| **04** | [04-auto-remediation-and-slack-hitl.md](docs/04-auto-remediation-and-slack-hitl.md) | 45 分 | ADK 2.x グラフ制御、型付き復旧、Slack Socket Mode 連携、鮮度管理、**Saved Error Budget 算出** |
+| **04** | [04-auto-remediation-and-slack-hitl.md](docs/04-auto-remediation-and-slack-hitl.md) | 45 分 | ADK 2.x グラフ制御、型付き復旧、Slack Socket Mode 連携、メール通知と承認コマンドの代替ルート、鮮度管理、**Saved Error Budget 算出** |
 | **05** | [05-deploy-cloud-run-instance-and-drills.md](docs/05-deploy-cloud-run-instance-and-drills.md) | 50 分 | 閉域 Cloud Run instance 常駐デプロイ、**4 大障害訓練・自己学習検証・訓練前後の Error Budget 比較** |
 | **06** | [06-optional-hardening-and-cleanup.md](docs/06-optional-hardening-and-cleanup.md) | 20 分 | 【任意】GKE Sandbox（`microVM`）、Model Armor ログ防御、`pass^3` 評価ゲート、クリーンアップ手順 |
 
@@ -100,7 +100,7 @@ flowchart LR
 
 ## 3. ローカル環境でのクイックテスト（クラウド課金 \$0）
 
-Google Cloud へデプロイする前に、手元の Python 3.11+ 仮想環境で重複排除・サンドボックス隔離・100 件検索・ADK 2.x 3 分岐・Slack 再開・鮮度管理・Error Budget 温存計算の全 26 テストを実行できます。
+Google Cloud へデプロイする前に、手元の Python 3.11+ 仮想環境で重複排除・サンドボックス隔離・100 件検索・ADK 2.x 3 分岐・Slack 再開・鮮度管理・Error Budget 温存計算・メール通知と承認コマンドの全 51 テストを実行できます。
 
 ```bash
 python3 -m venv .venv
@@ -123,6 +123,7 @@ pytest -v
 | **② 1 ヶ月放置（未削除）** | 削除せず 730 時間稼働させたまま放置 | **約 \$115 / 月** | GKE クラスタ管理手数料（\$73.00）＋ GKE Autopilot Pod 群（\$25.60）＋ 常駐 Cloud Run instance 1 台（\$11.56）＋ Cloud NAT 待機（約 \$4.00）＋ Artifact Registry・Secret Manager・ログメトリクス（約 \$0.40）。平時の Pub/Sub・Gemini 推論は \$0.00 |
 
 * **無料枠に関する補足**: 上記はすべて無料枠控除前のオンデマンド定価です。請求先アカウントで 1 台目の GKE Autopilot クラスタ管理手数料の無料枠や Cloud Logging 月 50 GiB 無料枠が残っている環境では自動割引され、①通常実施時は **約 \$0.32〜\$0.42**、②1 ヶ月放置時は **約 \$38 / 月** となります。
+* **代替ルートのメール通知に関する補足**: 通知メールは Application Integration の連携の実行として課金され、定価は実行 1,000 回あたり \$0.50 です。訓練 1 周で送る 9 通は \$0.01 未満のため、上表の概算には含めていません。無料枠は月 400 回までです。
 * **環境を残して待機課金だけ抑える方法**: 数日後に再デモする場合は `gcloud beta run instances stop` と `kubectl scale deployment order-service order-traffic-generator -n sre-demo-app --replicas=0` でコンテナ稼働課金を停止できます。GKE クラスタ管理手数料（\$0.10/時間）まで止める場合はクラスタを削除してください。
 
 ### B. 本番システムへ導入・常時運用した際の月額増分コスト目安（規模別 3 パターン）
@@ -149,11 +150,11 @@ pytest -v
 ├── pyproject.toml                   # Python パッケージ・テスト設定
 ├── target-app/                      # 監視対象 GKE アプリ・定常負荷マニフェスト・障害注入 & SLO 管理スクリプト
 │   ├── k8s/                         # namespace / order-service (v1, v2-buggy) / traffic-generator
-│   └── scripts/                     # 4種障害注入・リセット・setup_slo_monitoring.py・check_slo_budget.py
+│   └── scripts/                     # 4種障害注入・リセット・SLO 管理・通知メール設定・承認コマンド
 ├── bigquery/                        # BigQuery AI.EMBED 自動埋め込み DDL・初期シード 100 件 JSONL
 ├── sre-agent/                       # Cloud Run instances 常駐エージェント本体 (ADK 2.x + SLO 効果計測)
 ├── appendix/                        # 付録: GKE Standard microVM / Model Armor / pass^3 評価スクリプト
-├── tests/                           # ローカル自動テストスイート (全 26 件)
+├── tests/                           # ローカル自動テストスイート (全 51 件)
 └── docs/                            # 全 7 章のステップバイステップ Codelab 教材 & 高精細構成図
 ```
 
@@ -167,3 +168,4 @@ pytest -v
 * [Concepts in service monitoring (Cloud Monitoring)](https://docs.cloud.google.com/stackdriver/docs/solutions/slo-monitoring) — SLI・SLO・Error Budget と Windows-based / Request-based SLO の設計指針
 * [Use the GKE, Cloud Monitoring, and Cloud Logging MCP servers](https://docs.cloud.google.com/mcp/overview) — Google Cloud 公式リモート MCP サーバーの概要と IAM 設定
 * [Agent Development Kit (ADK) Documentation](https://adk.dev/) — ADK Python 2.x のグラフワークフローと Human-in-the-Loop 仕様
+* [Send Email task (Application Integration)](https://docs.cloud.google.com/application-integration/docs/configure-send-email-task) — 代替ルートの通知メールを送るメール送信タスクの仕様

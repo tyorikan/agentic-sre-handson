@@ -4,7 +4,9 @@
 #   - sandboxLauncher: true によりコンテナ内から /usr/local/gcp/bin/sandbox を起動可能
 #   - run.googleapis.com/ingress: internal と default-url-disabled: 'true' の併用により
 #     外部からの着信エンドポイントを完全に遮断（攻撃対象面ゼロ）
-#   - Pub/Sub StreamingPull と Slack Socket Mode はどちらも外向き TLS 接続のためそのまま動作
+#   - Pub/Sub StreamingPull・Slack Socket Mode・通知メールの送信はすべて外向き TLS 接続のためそのまま動作
+#   - Slack を使わずメール通知と承認コマンドで運用する場合は、SLACK_ で始まる 3 項目を削除し、
+#     EMAIL_NOTIFY_INTEGRATION と APPROVAL_PUBSUB_SUBSCRIPTION に値を設定
 # 注意:
 #   Cloud Run instances は us-central1 / us-east1 / europe-west1 では非対応のため、
 #   asia-northeast1（東京）等の対応リージョンへデプロイしてください。
@@ -83,6 +85,11 @@ spec:
           value: "adk-session"
         - name: FIRESTORE_TICKETS_COLLECTION
           value: "sre_pending_approval_tickets"
+        # Slack を使えない場合の代替ルート（空のままなら無効。Slack と併用も可能）
+        - name: EMAIL_NOTIFY_INTEGRATION
+          value: ""
+        - name: APPROVAL_PUBSUB_SUBSCRIPTION
+          value: ""
         - name: SLACK_ALERT_CHANNEL_ID
           value: "YOUR_SLACK_CHANNEL_ID"
         - name: SLACK_BOT_TOKEN
