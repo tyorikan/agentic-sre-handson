@@ -6,7 +6,7 @@ ADK 2.x の `Workflow` / `JoinNode` / `@node(require_confirmation=True)` で制�
 グラフ構造:
   START
     ├──> [analyze_metrics_in_sandbox]  (Cloud Run sandbox 内でエラー率の減衰傾きを計算)
-    └──> [search_similar_incidents]    (BigQuery VECTOR_SEARCH で過去障害 100 件を照合)
+    └──> [search_similar_incidents]    (BigQuery AI.SEARCH で AI.EMBED 自動埋め込み過去事例を照合)
             │
             ▼
        [JoinNode: join_diagnostics]

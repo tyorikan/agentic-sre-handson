@@ -38,16 +38,15 @@ spec:
       nodeSelector:
         cloud.google.com/compute-class: sandbox-microvm-class
       runtimeClassName: microvm
+      # GKE Sandbox (microVM) はハイパーバイザ境界で隔離され、ホスト側 Linux セキュリティモジュール
+      # (seccomp / no-new-privileges) は GKE Sandbox Pod では非サポートのため指定しません。
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
-        seccompProfile:
-          type: RuntimeDefault
       containers:
         - name: sre-agent
           image: SRE_AGENT_IMAGE_URI:latest
           securityContext:
-            allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
           # microVM は Pod あたり約 250m CPU / 130MiB メモリの固定オーバーヘッドを伴うため余裕を持って設定
@@ -71,6 +70,8 @@ spec:
               value: "gemini-3.8-flash"
             - name: SRE_EMBEDDING_MODEL
               value: "gemini-embedding-2"
+            - name: ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS
+              value: "false"
             - name: ALERT_PUBSUB_SUBSCRIPTION
               value: "sre-alert-stream-sub"
             - name: BQ_DATASET
@@ -81,6 +82,8 @@ spec:
               value: "true"
             - name: RUNBOOK_FRESHNESS_TTL_DAYS
               value: "90"
+            - name: ALLOW_DRILL_COOLDOWN_RESET
+              value: "false"
             - name: GKE_CLUSTER_NAME
               value: "sre-demo-cluster"
             - name: GKE_CLUSTER_LOCATION
@@ -110,3 +113,5 @@ spec:
               value: ""
             - name: SLACK_ALERT_CHANNEL_ID
               value: "YOUR_SLACK_CHANNEL_ID"
+            - name: SLACK_ALLOWED_APPROVER_IDS
+              value: ""

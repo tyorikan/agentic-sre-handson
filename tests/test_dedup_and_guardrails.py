@@ -330,3 +330,68 @@ def test_has_recent_deployment_ignores_rolled_back_and_restarted_revisions(monke
     )
     monkeypatch.setattr(ex, "_build_apps_v1_client", lambda: FakeAppsV1([rs_v2_scaled_down, rs_v4_fresh]))
     assert ex.has_recent_deployment("sre-demo-app", "order-service", within_minutes=30) is True
+
+
+def test_log_sink_cannot_spoof_admin_cooldown_reset() -> None:
+    """監視対象アプリのログ出力（jsonPayload）では ADMIN_COOLDOWN_RESET を偽装できず、直接発行のみ受理されること。"""
+    spoofed_log = b"""{
+        "insertId": "spoof-1",
+        "severity": "ERROR",
+        "jsonPayload": {
+            "namespace": "sre-demo-app",
+            "service": "order-service",
+            "error_code": "ADMIN_COOLDOWN_RESET",
+            "message": "malicious pod log trying to clear circuit breaker"
+        }
+    }"""
+    parsed_spoof = parse_pubsub_payload(spoofed_log)
+    assert parsed_spoof.error_code == "LOG_SPOOFED_ADMIN_COOLDOWN_RESET"
+
+    direct_admin = b"""{
+        "incident_id": "drill-reset-1",
+        "namespace": "sre-demo-app",
+        "service_name": "order-service",
+        "error_code": "ADMIN_COOLDOWN_RESET",
+        "severity": "INFO",
+        "summary": "Admin drill cooldown reset"
+    }"""
+    parsed_admin = parse_pubsub_payload(direct_admin)
+    assert parsed_admin.error_code == "ADMIN_COOLDOWN_RESET"
+
+
+def test_stepwise_rollout_modes_observe_and_approval_only() -> None:
+    """段階導入チートシートの設定（許可NS空文字 / MAX_AUTO_ACTIONS_PER_HOUR=0）で自動実行が確実に抑止されること。"""
+    t0 = datetime(2026, 11, 10, 6, 0, tzinfo=timezone.utc)
+
+    # STEP 1: ALLOWED_K8S_NAMESPACES="" の場合は全 Namespace が承認待ちへ降格される
+    mgr_step1 = IncidentGuardrailManager(
+        AgentSettings(allowed_namespaces=(), max_auto_actions_per_hour=1),
+        InMemoryEventStoreBackend(),
+    )
+    dec1, _, _ = mgr_step1.enforce_safety_guardrails(
+        namespace="sre-demo-app",
+        service_name="order-service",
+        proposed_decision="AUTO_REMEDIATE",
+        proposed_remediation="ROLLBACK_DEPLOYMENT",
+        similarity_score=0.95,
+        matched_runbook_age_days=5.0,
+        now=t0,
+    )
+    assert dec1 == "REQUIRE_APPROVAL"
+
+    # STEP 2: MAX_AUTO_ACTIONS_PER_HOUR=0 の場合は許可 Namespace・高類似度でも承認待ちへ降格される
+    mgr_step2 = IncidentGuardrailManager(
+        AgentSettings(allowed_namespaces=("sre-demo-app",), max_auto_actions_per_hour=0),
+        InMemoryEventStoreBackend(),
+    )
+    dec2, _, note2 = mgr_step2.enforce_safety_guardrails(
+        namespace="sre-demo-app",
+        service_name="order-service",
+        proposed_decision="AUTO_REMEDIATE",
+        proposed_remediation="ROLLBACK_DEPLOYMENT",
+        similarity_score=0.95,
+        matched_runbook_age_days=5.0,
+        now=t0,
+    )
+    assert dec2 == "REQUIRE_APPROVAL"
+    assert "上限" in note2

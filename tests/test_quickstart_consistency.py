@@ -263,11 +263,10 @@ def test_cleanup_removes_everything_the_full_course_cleanup_removes() -> None:
     documented = _removal_kinds(_doc_commands(DOC_CLEANUP))
     scripted = _removal_kinds(_script("cleanup.sh"))
 
-    assert len(documented) == 16
+    assert len(documented) == 17
     # Slack のシークレットはクイックスタートでは作らないため、削除もしない
     assert documented - scripted == {"gcloud secrets delete"}
-    # 第 6 章に無いのは、GKE が VPC に残すことがあるファイアウォール ルールの削除だけ
-    assert scripted - documented == {"gcloud compute firewall-rules delete"}
+    assert scripted - documented == set()
 
 
 def test_cleanup_removes_everything_setup_and_deploy_create() -> None:

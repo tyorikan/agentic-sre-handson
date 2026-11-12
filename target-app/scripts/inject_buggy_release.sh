@@ -11,7 +11,7 @@ NAMESPACE="${NAMESPACE:-sre-demo-app}"
 SERVICE="${SERVICE:-order-service}"
 
 if [[ -z "${TARGET_APP_IMAGE_URI:-}" ]]; then
-  echo "エラー: 環境変数 TARGET_APP_IMAGE_URI を設定してください（例: asia-northeast1-docker.pkg.dev/<PROJECT>/sre-handson/order-service）" >&2
+  echo "エラー: 環境変数 TARGET_APP_IMAGE_URI が未設定です。先に source ./quickstart/env.sh（フル版は source .env の後に TARGET_APP_IMAGE_URI を export）を実行してください。" >&2
   exit 1
 fi
 

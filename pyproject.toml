@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "agentic-sre-handson"
 version = "0.1.0"
-description = "常駐自律型 SRE エージェント ハンズオン実装（Cloud Run instances + sandboxes / GKE / BigQuery Vector Search / ADK 2.x / Slack Socket Mode）"
+description = "常駐自律型 SRE エージェント ハンズオン実装（Cloud Run instances + sandboxes / GKE / BigQuery AI.EMBED & AI.SEARCH / ADK 2.x / Slack Socket Mode）"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"

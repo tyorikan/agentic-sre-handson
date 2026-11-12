@@ -1,7 +1,7 @@
 """監視対象サンプル注文マイクロサービス (Order API)。
 
 GKE クラスタ上で稼働し、構造化 JSON ログと HTTP ステータスメトリクスを出力します。
-ハンズオンの障害訓練用に、以下の 3 つの障害モードを環境変数または管理エンドポイントから再現できます。
+ハンズオンの障害訓練用に、以下の 4 つの障害モードを環境変数または管理エンドポイントから再現できます。
 
 1. TRANSIENT_NET_ERR: 下流決済ゲートウェイの一時的な通信瞬断（指定秒数後に自然回復）
 2. MISSING_CONFIG_BUG: v2 デプロイ時の必須設定キー（PAYMENT_CURRENCY_PRECISION）欠落バグ（ロールバックで解消）
@@ -26,7 +26,7 @@ app = FastAPI(title="Order Service (Agentic SRE Target App)", version=os.getenv(
 
 # 実行時障害注入ステート（Pod 単位で保持）
 _FAULT_STATE: dict[str, Any] = {
-    "mode": os.getenv("INITIAL_FAULT_MODE", "NONE"),  # NONE | TRANSIENT_NET_ERR | DB_POOL_EXHAUSTED
+    "mode": os.getenv("INITIAL_FAULT_MODE", "NONE"),  # NONE | TRANSIENT_NET_ERR | DB_POOL_EXHAUSTED | TAX_CACHE_CORRUPTION
     "expires_at": 0.0,
 }
 
@@ -86,7 +86,7 @@ class OrderRequest(BaseModel):
 class FaultInjectionRequest(BaseModel):
     """訓練用の障害注入リクエスト。"""
 
-    mode: str  # NONE | TRANSIENT_NET_ERR | DB_POOL_EXHAUSTED
+    mode: str  # NONE | TRANSIENT_NET_ERR | DB_POOL_EXHAUSTED | TAX_CACHE_CORRUPTION
     duration_seconds: int = 90
 
 

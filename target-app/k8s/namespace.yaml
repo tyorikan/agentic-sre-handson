@@ -23,7 +23,7 @@ rules:
     resources: ["pods", "events", "services"]
     verbs: ["get", "list", "watch"]
 ---
-# デプロイ手順（Module 1）で SRE_AGENT_SA_EMAIL と SA の OAuth2 Unique ID を置換して apply します
+# デプロイ手順（第 1 章）で SRE_AGENT_SA_EMAIL と SA の OAuth2 Unique ID を置換して apply します
 # 注意: Cloud Run / GCE メタデータサーバー経由のアクセストークンでは GKE API が SA の
 # メールアドレスではなく数値の uniqueId をユーザー名として認識する場合があるため両方をバインドします
 apiVersion: rbac.authorization.k8s.io/v1

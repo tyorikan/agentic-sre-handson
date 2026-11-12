@@ -150,8 +150,9 @@ cp .env.example .env
 source .env
 
 gcloud config set project "${GOOGLE_CLOUD_PROJECT}"
+export GOOGLE_CLOUD_QUOTA_PROJECT="${GOOGLE_CLOUD_PROJECT}"
 
-# ローカル端末で実施する場合のみ：Python 管理スクリプト（SLO 登録・通知メール設定・承認コマンド）用の認証情報を設定します（Cloud Shell では不要）
+# ローカル端末で実施する場合のみ：Python 管理スクリプト用のユーザ認証情報を設定します（Cloud Shell では不要）
 gcloud auth application-default login
 gcloud auth application-default set-quota-project "${GOOGLE_CLOUD_PROJECT}"
 ```

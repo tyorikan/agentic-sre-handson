@@ -98,6 +98,8 @@ LLM が `AUTO_REMEDIATE` を提案しても、`enforce_guardrails_and_route` が
 4. **Runbook 鮮度有効期限**: 最終検証日（`last_verified_at`）から `RUNBOOK_FRESHNESS_TTL_DAYS`（既定：`90` 日）を超過した手順は再評価のため降格。
 5. **1 時間あたり回数上限**: `MAX_AUTO_ACTIONS_PER_HOUR`（既定：`1` 回）を超える連続実行を遮断。
 
+下図は、条件 3 の型付き操作（`ROLLBACK_DEPLOYMENT` / `RESTART_DEPLOYMENT`）が提案された後の残り 4 条件の分岐と事後検証フローを示しています。
+
 ![安全ガードレールによる承認待機への自動降格条件と事後エラー率検証フロー図](images/04-03-guardrail-downgrade-and-probe.png)
 
 <details>
@@ -365,7 +367,7 @@ gcloud projects add-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
 
 * **リージョンの有効化**: 初回だけ行います。このとき Google Cloud が、サービス エージェントへのロール付与と `ExecuteConnection` という連携の作成を自動で行います。
 * **連携の登録と公開**: 登録済みの定義と同じなら何もしないため、再実行しても重複しません。宛先を変える場合は `NOTIFY_EMAIL_TO` を書き換えて再実行します。
-* **送信上限の表示**: メールの 1 日あたりの送信上限はプロジェクトによって異なります。訓練 1 周で送るメールは 9 通です。
+* **送信上限の表示**: メールの 1 日あたりの送信上限はプロジェクトによって異なります。フル版の訓練 1 周で送る通知メールは 9 通です［テストメールを含めると 10 通、クイックスタートはテストメール込みで合計 8 通］。
 
 #### 権限の境界と失敗時の扱い
 
@@ -381,27 +383,27 @@ gcloud projects add-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
 
 ---
 
-## 6. 全テストスイート（89 件）のローカル実行確認
+## 6. 全テストスイート（93 件）のローカル実行確認
 
-ワークフロー 3 分岐、Slack 再開・即時状態更新、鮮度ライフサイクル、Error Budget 温存計算、メール通知と承認コマンド、クイックスタートのスクリプトを含む全 89 件のテストを実行します。
+ワークフロー 3 分岐、Slack 再開・即時状態更新、鮮度ライフサイクル、Error Budget 温存計算、メール通知と承認コマンド、Log Sink 経由の偽装防止、クイックスタートのスクリプトを含む全 93 件のテストを実行します。
 
 ```bash
 source .venv/bin/activate
 pytest -v
 ```
 
-### 期待される出力（全 89 件 PASS）
+### 期待される出力（全 93 件 PASS）
 
 ```text
-tests/test_dedup_and_guardrails.py ........... (6 passed)
+tests/test_dedup_and_guardrails.py ........... (8 passed)
 tests/test_email_and_approval_command.py ..... (27 passed)
 tests/test_quickstart_consistency.py ......... (28 passed)
 tests/test_quickstart_scripts.py ............. (8 passed)
 tests/test_sandbox_runner.py ................. (4 passed)
-tests/test_slack_hitl_resume.py .............. (11 passed)
+tests/test_slack_hitl_resume.py .............. (13 passed)
 tests/test_slo_metrics.py .................... (4 passed)
 tests/test_workflow_routing.py ............... (1 passed)
-============================== 89 passed ==============================
+============================== 93 passed ==============================
 ```
 
 ---
@@ -410,7 +412,7 @@ tests/test_workflow_routing.py ............... (1 passed)
 
 ```markdown
 `AGENTS.md` を読み込み、第4章（`docs/04-auto-remediation-and-slack-hitl.md`）のテスト検証を実行してください。
-- `.venv` 環境で `pytest -v` を実行し、全 89 件のテスト（重複排除、サンドボックス隔離、Workflow 3分岐、Slack 再開と即時状態更新、自律ナレッジ昇格、鮮度管理、Error Budget 温存計算、メール通知と承認コマンド、クイックスタートのスクリプト）が PASS することを確認して報告すること。
+- `.venv` 環境で `pytest -v` を実行し、全 93 件のテスト（重複排除、サンドボックス隔離、Workflow 3分岐、Slack 再開と即時状態更新、自律ナレッジ昇格、鮮度管理、Error Budget 温存計算、メール通知と承認コマンド、クイックスタートのスクリプト）が PASS することを確認して報告すること。
 - Secret Manager への Slack トークン登録は私が手元で入力するため、コマンドのみ案内すること。
 - 代替ルートを使う場合、API 有効化・Pub/Sub 作成・`setup_email_notification.py`・IAM 付与は、実行前に提示して私の `y` 承認を得てから実行すること。
 ```

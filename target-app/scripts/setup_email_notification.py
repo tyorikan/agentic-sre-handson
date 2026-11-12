@@ -50,7 +50,7 @@ from agent_app.email_notifier import EMAIL_BODY_PARAM, EMAIL_SUBJECT_PARAM, EMAI
 
 DEFAULT_INTEGRATION_NAME = "sre-notify-email"
 MAX_RECIPIENTS = 30
-# 訓練 1 周で約 9 通を送るため、これより上限が低いプロジェクトでは通知が途中で止まる可能性がある
+# 訓練 1 周（フル版 9 通、クイックスタートはテストメール込み合計 8 通）より上限が低い環境では通知が途中で止まる可能性がある
 LOW_DAILY_LIMIT = 20
 EMAIL_QUOTA_METRIC = "integrations.googleapis.com/email_sent_count"
 

@@ -46,6 +46,13 @@ from .workflow import SreIncidentOrchestrator, WorkflowRunResult
 
 ACTION_APPROVE_ID = "sre_approve_remediation"
 ACTION_REJECT_ID = "sre_reject_remediation"
+PLACEHOLDER_SLACK_CHANNEL_ID = "C0000000000"
+
+
+def is_slack_channel_configured(channel_id: str) -> bool:
+    """実際の Slack チャンネル ID が設定されているか判定する（テンプレート既定値は未設定扱い）。"""
+    stripped = channel_id.strip()
+    return bool(stripped and stripped != PLACEHOLDER_SLACK_CHANNEL_ID)
 
 
 @dataclass
@@ -287,7 +294,7 @@ class SlackHitlCoordinator:
             await self._ticket_store.save_ticket(stored_ticket)
             self._pending[incident_id] = PendingApprovalTicket(run_result=result)
 
-        slack_enabled = bool(self._bolt_app and self._settings.slack_channel_id)
+        slack_enabled = bool(self._bolt_app and is_slack_channel_configured(self._settings.slack_channel_id))
         if slack_enabled:
             try:
                 await self._post_to_slack(result, stored_ticket)

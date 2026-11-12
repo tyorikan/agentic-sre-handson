@@ -45,6 +45,7 @@ flowchart LR
 
 * **なぜ Cloud Run Services ではなく Cloud Run instances なのか**: リクエスト駆動でスケールトゥゼロする Cloud Run Services と異なり、Cloud Run instances は単一コンテナを常時稼働させて Pub/Sub StreamingPull と Slack Socket Mode WebSocket を維持でき、さらに `--sandbox-launcher` で隔離サンドボックスを即起動できます。
 * **代替ルートも外向き通信だけで成立**: 通知メールの送信は Application Integration の API 呼び出し、承認コマンドからの承認は承認専用サブスクリプションの StreamingPull で受け取るため、着信 URL は不要です。
+* **閉域 GKE コントロールプレーンへの接続補足**: 本手順の GKE はプライベートノード構成（コントロールプレーン外部到達有効）のためそのまま到達できます。コントロールプレーンの外部エンドポイントも閉じた GKE に接続する場合は、Cloud Run instance に Direct VPC Egress（`--network` / `--subnet`）を付与するか GKE の DNS ベースエンドポイントを使用します。
 
 ---
 
@@ -129,6 +130,7 @@ gcloud logging read \
 第 1 章で起動した定常トラフィックにより健全なベースライン（Error Budget 残量 `100.00%`）が形成されていることを確認し、スナップショットを保存します。あわせて Google Cloud コンソールの **Monitoring → Services → `Order Service`** 画面を開いておくと、以降の訓練中の V 字回復グラフをリアルタイムで観察できます。
 
 ```bash
+source .env
 source .venv/bin/activate
 python3 ./target-app/scripts/check_slo_budget.py --save-baseline /tmp/slo_before_drills.json
 ```
@@ -148,6 +150,21 @@ python3 ./target-app/scripts/approve_incident.py <INCIDENT_ID>
 
 # メールが届かない場合は、引数なしで実行すると承認待ちの一覧を表示します
 python3 ./target-app/scripts/approve_incident.py
+```
+
+承認コマンドを実行した際の対話表示例は以下の通りです。
+
+```text
+========================================================================
+承認待ちインシデント [a1b2c3d4e5f6g7h8]
+  対象         : sre-demo-app/order-service
+  操作種別     : RESTART_DEPLOYMENT
+  類似過去事例 : INC-001 (類似度 0.72)
+  根本原因仮説 : 税率テーブルのインメモリキャッシュ CRC32 破損による 500 エラー継続
+  提案内容     : Deployment のローリング再起動を実施し、エラー率 1.0% 未満への回復を確認
+========================================================================
+実行を承認する場合は approve、手動対応へ切り替える場合は reject を入力してください: approve
+承認イベントを sre-approval-decisions へ発行しました（操作者: you@example.com）。結果は通知メールで確認してください。
 ```
 
 承認コマンドは承認または却下を発行したら終了し、結果は承認結果のメールで届きます。結果が届かない場合は、エージェントが承認をどう処理したかをログで確認します。`STATUS` が `applied` 以外の承認は実行されていません。
@@ -183,13 +200,13 @@ sequenceDiagram
     rect rgb(252, 232, 230)
         Note over Script,GKE: 1. 一過性ゲートウェイ TLS 瞬断の発生と自然回復トラフィック送信
         Script->>GKE: 正常8件送信 → 15秒間 503 注入・12件送信 → 回復後16件正常送信
-        GKE->>Agent: Logging シンク → Pub/Sub 経由で TRANSIENT_NET_ERR 通知
+        GKE->>Agent: Logging シンク → Pub/Sub 経由で UPSTREAM_CONN_RESET_503 通知
     end
 
     rect rgb(232, 240, 254)
         Note over Agent,BQ: 2. 30秒安定化観測・隔離 sandbox 減衰解析・過去事例照合
-        Agent->>Agent: INITIAL_STABILIZATION_SECONDS=30 待機後に直近90秒ログ時系列を取得
-        Agent->>Agent: sandbox do で減衰傾き負 is_naturally_decaying=True・直近デプロイ無しを確認
+        Note over Agent: INITIAL_STABILIZATION_SECONDS=30 待機後に直近90秒ログ時系列を取得
+        Note over Agent: sandbox do で減衰傾き負 is_naturally_decaying=True・直近デプロイ無しを確認
         Agent->>BQ: AI.SEARCH により INC-013 外部決済 TLS 瞬断が上位一致
     end
 
@@ -208,6 +225,19 @@ sequenceDiagram
 
 **確認ポイント**:
 * Slack またはメールに `OBSERVE`（類似事例 `INC-013`）と「不要な Pod 再起動による二次障害・追加バジェット流出を防止」のレポートが届き、Deployment リビジョンが変化していないこと。
+
+届くレポート通知の実例は以下の通りです。
+
+```text
+SRE Agent Report [5m4fmm6attxchacf]
+判定結果: 🟢 静観 (OBSERVE - 一過性エラーのため変更なし)
+対象: sre-demo-app/order-service  |  類似過去事例: INC-013 (類似度 0.89 / 最終検証 7日前)
+操作種別: NONE
+根本原因の推定: 外部決済事業者のエッジロードバランサ切り替え等に伴う一時的な TLS ハンドシェイク接続リセット。
+判断根拠: 実トラフィック上のエラー率が既に 0.0% へ自然減衰（is_naturally_decaying=True）しており、過去事例 INC-013 の推奨アクションも OBSERVE であるため静観とする。
+📊 SLO & Error Budget 効果: 自然減衰を 58秒 で確認し静観 — 不要な Pod 再起動による再接続ストームと追加の Error Budget 流出を防止
+⚠️ 回避した誤対応: この状態で Pod を一斉再起動すると確立済みの正常な TLS コネクションプールまで破棄され、再ハンドシェイク嵐で障害が長引く。
+```
 
 ---
 
@@ -237,9 +267,9 @@ sequenceDiagram
 
     rect rgb(232, 240, 244)
         Note over Agent,BQ: 2. 直近デプロイ検知・知識ベース高類似度一致・安全ガード検証
-        Agent->>Agent: 直近30分以内の新規 ReplicaSet ロールアウトと高止まりエラー率を確認
+        Note over Agent: 直近30分以内の新規 ReplicaSet ロールアウトと高止まりエラー率を確認
         Agent->>BQ: AI.SEARCH により INC-001 必須環境変数欠落が類似度 >= 0.85 で一致
-        Agent->>Agent: ガードレール PASS — sre-demo-app 内・類似度 >= 0.85・1時間以内初回
+        Note over Agent: ガードレール PASS — sre-demo-app 内・類似度 >= 0.85・1時間以内初回
     end
 
     rect rgb(230, 244, 234)
@@ -266,6 +296,16 @@ python3 ./target-app/scripts/check_slo_budget.py --compare-baseline /tmp/slo_bef
 **確認ポイント**:
 * `order-service` が自動的に `version=v1.0.0` へロールバックされ、実測 MTTR 約 70〜90 秒（約 1.3 分）で回復していること。
 * `check_slo_budget.py --compare-baseline` と自動復旧完了の通知において、**手動対応 30 分なら月次 99.9% バジェット（43.2 分）の約 70% を失っていたところを数 % の消費に抑え、約 27〜28 分の Error Budget を温存できたこと**が確認できること。
+
+`check_slo_budget.py --compare-baseline` の実測出力例は以下の通りです。
+
+```text
+=== Service Monitoring SLO & Error Budget 前後比較レポート ===
+対象サービス : order-service-slo
+  [日次 99.0% 可用性 SLO] 残量: 100.00% -> 79.17% (消費 20.83 pt / 許容停止枠 14.4分)
+  [月次 99.9% 可用性 SLO] 残量: 100.00% -> 93.06% (消費  6.94 pt / 許容停止枠 43.2分)
+  ※ 自動ロールバック (MTTR 約 82.1 秒) により、手動対応 30.0 分想定と比べて月次バジェット約 +28.63 分を温存
+```
 
 ---
 
@@ -356,7 +396,7 @@ sequenceDiagram
     rect rgb(243, 232, 253)
         Note over Agent,BQ: 自律ナレッジ昇格: 実証された解決策を構造化し BigQuery が自動でベクトル化
         Agent->>BQ: Gemini 3.8 Flash で AUTO-* Runbook を合成し MERGE 登録 — 次回推奨 AUTO_REMEDIATE
-        BQ->>BQ: GENERATED ALWAYS AS AI.EMBED により gemini-embedding-2 ベクトルを自動生成
+        Note over BQ: GENERATED ALWAYS AS AI.EMBED により gemini-embedding-2 ベクトルを自動生成
         Agent->>Slack: 処置完了 + 新規 Runbook AUTO-* 自動登録を通知
     end
 
@@ -390,10 +430,14 @@ sequenceDiagram
 
 #### ステップ B：`AI.EMBED` 自動埋め込み完了の確認とクールダウン解除
 
+ステップ A のローリング再起動によってインメモリの破損状態はすでに初期化されています。ここでは自動登録された `AUTO-*` 手順のベクトル生成完了を確認し、連続訓練用にクールダウン制限を解除します。
+
 ```bash
 for i in $(seq 1 8); do
-  bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGION}" --use_legacy_sql=false \
-    'SELECT runbook_id, recommended_action, (embedding IS NOT NULL AND embedding.status = "") AS embedded, verified_count FROM `sre_agent_ops.incident_runbooks` WHERE STARTS_WITH(runbook_id, "AUTO-")'
+  OUT=$(bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGION}" --use_legacy_sql=false --format=pretty \
+    'SELECT runbook_id, recommended_action, (embedding IS NOT NULL AND embedding.status = "") AS embedded, verified_count FROM `sre_agent_ops.incident_runbooks` WHERE STARTS_WITH(runbook_id, "AUTO-")')
+  echo "${OUT}"
+  [[ "${OUT}" == *"true"* ]] && break
   sleep 8
 done
 
@@ -423,6 +467,13 @@ sleep 8
 # 「鮮度期限切れの再評価」の承認待ち通知が届くことを確認し、承認して鮮度を復活させます
 ```
 
+* **ワンポイント確認（`Reject` による自動実行の恒久凍結）**: ステップ D の承認待ちで `Reject`（却下）を選んだ場合は、`incident_runbooks` 内の該当 `AUTO-*` 行の `recommended_action` が自動的に `REQUIRE_APPROVAL` へ書き換えられ、以後の無断自動実行が恒久的に凍結されます。以下のクエリで状態を確認できます。
+
+```bash
+bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGION}" --use_legacy_sql=false \
+  'SELECT runbook_id, recommended_action, verified_count, last_verified_at FROM `sre_agent_ops.incident_runbooks` WHERE STARTS_WITH(runbook_id, "AUTO-")'
+```
+
 ---
 
 ## 4. 全訓練を通じた Error Budget 温存効果の総括集計（BigQuery 監査 SQL）
@@ -442,9 +493,22 @@ bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGIO
      ROUND(slo_budget_remaining_pct, 1) AS daily_slo_rem_pct
    FROM `sre_agent_ops.incident_events`
    WHERE decision != "ADMIN_RESET"
-   ORDER BY created_at DESC
-   LIMIT 10'
+   ORDER BY created_at ASC'
 ```
+
+期待される監査記録の推移例（訓練 1〜4 ステップ D まで実施した場合の 9 行）は以下の通りです。`TAX_RULE_CRC32_MISMATCH_500` が 1 回目の承認解決を経て 2 回目に `AUTO-*` で自動復旧へ進化し、120 日経過模擬では再び承認待ちへ安全降格していることが一目で確認できます。
+
+| 訓練 | `error_code` | `decision` | `matched_runbook_id` | `mttr_sec` | `saved_budget_min` |
+|---|---|---|---|---:|---:|
+| 訓練 1 | `UPSTREAM_CONN_RESET_503` | `OBSERVE` | `INC-013` | 55.6 | 0.00 |
+| 訓練 2 | `CONFIG_KEY_ERROR_500` | `AUTO_REMEDIATE` | `INC-001` | 82.1 | 28.63 |
+| 訓練 3 | `DB_CONN_SLOTS_EXHAUSTED_500` | `REQUIRE_APPROVAL` | `INC-025` | NULL | NULL |
+| 訓練 3 | `DB_CONN_SLOTS_EXHAUSTED_500` | `APPROVED_EXECUTED` | `INC-025` | NULL | NULL |
+| 訓練 4-A | `TAX_RULE_CRC32_MISMATCH_500` | `REQUIRE_APPROVAL` | `INC-001` | NULL | NULL |
+| 訓練 4-A | `TAX_RULE_CRC32_MISMATCH_500` | `APPROVED_EXECUTED` | `INC-001` | 124.1 | 27.93 |
+| 訓練 4-C | `TAX_RULE_CRC32_MISMATCH_500` | `AUTO_REMEDIATE` | `AUTO-AC0B8750` | 97.2 | 28.38 |
+| 訓練 4-D | `TAX_RULE_CRC32_MISMATCH_500` | `REQUIRE_APPROVAL` | `AUTO-AC0B8750` | NULL | NULL |
+| 訓練 4-D | `TAX_RULE_CRC32_MISMATCH_500` | `APPROVED_EXECUTED` | `AUTO-AC0B8750` | 118.4 | 28.03 |
 
 ---
 

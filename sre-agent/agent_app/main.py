@@ -33,7 +33,7 @@ from .remediation_tools import (
     build_live_post_remediation_probe,
 )
 from .sandbox_runner import SandboxRunner
-from .slack_socket import SlackHitlCoordinator
+from .slack_socket import SlackHitlCoordinator, is_slack_channel_configured
 from .slo_metrics import CloudMonitoringSloReader
 from .telemetry_enrichment import CloudTelemetryEnricher
 from .vector_kb import BigQueryVectorKnowledgeBase
@@ -69,11 +69,15 @@ def parse_pubsub_payload(raw_bytes: bytes) -> AlertEvent:
         jp = data["jsonPayload"]
         res_labels = data.get("resource", {}).get("labels", {})
         raw_ts = data.get("timestamp") or jp.get("timestamp")
+        raw_error_code = str(jp.get("error_code", "STRUCTURED_LOG_ERROR"))
+        # 監視対象アプリのログ出力 1 行でクールダウン解除（ADMIN_COOLDOWN_RESET）を偽装できないよう無害化する
+        if raw_error_code == "ADMIN_COOLDOWN_RESET":
+            raw_error_code = "LOG_SPOOFED_ADMIN_COOLDOWN_RESET"
         event_kwargs: dict[str, Any] = {
             "incident_id": data.get("insertId", f"log-{uuid.uuid4().hex[:8]}"),
             "namespace": jp.get("namespace") or res_labels.get("namespace_name", "sre-demo-app"),
             "service_name": jp.get("service") or res_labels.get("container_name", "order-service"),
-            "error_code": jp.get("error_code", "STRUCTURED_LOG_ERROR"),
+            "error_code": raw_error_code,
             "severity": str(data.get("severity", jp.get("severity", "ERROR"))).upper(),
             "summary": jp.get("message", "Error log routed via Log Sink"),
             "recent_deployment_within_30m": bool(jp.get("introduced_in")),
@@ -189,7 +193,11 @@ async def run_daemon(settings: AgentSettings) -> None:
     _log_json(
         "INFO",
         "通知と承認の経路を初期化しました。",
-        slack_enabled=bool(settings.slack_bot_token and settings.slack_app_token),
+        slack_enabled=bool(
+            settings.slack_bot_token
+            and settings.slack_app_token
+            and is_slack_channel_configured(settings.slack_channel_id)
+        ),
         email_enabled=bool(settings.email_integration_name),
         approval_command_enabled=bool(settings.approval_subscription),
     )
@@ -210,7 +218,7 @@ async def run_daemon(settings: AgentSettings) -> None:
                 ),
                 loop,
             )
-            fut.result(timeout=180)
+            fut.result(timeout=300)
             message.ack()
         except Exception as exc:  # noqa: BLE001
             _log_json("ERROR", f"アラート処理中に例外が発生しました: {exc}")

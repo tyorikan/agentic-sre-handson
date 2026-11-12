@@ -109,7 +109,7 @@ flowchart LR
 
 ## 3. ローカル環境でのクイックテスト（クラウド課金 \$0）
 
-Google Cloud へデプロイする前に、手元の Python 3.11+ 仮想環境で重複排除・サンドボックス隔離・100 件検索・ADK 2.x 3 分岐・Slack 再開・鮮度管理・Error Budget 温存計算・メール通知と承認コマンド・クイックスタートのスクリプトの全 89 テストを実行できます。
+Google Cloud へデプロイする前に、手元の Python 3.11+ 仮想環境で重複排除・サンドボックス隔離・100 件検索・ADK 2.x 3 分岐・Slack 再開・鮮度管理・Error Budget 温存計算・メール通知と承認コマンド・クイックスタートのスクリプトの全 93 テストを実行できます。
 
 ```bash
 python3 -m venv .venv
@@ -133,7 +133,7 @@ pytest -v
 | **③ 1 ヶ月放置（未削除）** | 削除せず 730 時間稼働させたまま放置 | **約 \$115 / 月** | GKE クラスタ管理手数料（\$73.00）＋ GKE Autopilot Pod 群（\$25.60）＋ 常駐 Cloud Run instance 1 台（\$11.56）＋ Cloud NAT 待機（約 \$4.00）＋ Artifact Registry・Secret Manager・ログメトリクス（約 \$0.40）。平時の Pub/Sub・Gemini 推論は \$0.00 |
 
 * **無料枠に関する補足**: 上記はすべて無料枠控除前のオンデマンド定価です。請求先アカウントで 1 台目の GKE Autopilot クラスタ管理手数料の無料枠や Cloud Logging 月 50 GiB 無料枠が残っている環境では自動割引され、①通常実施時は **約 \$0.32〜\$0.42**、②クイックスタートは **約 \$0.22〜\$0.32**、③1 ヶ月放置時は **約 \$38 / 月** となります。
-* **代替ルートのメール通知に関する補足**: 通知メールは Application Integration の連携の実行として課金され、定価は実行 1,000 回あたり \$0.50 です。訓練 1 周で送る 9 通は \$0.01 未満のため、上表の概算には含めていません。無料枠は月 400 回までです。
+* **代替ルートのメール通知に関する補足**: 通知メールは Application Integration の連携の実行として課金され、定価は実行 1,000 回あたり \$0.50 です。フル版の訓練 1 周で送る 9 通［クイックスタートはテストメール込み合計 8 通］は \$0.01 未満のため、上表の概算には含めていません。無料枠は月 400 回までです。
 * **環境を残して待機課金だけ抑える方法**: 数日後に再デモする場合は `gcloud beta run instances stop` と `kubectl scale deployment order-service order-traffic-generator -n sre-demo-app --replicas=0` でコンテナ稼働課金を停止できます。GKE クラスタ管理手数料（\$0.10/時間）まで止める場合はクラスタを削除してください。
 
 ### B. 本番システムへ導入・常時運用した際の月額増分コスト目安（規模別 3 パターン）
@@ -151,7 +151,17 @@ pytest -v
 
 ---
 
-## 5. ディレクトリ構成
+## 5. 自社環境への段階導入ロードマップ（コード変更ゼロ・環境変数のみで切替）
+
+本リポジトリのエージェントは、コードを書き換えずに環境変数と RBAC だけで「観測のみ → 承認実行＋知識蓄積 → 限定自動復旧」の 3 段階ロールアウトをそのまま実践できます。設定値の詳細は [06-optional-hardening-and-cleanup.md](docs/06-optional-hardening-and-cleanup.md) の第 4 節を参照してください。
+
+1. **STEP 1（観測・通知のみ）**: `ALLOWED_K8S_NAMESPACES=""`（GKE `RoleBinding` 未付与）で起動し、変更操作ゼロで診断精度を評価
+2. **STEP 2（人間承認＋自律学習）**: `ALLOWED_K8S_NAMESPACES="対象NS"` かつ `MAX_AUTO_ACTIONS_PER_HOUR="0"` とし、承認された復旧だけを実測検証して `AI.EMBED` 知識ベースへ自動蓄積
+3. **STEP 3（限定自動復旧）**: `MAX_AUTO_ACTIONS_PER_HOUR="1"` かつ `ALLOW_DRILL_COOLDOWN_RESET="false"` で既知障害を即時切り戻し（DB・未知・90 日超過手順は承認維持）
+
+---
+
+## 6. ディレクトリ構成
 
 ```text
 .
@@ -165,7 +175,7 @@ pytest -v
 ├── sre-agent/                       # Cloud Run instances 常駐エージェント本体 (ADK 2.x + SLO 効果計測)
 ├── quickstart/                      # クイックスタート用: 環境構築・エージェントのデプロイ・後片付けのスクリプト
 ├── appendix/                        # 付録: GKE Standard microVM / Model Armor / pass^3 評価スクリプト
-├── tests/                           # ローカル自動テストスイート (全 89 件)
+├── tests/                           # ローカル自動テストスイート (全 93 件)
 └── docs/                            # クイックスタート・全 7 章のステップバイステップ Codelab 教材 & 高精細構成図
 ```
 

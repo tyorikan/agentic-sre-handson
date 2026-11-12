@@ -202,6 +202,8 @@ SRE エージェントを Cloud Run instance としてデプロイします。Cl
   メール通知   : 有効
   承認コマンド : 有効
   Slack        : 無効
+
+次の手順: source ./quickstart/env.sh を実行してから、訓練 1 (./target-app/scripts/inject_transient_net_err.sh) へ進みます。
 ```
 
 このデプロイでは、フル版と同じ 2 つの設定を付けています。
@@ -256,7 +258,7 @@ flowchart LR
 | 4-A | 知識ベースに無い障害、1 回目 | 人の承認 | `承認待ち` → `承認・実行完了` | 承認コマンド |
 | 4-C | 同じ障害、2 回目 | 自動復旧 | `自動復旧完了` | なし |
 
-メールは、環境構築のときのテストメールを含めて合計 8 通届きます。障害を注入してからメールが届くまでの時間は、1〜2 分が目安です。
+メールは、環境構築時のテストメール 1 通と訓練中の通知 7 通を合わせて、合計 8 通届きます。障害を注入してからメールが届くまでの時間は、1〜2 分が目安です。
 
 ### 訓練 1：一時的な通信断 → 静観
 
@@ -276,6 +278,15 @@ flowchart LR
 
 ```bash
 kubectl get pods -n sre-demo-app -l app=order-service
+```
+
+届くメールの抜粋例は次のとおりです。
+
+```text
+件名: [SRE Agent] 静観: sre-demo-app/order-service [5m4fmm6attxchacf]
+判定結果: 静観 (OBSERVE)  /  類似した過去事例: INC-013 (類似度 0.89)
+判断根拠: 実トラフィック上のエラー率が既に 0.0% へ自然減衰しており、過去事例 INC-013 の推奨アクションも OBSERVE であるため静観とする。
+回避した誤対応: この状態で Pod を一斉再起動すると、確立済みの正常な TLS コネクションプールまで破棄され、再ハンドシェイク嵐で障害が長引く。
 ```
 
 ### 訓練 2：設定が欠けたリリース → 自動復旧
@@ -315,6 +326,18 @@ python3 ./target-app/scripts/approve_incident.py <インシデント ID>
 ```
 
 判定の内容が表示されるので、確かめてから `approve` と入力します。却下する場合は `reject` と入力します。
+
+```text
+========================================================================
+承認待ちインシデント [9k3m8x2p7v4q1w5z]
+  対象         : sre-demo-app/order-service
+  操作種別     : MANUAL_INTERVENTION
+  類似過去事例 : INC-025 (類似度 0.89)
+  提案内容     : Pod の無断再起動を避け、オンコール担当者へ DB ロック調査を引き継ぐ
+========================================================================
+実行を承認する場合は approve、手動対応へ切り替える場合は reject を入力してください: approve
+承認イベントを sre-approval-decisions へ発行しました（操作者: you@example.com）。結果は通知メールで確認してください。
+```
 
 * メールが届かない場合は、引数を付けずに `python3 ./target-app/scripts/approve_incident.py` を実行すると、承認待ちの一覧が表示されます。
 * 承認コマンドは、承認または却下を送信したら終了します。結果は次のメールで届きます。
@@ -357,7 +380,7 @@ bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGIO
   'SELECT runbook_id, recommended_action, (embedding IS NOT NULL AND embedding.status = "") AS embedded, verified_count FROM `sre_agent_ops.incident_runbooks` WHERE STARTS_WITH(runbook_id, "AUTO-")'
 ```
 
-続けて、再現した障害を解除し、連続して訓練するための制限解除を行います。
+ステップ A の再起動によって税率データの破損自体はすでに解消しています。続けて、連続して訓練するための制限解除を行います。
 
 ```bash
 ./target-app/scripts/reset_fault.sh --reset-cooldown
@@ -410,6 +433,18 @@ bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGIO
 記録は 7 行になります。承認が必要だった訓練 3 と訓練 4-A は、承認待ちと承認後の 2 行ずつです。
 
 同じ障害 `TAX_RULE_CRC32_MISMATCH_500` が、1 回目は `REQUIRE_APPROVAL` と `APPROVED_EXECUTED`、2 回目は `AUTO_REMEDIATE` として記録されていることを確かめてください。人が一度承認した対処が、次回からは自動で実行されるようになったことを示しています。
+
+実行結果の例（7 行）は次のとおりです。
+
+| 訓練 | `error_code` | `decision` | `matched_runbook_id` | `mttr_sec` | `saved_budget_min` |
+|---|---|---|---|---:|---:|
+| 1 | `UPSTREAM_CONN_RESET_503` | `OBSERVE` | `INC-013` | 55.6 | 0.00 |
+| 2 | `CONFIG_KEY_ERROR_500` | `AUTO_REMEDIATE` | `INC-001` | 82.1 | 28.63 |
+| 3 | `DB_CONN_SLOTS_EXHAUSTED_500` | `REQUIRE_APPROVAL` | `INC-025` | NULL | NULL |
+| 3 | `DB_CONN_SLOTS_EXHAUSTED_500` | `APPROVED_EXECUTED` | `INC-025` | NULL | NULL |
+| 4-A | `TAX_RULE_CRC32_MISMATCH_500` | `REQUIRE_APPROVAL` | `INC-001` | NULL | NULL |
+| 4-A | `TAX_RULE_CRC32_MISMATCH_500` | `APPROVED_EXECUTED` | `INC-001` | 124.1 | 27.93 |
+| 4-C | `TAX_RULE_CRC32_MISMATCH_500` | `AUTO_REMEDIATE` | `AUTO-AC0B8750` | 97.2 | 28.38 |
 
 ---
 

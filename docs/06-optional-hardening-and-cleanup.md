@@ -40,8 +40,15 @@ flowchart LR
 </details>
 
 * **必須条件**: GKE Standard クラスタ（バージョン `1.37` 以降）かつ Nested Virtualization 対応の x86 マシンシリーズ（`n4` / `n2` / `c4` 等、`e2` や Autopilot は非対応）が必要です。またシステム Pod 用に通常ノードプールを最低 1 ノード残します。
+* **通信境界とセキュリティ設定の注意点**:
+  * [network-policy-metadata-deny.yaml](../appendix/gke-microvm/network-policy-metadata-deny.yaml) は着信を全面拒否し、外向き通信を DNS（53）・HTTPS（443）およびエージェント自身の Workload Identity 認証エンドポイント（`169.254.169.254:80` / `169.254.169.252:988`）のみに絞ります。未信頼コードを別 `microVM` ワーカー Pod へ分離実行する場合は、該当ワーカー側のメタデータ許可ブロックを削除して完全遮断してください。
+  * GKE Sandbox Pod はハイパーバイザ境界で隔離されるため、ホスト側の Linux セキュリティモジュール設定（`seccompProfile` 等）は公式仕様上非サポートであり、[agent-deployment-microvm.yaml](../appendix/gke-microvm/agent-deployment-microvm.yaml) でも除外しています。
 
 ```bash
+source .env
+export SRE_AGENT_SA_EMAIL="sre-autonomous-agent-sa@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com"
+export SRE_AGENT_IMAGE_URI="${GOOGLE_CLOUD_REGION}-docker.pkg.dev/${GOOGLE_CLOUD_PROJECT}/sre-handson/sre-autonomous-agent"
+
 gcloud iam service-accounts add-iam-policy-binding "${SRE_AGENT_SA_EMAIL}" \
   --role="roles/iam.workloadIdentityUser" \
   --member="serviceAccount:${GOOGLE_CLOUD_PROJECT}.svc.id.goog[sre-agent-system/sre-agent-ksa]" \
@@ -115,13 +122,28 @@ python3 ./appendix/production-hardening/calc_pass_hat_k.py \
 
 ---
 
-<!-- phase: cleanup -->
-## 4. クリーンアップ手順（継続課金の停止）
+## 4. 自社環境への段階導入チートシート（コード変更ゼロ・環境変数切替）
 
-ハンズオン終了後、継続課金が発生しないよう以下の順番でリソースを削除します。
+本ハンズオンで構築したエージェントは、コードを 1 行も変更せず環境変数と RBAC の組み合わせだけで、安全な「観測モード」から段階的に本番適用できます。
+
+| 導入フェーズ | 環境変数と RBAC の設定値 | エージェントの実際の挙動 |
+|---|---|---|
+| **STEP 1: 観測・通知のみ**［1〜2 週間］ | `ALLOWED_K8S_NAMESPACES=""` / `ALLOW_DRILL_COOLDOWN_RESET="false"` / 対象 GKE の `RoleBinding` 未付与 | 変更権限ゼロで稼働。異常検知時は隔離解析・`AI.SEARCH` 照合を行い、根拠レポートのみを Slack またはメールへ送信 |
+| **STEP 2: 人間承認＋自律学習**［2〜4 週間］ | `ALLOWED_K8S_NAMESPACES="対象NS"` / `MAX_AUTO_ACTIONS_PER_HOUR="0"` / `ALLOW_DRILL_COOLDOWN_RESET="false"` / `SLACK_ALLOWED_APPROVER_IDS` 指定 | すべての復旧候補が決定論的ガードレールで承認待ちへ移行。人間が承認して回復実証された手順だけが `AI.EMBED` 知識ベースへ自動蓄積 |
+| **STEP 3: 限定自動復旧**［定着後］ | `ALLOWED_K8S_NAMESPACES="対象NS"` / `MAX_AUTO_ACTIONS_PER_HOUR="1"` / `ALLOW_DRILL_COOLDOWN_RESET="false"` / `RUNBOOK_FRESHNESS_TTL_DAYS="90"` | 類似度 `0.85` 以上かつ直近 90 日以内に実証済みの既知障害のみ 1 時間 1 回まで即時自動復旧。DB・未知・90 日超過手順は承認を維持 |
+
+* **閉域 GKE コントロールプレーンへ接続する場合**: 本ハンズオンの GKE はプライベートノード構成（コントロールプレーン外部到達有効）ですが、本番でコントロールプレーンの外部エンドポイントも閉じている場合は、Cloud Run instance に Direct VPC Egress（`--network` / `--subnet`）を設定するか GKE の DNS ベースエンドポイントを使用してください。
+
+---
+
+<!-- phase: cleanup -->
+## 5. クリーンアップ手順（継続課金の停止）
+
+ハンズオン終了後、継続課金が発生しないよう以下の順番でリソースを削除します（新しいターミナルを開いた場合でもそのまま実行できるよう `.env` と `.venv` を最初に読み込みます）。
 
 ```bash
 source .env
+source .venv/bin/activate
 
 # 1. 常駐 Cloud Run instance の削除
 gcloud beta run instances delete sre-autonomous-agent \
@@ -149,14 +171,28 @@ gcloud compute routers delete sre-handson-router \
   --project="${GOOGLE_CLOUD_PROJECT}" \
   --quiet
 
-gcloud compute networks subnets delete sre-handson-subnet \
-  --region="${GOOGLE_CLOUD_REGION}" \
+# GKE が専用 VPC に残すことがあるファイアウォールルールを先に削除し、解放待ちを含めてサブネットと VPC を削除します
+for FW_RULE in $(gcloud compute firewall-rules list \
   --project="${GOOGLE_CLOUD_PROJECT}" \
-  --quiet
+  --filter="network~/sre-handson-vpc$" \
+  --format="value(name)"); do
+  gcloud compute firewall-rules delete "${FW_RULE}" --project="${GOOGLE_CLOUD_PROJECT}" --quiet || true
+done
 
-gcloud compute networks delete sre-handson-vpc \
-  --project="${GOOGLE_CLOUD_PROJECT}" \
-  --quiet
+for ATTEMPT in 1 2 3 4 5 6; do
+  gcloud compute networks subnets delete sre-handson-subnet \
+    --region="${GOOGLE_CLOUD_REGION}" \
+    --project="${GOOGLE_CLOUD_PROJECT}" \
+    --quiet && break
+  sleep 20
+done
+
+for ATTEMPT in 1 2 3 4 5 6; do
+  gcloud compute networks delete sre-handson-vpc \
+    --project="${GOOGLE_CLOUD_PROJECT}" \
+    --quiet && break
+  sleep 20
+done
 
 # 4. Logging シンクと Pub/Sub の削除
 gcloud logging sinks delete sre-gke-error-sink \

@@ -837,5 +837,55 @@ async def test_slack_button_click_immediately_updates_to_in_progress_and_restore
     assert any(b.get("type") == "actions" for b in restored_blocks)
 
 
+def test_is_slack_channel_configured_ignores_placeholder() -> None:
+    """テンプレート既定値 C0000000000 と空文字が未設定と判定され、実チャンネル ID のみ有効となること。"""
+    from agent_app.slack_socket import is_slack_channel_configured
+
+    assert is_slack_channel_configured("") is False
+    assert is_slack_channel_configured("   ") is False
+    assert is_slack_channel_configured("C0000000000") is False
+    assert is_slack_channel_configured(" C0000000000 ") is False
+    assert is_slack_channel_configured("C0123ABCDEF") is True
+
+
+@pytest.mark.asyncio
+async def test_placeholder_channel_id_skips_slack_post_and_falls_back_cleanly(tmp_path: Path) -> None:
+    """SLACK_ALERT_CHANNEL_ID が C0000000000 のままでも Slack 誤送信を試みずチケット保存が完了すること。"""
+    from types import SimpleNamespace
+
+    db_file = tmp_path / "placeholder_ch.db"
+    settings = AgentSettings(
+        sandbox_mode="local_subprocess",
+        session_backend="sqlite",
+        session_db_url=f"sqlite+aiosqlite:///{db_file}",
+        slack_channel_id="C0000000000",
+    )
+    orch = SreIncidentOrchestrator(
+        settings=settings,
+        sandbox_runner=SandboxRunner(settings),
+        knowledge_base=LocalJsonlKnowledgeBase(REPO_ROOT / "bigquery" / "seed_runbooks_100.jsonl"),
+        guardrail_manager=IncidentGuardrailManager(settings, InMemoryEventStoreBackend()),
+        remediation_service=SafeRemediationService(settings, FakeK8sExecutor()),
+        decision_analyzer=_approval_required_restart_analyzer,
+        runbook_synthesizer=_fast_det_synthesizer,
+        session_service=DatabaseSessionService(db_url=settings.session_db_url),
+    )
+    coordinator = SlackHitlCoordinator(settings, orch)
+    post_calls: list[dict] = []
+
+    class _MustNotPostClient:
+        async def chat_postMessage(self, **kwargs):  # noqa: ANN003
+            post_calls.append(kwargs)
+            raise AssertionError("C0000000000 に対して chat_postMessage を呼んではならない")
+
+    coordinator._bolt_app = SimpleNamespace(client=_MustNotPostClient())  # type: ignore[assignment]
+    paused = await orch.handle_alert(
+        AlertEvent(incident_id="PH-CH-1", summary="Placeholder channel test", error_rate_series=[0.4, 0.5])
+    )
+    await coordinator.notify_workflow_result(paused)
+    assert post_calls == []
+    assert "PH-CH-1" in coordinator.pending_tickets
+
+
 
 
