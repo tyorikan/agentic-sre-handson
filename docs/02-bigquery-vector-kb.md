@@ -135,7 +135,24 @@ gcloud projects add-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
   --condition=None \
   --quiet
 
-sleep 15
+# 付与したロールがエンドポイントまで反映される前にデータを投入すると、初回の自動埋め込みジョブが権限エラーで止まるため、同期呼び出しで反映を確認する
+for i in $(seq 1 18); do
+  if bq query \
+    --project_id="${GOOGLE_CLOUD_PROJECT}" \
+    --location="${GOOGLE_CLOUD_REGION}" \
+    --use_legacy_sql=false \
+    --quiet \
+    "ASSERT (SELECT AI.EMBED('warmup', connection_id => '${GOOGLE_CLOUD_PROJECT}.${GOOGLE_CLOUD_REGION}.${BQ_CONNECTION_ID:-sre_genai_conn}', endpoint => '${SRE_EMBEDDING_MODEL}').status) = '' AS 'IAM propagation pending'" >/dev/null 2>&1; then
+    echo "BigQuery Connection SA の IAM 反映を確認しました。"
+    break
+  fi
+  if [[ "${i}" == "18" ]]; then
+    echo "エラー: IAM の反映を確認できませんでした。1 分ほど待ってから再実行してください。" >&2
+    false
+  fi
+  echo "[試行 ${i}/18] IAM の反映を待機しています..."
+  sleep 10
+done
 
 sed -e "s|__PROJECT_ID__|${GOOGLE_CLOUD_PROJECT}|g" \
     -e "s|__REGION__|${GOOGLE_CLOUD_REGION}|g" \

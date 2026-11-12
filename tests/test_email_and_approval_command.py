@@ -1175,6 +1175,76 @@ def test_setup_script_validates_recipients_and_explains_the_daily_limit(capsys: 
     assert "確認できませんでした" in describe(None)
 
 
+def test_setup_script_status_reports_registration_without_changing_anything(capsys: pytest.CaptureFixture[str]) -> None:
+    """--status が登録の有無を終了コードで返し、有効化・登録・送信のどれも行わないこと。"""
+    service = FakeIntegrationService(provisioned=False)
+    base_args = ["--project", "test-proj", "--location", "asia-northeast1"]
+    main = setup_email_notification.main
+    not_registered = setup_email_notification.EXIT_NOT_REGISTERED
+    assert not_registered not in (0, 1)  # 成功（0）とも失敗（1）とも区別できる終了コードであること
+
+    # リージョンが未有効化: 未登録として返し、有効化しない。宛先を指定しなくても調べられる
+    assert main([*base_args, "--status"], session=service) == not_registered
+    assert "未登録" in capsys.readouterr().out
+    assert service.provisioned is False
+
+    # 作成しただけで公開していない連携は、実行できないため未登録として扱う
+    service.provisioned = True
+    service.versions["sre-notify-email"] = [{"name": "draft-only", "state": "DRAFT"}]
+    assert main([*base_args, "--status"], session=service) == not_registered
+    del service.versions["sre-notify-email"]
+
+    # 登録して公開した後: 登録済み。--status は読み取りだけを行う
+    assert main([*base_args, "--to", "sre@example.com"], session=service) == 0
+    calls_before_status = len(service.calls)
+    capsys.readouterr()
+    assert main([*base_args, "--status"], session=service) == 0
+    assert "登録済み" in capsys.readouterr().out
+    status_calls = service.calls[calls_before_status:]
+    assert status_calls and all(method == "GET" for method, _, _ in status_calls)
+    assert service.executions == []
+
+    # 削除後: 未登録に戻る
+    assert main([*base_args, "--delete"], session=service) == 0
+    assert main([*base_args, "--status"], session=service) == not_registered
+
+
+def test_setup_script_registers_nothing_when_the_daily_limit_is_too_low(capsys: pytest.CaptureFixture[str]) -> None:
+    """--min-daily-limit を指定すると、送信上限が足りないプロジェクトでは有効化・登録・送信のどれも行わないこと。"""
+    base_args = ["--project", "test-proj", "--location", "asia-northeast1", "--to", "sre@example.com", "--send-test"]
+    main = setup_email_notification.main
+    too_low = setup_email_notification.EXIT_DAILY_LIMIT_TOO_LOW
+    assert too_low not in (0, 1, setup_email_notification.EXIT_NOT_REGISTERED)
+
+    # 上限 5 通に対して 8 通が必要: Application Integration の API を 1 度も呼ばずに終わる
+    low = FakeIntegrationService(provisioned=False, daily_limit=5)
+    assert main([*base_args, "--min-daily-limit", "8"], session=low) == too_low
+    assert "1 日 5 通で、必要な 8 通に足りません。何も登録していません。" in capsys.readouterr().err
+    assert low.calls == [] and low.provisioned is False and low.versions == {} and low.executions == []
+
+    # メールを 1 通も送れないプロジェクト（上限 0 通）も同じ
+    blocked = FakeIntegrationService(daily_limit=0)
+    assert main([*base_args, "--min-daily-limit", "8"], session=blocked) == too_low
+    assert blocked.calls == []
+
+    # 上限が必要な通数ちょうどなら登録して、テストメールを送る
+    exact = FakeIntegrationService(daily_limit=8)
+    assert main([*base_args, "--min-daily-limit", "8"], session=exact) == 0
+    assert len(exact.executions) == 1
+
+    # 上限を確認できない場合は、登録を続ける
+    unknown = FakeIntegrationService(daily_limit=None)
+    assert main([*base_args, "--min-daily-limit", "8"], session=unknown) == 0
+    assert "sre-notify-email" in unknown.versions
+
+    # --min-daily-limit を指定しなければ、上限が低くても登録して警告を表示する（フル版の動作）
+    capsys.readouterr()
+    unchecked = FakeIntegrationService(daily_limit=5)
+    assert main(base_args, session=unchecked) == 0
+    assert "[WARN]" in capsys.readouterr().out
+    assert "sre-notify-email" in unchecked.versions
+
+
 def test_alternative_route_is_disabled_unless_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     """メール通知と承認コマンドの待ち受けは、設定しない限り無効であること。"""
     defaults = AgentSettings()

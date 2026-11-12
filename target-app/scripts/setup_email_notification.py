@@ -18,6 +18,12 @@
   # 削除（第 6 章の削除手順で使用）
   python3 ./target-app/scripts/setup_email_notification.py --delete
 
+  # 登録済みかどうかだけを調べる（何も変更しない。登録済みなら終了コード 0、未登録なら 4）
+  python3 ./target-app/scripts/setup_email_notification.py --status
+
+  # 1 日の送信上限が指定した通数に足りない場合は、何も登録せずに終了コード 3 で終わる
+  python3 ./target-app/scripts/setup_email_notification.py --min-daily-limit 8
+
 IAM について:
   このスクリプト自身は IAM ポリシーを書き換えません。エージェントのサービスアカウントへ連携の実行権限
   （roles/integrations.integrationInvoker）を付与する手順は、ドキュメントを参照してください。
@@ -47,6 +53,10 @@ MAX_RECIPIENTS = 30
 # 訓練 1 周で約 9 通を送るため、これより上限が低いプロジェクトでは通知が途中で止まる可能性がある
 LOW_DAILY_LIMIT = 20
 EMAIL_QUOTA_METRIC = "integrations.googleapis.com/email_sent_count"
+
+# 呼び出し元のスクリプトが結果を区別できるよう、失敗（1）とは別の終了コードを使う
+EXIT_DAILY_LIMIT_TOO_LOW = 3
+EXIT_NOT_REGISTERED = 4
 
 _EMAIL_PATTERN = re.compile(r"[^@\s,]+@[^@\s,]+\.[^@\s,]+")
 _SEND_TASK_ID = "1"
@@ -275,6 +285,11 @@ def upsert_integration(api: IntegrationApi, name: str, recipients: list[str]) ->
     return "updated" if exists else "created"
 
 
+def is_integration_active(api: IntegrationApi, name: str) -> bool:
+    """メール送信用の連携が公開済みで、実行できる状態かどうかを返す（何も変更しない）。"""
+    return api.is_region_provisioned() and bool(api.list_versions(name, active_only=True))
+
+
 def remove_integration(api: IntegrationApi, name: str) -> bool:
     """このスクリプトが登録した連携だけを削除する。存在しなければ False を返す。"""
     if not api.list_versions(name):
@@ -356,6 +371,17 @@ def main(argv: list[str] | None = None, *, session: Any | None = None) -> int:
     parser.add_argument("--to", default=os.getenv("NOTIFY_EMAIL_TO", ""), help="通知メールの宛先（カンマ区切り）")
     parser.add_argument("--send-test", action="store_true", help="登録後にテストメールを 1 通送る")
     parser.add_argument("--delete", action="store_true", help="このスクリプトが登録した連携を削除する")
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help=f"登録済みかどうかだけを調べる。登録済みなら終了コード 0、未登録なら {EXIT_NOT_REGISTERED}",
+    )
+    parser.add_argument(
+        "--min-daily-limit",
+        type=int,
+        default=0,
+        help=f"1 日の送信上限がこの通数に足りない場合は、何も登録せずに終了コード {EXIT_DAILY_LIMIT_TOO_LOW} で終わる",
+    )
     args = parser.parse_args(argv)
 
     if not args.project or args.project == "your-sandbox-project-id":
@@ -363,7 +389,7 @@ def main(argv: list[str] | None = None, *, session: Any | None = None) -> int:
         return 1
 
     try:
-        recipients = [] if args.delete else parse_recipients(args.to)
+        recipients = [] if (args.delete or args.status) else parse_recipients(args.to)
     except ValueError as exc:
         print(f"エラー: {exc}", file=sys.stderr)
         return 1
@@ -371,6 +397,13 @@ def main(argv: list[str] | None = None, *, session: Any | None = None) -> int:
     try:
         active_session = session or _build_session(args.project)
         api = IntegrationApi(active_session, args.project, args.location)
+
+        if args.status:
+            if is_integration_active(api, args.name):
+                print(f"[OK] メール送信用の連携は登録済みです: {args.name}")
+                return 0
+            print(f"[INFO] メール送信用の連携は未登録です: {args.name}")
+            return EXIT_NOT_REGISTERED
 
         if args.delete:
             if not api.is_region_provisioned():
@@ -382,6 +415,15 @@ def main(argv: list[str] | None = None, *, session: Any | None = None) -> int:
                 print(f"[SKIP] メール送信用の連携は既に存在しません: {args.name}")
             print("[INFO] リージョンの有効化と、有効化時に自動作成された連携 ExecuteConnection は残ります。")
             return 0
+
+        daily_limit = read_email_daily_limit(active_session, args.project)
+        if args.min_daily_limit > 0 and daily_limit is not None and daily_limit < args.min_daily_limit:
+            print(
+                f"エラー: このプロジェクトのメール送信上限は 1 日 {daily_limit:,} 通で、"
+                f"必要な {args.min_daily_limit:,} 通に足りません。何も登録していません。",
+                file=sys.stderr,
+            )
+            return EXIT_DAILY_LIMIT_TOO_LOW
 
         if ensure_region_provisioned(api):
             print(f"[OK] {args.location} で Application Integration を有効化しました。")
@@ -401,7 +443,7 @@ def main(argv: list[str] | None = None, *, session: Any | None = None) -> int:
         print(f"[OK] メール送信用の連携: {args.name} — {verb}")
         print(f"     宛先（連携の定義に固定）: {', '.join(recipients)}")
 
-        print(describe_daily_limit(read_email_daily_limit(active_session, args.project)))
+        print(describe_daily_limit(daily_limit))
 
         if args.send_test:
             sent_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")

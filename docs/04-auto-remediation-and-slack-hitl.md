@@ -381,25 +381,27 @@ gcloud projects add-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
 
 ---
 
-## 6. 全テストスイート（51 件）のローカル実行確認
+## 6. 全テストスイート（88 件）のローカル実行確認
 
-ワークフロー 3 分岐、Slack 再開・即時状態更新、鮮度ライフサイクル、Error Budget 温存計算、メール通知と承認コマンドを含む全 51 件のテストを実行します。
+ワークフロー 3 分岐、Slack 再開・即時状態更新、鮮度ライフサイクル、Error Budget 温存計算、メール通知と承認コマンド、クイックスタートのスクリプトを含む全 88 件のテストを実行します。
 
 ```bash
 source .venv/bin/activate
 pytest -v
 ```
 
-### 期待される出力（全 51 件 PASS）
+### 期待される出力（全 88 件 PASS）
 
 ```text
 tests/test_dedup_and_guardrails.py ........... (6 passed)
-tests/test_email_and_approval_command.py ..... (25 passed)
+tests/test_email_and_approval_command.py ..... (27 passed)
+tests/test_quickstart_consistency.py ......... (27 passed)
+tests/test_quickstart_scripts.py ............. (8 passed)
 tests/test_sandbox_runner.py ................. (4 passed)
 tests/test_slack_hitl_resume.py .............. (11 passed)
 tests/test_slo_metrics.py .................... (4 passed)
 tests/test_workflow_routing.py ............... (1 passed)
-============================== 51 passed ==============================
+============================== 88 passed ==============================
 ```
 
 ---
@@ -408,7 +410,7 @@ tests/test_workflow_routing.py ............... (1 passed)
 
 ```markdown
 `AGENTS.md` を読み込み、第4章（`docs/04-auto-remediation-and-slack-hitl.md`）のテスト検証を実行してください。
-- `.venv` 環境で `pytest -v` を実行し、全 51 件のテスト（重複排除、サンドボックス隔離、Workflow 3分岐、Slack 再開と即時状態更新、自律ナレッジ昇格、鮮度管理、Error Budget 温存計算、メール通知と承認コマンド）が PASS することを確認して報告すること。
+- `.venv` 環境で `pytest -v` を実行し、全 88 件のテスト（重複排除、サンドボックス隔離、Workflow 3分岐、Slack 再開と即時状態更新、自律ナレッジ昇格、鮮度管理、Error Budget 温存計算、メール通知と承認コマンド、クイックスタートのスクリプト）が PASS することを確認して報告すること。
 - Secret Manager への Slack トークン登録は私が手元で入力するため、コマンドのみ案内すること。
 - 代替ルートを使う場合、API 有効化・Pub/Sub 作成・`setup_email_notification.py`・IAM 付与は、実行前に提示して私の `y` 承認を得てから実行すること。
 ```

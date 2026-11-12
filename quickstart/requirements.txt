@@ -1,0 +1,13 @@
+# クイックスタートで手元から実行する Python スクリプト用の最小構成です。
+#   - 通知メールの設定（setup_email_notification.py）
+#   - 可用性 SLO の登録と削除（setup_slo_monitoring.py）
+#   - 承認コマンド（approve_incident.py）
+# エージェント本体の依存パッケージは含みません。単体テストやエージェントのローカル実行を行う場合は、
+# フル版の手順どおり pip install -e ".[dev]" を実行してください。
+# バージョンの指定は pyproject.toml と同じにしています（tests/test_quickstart_consistency.py が照合します）。
+python-dotenv>=1.0.1
+pydantic>=2.8.0
+google-cloud-monitoring>=2.22.0
+google-cloud-logging>=3.11.0
+google-cloud-firestore>=2.16.0
+google-cloud-pubsub>=2.23.0
