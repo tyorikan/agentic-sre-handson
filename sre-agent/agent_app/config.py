@@ -36,13 +36,16 @@ class AgentSettings:
     # Pub/Sub 常時購読設定
     alert_subscription: str = field(default_factory=lambda: os.getenv("ALERT_PUBSUB_SUBSCRIPTION", "sre-alert-stream-sub"))
 
-    # BigQuery 知識ベース（Autonomous Embedding Generation）& 状態管理設定
+    # BigQuery 知識ベース（Autonomous Embedding Generation）& 公式ドキュメント MCP 設定
     bq_dataset: str = field(default_factory=lambda: os.getenv("BQ_DATASET", "sre_agent_ops"))
     bq_runbooks_table: str = field(default_factory=lambda: os.getenv("BQ_RUNBOOKS_TABLE", "incident_runbooks"))
     bq_events_table: str = field(default_factory=lambda: os.getenv("BQ_EVENTS_TABLE", "incident_events"))
     bq_connection_id: str = field(default_factory=lambda: os.getenv("BQ_CONNECTION_ID", "sre_genai_conn"))
     enable_autonomous_kb_learning: bool = field(
         default_factory=lambda: _parse_bool(os.getenv("ENABLE_AUTONOMOUS_KB_LEARNING", "true"))
+    )
+    enable_developer_knowledge_mcp: bool = field(
+        default_factory=lambda: _parse_bool(os.getenv("ENABLE_DEVELOPER_KNOWLEDGE_MCP", "true"))
     )
     runbook_freshness_ttl_days: int = field(
         default_factory=lambda: int(os.getenv("RUNBOOK_FRESHNESS_TTL_DAYS", "90"))

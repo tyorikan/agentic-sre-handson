@@ -169,6 +169,7 @@ gcloud services enable \
   monitoring.googleapis.com \
   logging.googleapis.com \
   aiplatform.googleapis.com \
+  developerknowledge.googleapis.com \
   artifactregistry.googleapis.com \
   cloudbuild.googleapis.com \
   secretmanager.googleapis.com \
@@ -282,6 +283,7 @@ gcloud projects get-iam-policy "${GOOGLE_CLOUD_PROJECT}" \
 
 * [Create and manage Cloud Run instances](https://docs.cloud.google.com/run/docs/instances/create-and-manage-instances) — Cloud Run instances の概要と対応リージョン
 * [Google Cloud MCP servers overview](https://docs.cloud.google.com/mcp/overview) — `roles/mcp.toolUser` を用いた公式リモート MCP サーバーの利用方法
+* [Developer Knowledge MCP server](https://developers.google.com/knowledge/mcp) — 初見エラー調査で参照する Google 公式ドキュメント検索 MCP の仕様
 * [IAM least privilege best practices](https://docs.cloud.google.com/iam/docs/using-iam-securely) — サービスアカウントの最小権限設計ガイド
 * [Set up Application Default Credentials for a local development environment](https://docs.cloud.google.com/docs/authentication/set-up-adc-local-dev-environment) — ローカル端末と Cloud Shell における ADC の設定方法
 

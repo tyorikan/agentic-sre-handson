@@ -161,7 +161,7 @@ pytest -v
 
 ## 5. 自社環境への段階導入ロードマップ（コード変更ゼロ・環境変数のみで切替）
 
-本リポジトリのエージェントは、コードを書き換えずに環境変数と RBAC だけで「観測のみ → 承認実行＋知識蓄積 → 限定自動復旧」の 3 段階ロールアウトをそのまま実践できます。設定値の詳細は [06-optional-hardening-and-cleanup.md](docs/06-optional-hardening-and-cleanup.md) の第 4 節を参照してください。
+本リポジトリのエージェントは、コードを書き換えずに環境変数と RBAC だけで「観測のみ → 承認実行＋知識蓄積 → 限定自動復旧」の 3 段階ロールアウトをそのまま実践できます。自社環境の初期知識ベースには、固有サービス名を含まず変更系をすべて `REQUIRE_APPROVAL` に固定した汎用 240 件カタログ（`bigquery/seed_runbooks_production_starter.jsonl`）と既存手順書インポート CLI（`bigquery/import_markdown_runbooks.py`）を利用できます。詳細は [02-bigquery-vector-kb.md](docs/02-bigquery-vector-kb.md) 第 4 節および [06-optional-hardening-and-cleanup.md](docs/06-optional-hardening-and-cleanup.md) 第 4 節を参照してください。
 
 1. **STEP 1（観測・通知のみ）**: `ALLOWED_K8S_NAMESPACES=""`（GKE `RoleBinding` 未付与）で起動し、変更操作ゼロで診断精度を評価
 2. **STEP 2（人間承認＋自律学習）**: `ALLOWED_K8S_NAMESPACES="対象NS"` かつ `MAX_AUTO_ACTIONS_PER_HOUR="0"` とし、承認された復旧だけを実測検証して `AI.EMBED` 知識ベースへ自動蓄積
@@ -179,11 +179,11 @@ pytest -v
 ├── target-app/                      # 監視対象 GKE アプリ・定常負荷マニフェスト・障害注入 & SLO 管理スクリプト
 │   ├── k8s/                         # namespace / order-service (v1, v2-buggy) / traffic-generator
 │   └── scripts/                     # 4種障害注入・リセット・SLO 管理・通知メール設定・承認コマンド
-├── bigquery/                        # BigQuery AI.EMBED 自動埋め込み DDL・初期シード 100 件 JSONL
+├── bigquery/                        # BigQuery AI.EMBED 自動埋め込み DDL・訓練用 100 件・導入用汎用 240 件・手順書取込 CLI
 ├── sre-agent/                       # Cloud Run instances 常駐エージェント本体 (ADK 2.x + SLO 効果計測)
 ├── quickstart/                      # クイックスタート用: 環境構築・エージェントのデプロイ・後片付けのスクリプト
 ├── appendix/                        # 付録: GKE Standard microVM / Model Armor / pass^3 評価スクリプト
-├── tests/                           # ローカル & GitHub Actions 自動テストスイート (全 99 件)
+├── tests/                           # ローカル & GitHub Actions 自動テストスイート (全 111 件)
 └── docs/                            # クイックスタート・全 7 章 Codelab 教材・構成図 (images/)・概要解説動画 (videos/)
 ```
 
@@ -196,5 +196,6 @@ pytest -v
 * [Autonomous embedding generation in BigQuery](https://docs.cloud.google.com/bigquery/docs/autonomous-embedding-generation) — `AI.EMBED` 自動埋め込み生成列と `AI.SEARCH` による自律知識ベースの構築方法
 * [Concepts in service monitoring (Cloud Monitoring)](https://docs.cloud.google.com/stackdriver/docs/solutions/slo-monitoring) — SLI・SLO・Error Budget と Windows-based / Request-based SLO の設計指針
 * [Use the GKE, Cloud Monitoring, and Cloud Logging MCP servers](https://docs.cloud.google.com/mcp/overview) — Google Cloud 公式リモート MCP サーバーの概要と IAM 設定
+* [Developer Knowledge MCP server](https://developers.google.com/knowledge/mcp) — 初見エラー調査で参照する Google 公式ドキュメント検索 MCP の仕様
 * [Agent Development Kit (ADK) Documentation](https://adk.dev/) — ADK Python 2.x のグラフワークフローと Human-in-the-Loop 仕様
 * [Send Email task (Application Integration)](https://docs.cloud.google.com/application-integration/docs/configure-send-email-task) — 代替ルートの通知メールを送るメール送信タスクの仕様

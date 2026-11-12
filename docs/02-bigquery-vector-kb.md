@@ -233,6 +233,84 @@ bq query \
 
 ---
 
+## 4. 自社環境への導入用カタログ（240 件）と既存手順書の取り込み
+
+ハンズオンでは訓練シナリオ（`order-service` 等）に合わせた `seed_runbooks_100.jsonl` を使いますが、自社環境の PoC や本番導入では、架空のサービス名を含まない汎用障害パターン集と既存手順書の取り込みスクリプトを使用します。
+
+### 4.1 ハンズオン用 100 件と導入用 240 件の使い分け
+
+| データファイル | 件数・内訳 | 主な用途と特徴 |
+|---|---|---|
+| [bigquery/seed_runbooks_100.jsonl](../bigquery/seed_runbooks_100.jsonl) | 100 件（`AUTO_REMEDIATE` 35 / `REQUIRE_APPROVAL` 40 / `OBSERVE` 25） | **ハンズオン訓練専用**。`order-service` 等の訓練用サービス名と検証済み経過日数を含む |
+| [bigquery/seed_runbooks_production_starter.jsonl](../bigquery/seed_runbooks_production_starter.jsonl) | 240 件・8 分類（`REQUIRE_APPROVAL` 217 / `OBSERVE` 23 / **`AUTO_REMEDIATE` 0**） | **自社 PoC・本番の初期土台**。固有サービス名を含まず、すべて「未検証」として登録 |
+
+* **同じデータセットに両方を入れたままにしない**: 似た障害パターンが検索結果で競合するため、ハンズオンと自社検証ではデータセットまたはプロジェクトを分けてください。
+* **導入前の確認推奨**: 汎用 240 件は一般的な GKE・データベース・ネットワーク・IAM・非同期処理の典型パターンをまとめた下書きであり、個別環境で動作検証された記録ではありません。投入前に SRE チームで自社構成に当てはまらない行の除外や手順の調整を行うことを推奨します。
+
+### 4.2 導入用 240 件の投入手順
+
+[bigquery/03_seed_production_starter.sql](../bigquery/03_seed_production_starter.sql) は、一過性の静観（`OBSERVE`）以外の全行を SQL でも強制的に `REQUIRE_APPROVAL` とし、`last_verified_at = NULL`・`verified_count = 0`（未検証）で登録します。承認通知（Slack / メール）では、未検証の事例に一致した際に `この環境では未検証` と明示されます。
+
+```sh
+bq load \
+  --project_id="${GOOGLE_CLOUD_PROJECT}" \
+  --location="${GOOGLE_CLOUD_REGION}" \
+  --source_format=NEWLINE_DELIMITED_JSON \
+  --replace \
+  "${BQ_DATASET}.incident_runbooks_raw" \
+  ./bigquery/seed_runbooks_production_starter.jsonl
+
+bq query \
+  --project_id="${GOOGLE_CLOUD_PROJECT}" \
+  --location="${GOOGLE_CLOUD_REGION}" \
+  --use_legacy_sql=false \
+  < ./bigquery/03_seed_production_starter.sql
+```
+
+### 4.3 既存の運用手順書（Markdown / テキスト）の取り込み
+
+手元にある障害対応手順書や Postmortem（`.md` / `.txt`）は、[bigquery/import_markdown_runbooks.py](../bigquery/import_markdown_runbooks.py) で同じ 15 項目の JSONL へ一括変換できます。取り込み直後の誤自動実行を防ぐため、`recommended_action` は常に `REQUIRE_APPROVAL`、`historical_mttr_minutes` は `0` に固定されます。
+
+```sh
+# 一覧表示のみ（ファイル書き出しなし）
+python3 ./bigquery/import_markdown_runbooks.py \
+  --input ./my_runbooks \
+  --dry-run
+
+# JSONL へ書き出し（内容を人が確認してから 03_seed_production_starter.sql と同じ手順で投入）
+python3 ./bigquery/import_markdown_runbooks.py \
+  --input ./my_runbooks \
+  --output ./bigquery/custom_runbooks.jsonl
+```
+
+* Gemini API を呼ばずに見出しルールだけで変換する場合は `--offline` を付与します（操作種別はすべて `MANUAL_INTERVENTION` になります）。
+
+### 4.4 実運用での学習と自動復旧への切り替え
+
+初期投入データの使われ方は、アラートとの類似度によって 2 通りに分かれます。
+
+1. **類似度が `0.85` 未満で一致した場合（汎用 240 件での典型挙動）**: 固有サービス名を持たない汎用エントリは、`AI.SEARCH` の実測で類似度が概ね `0.78〜0.84` になります。トリアージ時の参考手順として上位 3 件に渡された上で、人間が承認して回復確認に成功すると、そのサービス固有の `AUTO-*` Runbook が自動登録されます（Rollback / Restart 実行時は次回から `AUTO_REMEDIATE` 対象）。
+2. **類似度が `0.85` 以上で一致した場合（自社サービス名入りの手順書を取り込んだ場合など）**: 承認・回復確認時には `last_verified_at` と `verified_count` のみが更新され、**自動では `AUTO_REMEDIATE` へ昇格しません**。自動化の範囲を人が管理できるよう、実績を確認した手順だけを以下の SQL で明示的に昇格させます。
+
+```sql
+-- 承認実行と事後回復確認が 2 回以上成功している昇格候補の確認
+SELECT runbook_id, title, remediation_type, verified_count, last_verified_at
+FROM `sre_agent_ops.incident_runbooks`
+WHERE recommended_action = 'REQUIRE_APPROVAL'
+  AND remediation_type IN ('ROLLBACK_DEPLOYMENT', 'RESTART_DEPLOYMENT')
+  AND verified_count >= 2
+ORDER BY verified_count DESC;
+
+-- 運用者が確認した特定の Runbook を自動復旧対象へ切り替える（search_document 不変のため再埋め込み不要）
+UPDATE `sre_agent_ops.incident_runbooks`
+SET recommended_action = 'AUTO_REMEDIATE'
+WHERE runbook_id = 'CUST-XXXXXXXX'
+  AND remediation_type IN ('ROLLBACK_DEPLOYMENT', 'RESTART_DEPLOYMENT')
+  AND verified_count >= 1;
+```
+
+---
+
 ## 🤖 AI コーディングエージェントを使う場合の指示プロンプト
 
 ```markdown

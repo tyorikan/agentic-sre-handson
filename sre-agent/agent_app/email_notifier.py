@@ -116,6 +116,11 @@ def _plain(text: str) -> str:
     return cleaned
 
 
+# 最終検証日が無い事例（この環境でまだ一度も検証していない事例）に対して、知識ベースの検索が返す経過日数
+NEVER_VERIFIED_AGE_DAYS = 9999.0
+NEVER_VERIFIED_LABEL = "この環境では未検証"
+
+
 def _matched_runbook_line(decision: TriageDecision) -> str:
     runbook_id = decision.matched_runbook_id.strip()
     if not runbook_id or runbook_id == "NONE":
@@ -124,7 +129,9 @@ def _matched_runbook_line(decision: TriageDecision) -> str:
             return f"該当なし / 最も近い事例との類似度 {decision.similarity_score:.2f}"
         return "該当なし"
     line = f"{runbook_id} / 類似度 {decision.similarity_score:.2f}"
-    if decision.matched_runbook_age_days >= 0.0:
+    if decision.matched_runbook_age_days >= NEVER_VERIFIED_AGE_DAYS:
+        line += f" / {NEVER_VERIFIED_LABEL}"
+    elif decision.matched_runbook_age_days >= 0.0:
         line += f" / 最終検証 {decision.matched_runbook_age_days:.0f} 日前"
     return line
 

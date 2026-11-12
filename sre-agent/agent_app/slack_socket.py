@@ -28,6 +28,8 @@ from slack_bolt.async_app import AsyncApp
 
 from .config import AgentSettings
 from .email_notifier import (
+    NEVER_VERIFIED_AGE_DAYS,
+    NEVER_VERIFIED_LABEL,
     ApplicationIntegrationEmailSender,
     EmailSender,
     NotificationEmail,
@@ -79,11 +81,12 @@ def build_report_blocks(result: WorkflowRunResult) -> list[dict[str, Any]]:
             "REQUIRE_APPROVAL": "🟠 承認待機 (REQUIRE_APPROVAL)",
         }[dec.decision]
 
-    age_suffix = (
-        f" / 最終検証 `{dec.matched_runbook_age_days:.0f}日前`"
-        if dec.matched_runbook_id != "NONE" and dec.matched_runbook_age_days >= 0.0
-        else ""
-    )
+    if dec.matched_runbook_id == "NONE" or dec.matched_runbook_age_days < 0.0:
+        age_suffix = ""
+    elif dec.matched_runbook_age_days >= NEVER_VERIFIED_AGE_DAYS:
+        age_suffix = f" / {NEVER_VERIFIED_LABEL}"
+    else:
+        age_suffix = f" / 最終検証 `{dec.matched_runbook_age_days:.0f}日前`"
 
     blocks: list[dict[str, Any]] = [
         {

@@ -37,6 +37,7 @@ fi
 : "${ALERT_PUBSUB_SUBSCRIPTION:=sre-alert-stream-sub}"
 : "${BQ_DATASET:=sre_agent_ops}"
 : "${BQ_CONNECTION_ID:=sre_genai_conn}"
+: "${ENABLE_DEVELOPER_KNOWLEDGE_MCP:=true}"
 : "${SLACK_ALERT_CHANNEL_ID:=}"
 : "${SLACK_ALLOWED_APPROVER_IDS:=}"
 : "${NOTIFY_EMAIL_TO:=}"

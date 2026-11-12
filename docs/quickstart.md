@@ -479,6 +479,7 @@ bq query --project_id="${GOOGLE_CLOUD_PROJECT}" --location="${GOOGLE_CLOUD_REGIO
 | 訓練の前後での Error Budget の比較 | [第 5 章](05-deploy-cloud-run-instance-and-drills.md) の Step 3.0 のコマンドを実行します |
 | 単体テストと、エージェントのコードの解説 | [第 3 章](03-diagnostic-agent-and-sandbox.md) と [第 4 章](04-auto-remediation-and-slack-hitl.md) を参照します。テストの実行には `pip install -e ".[dev]"` が必要です |
 | オーナー以外の最小限のロールでの実施 | [第 0 章](00-overview-and-architecture.md) の Step 2.0 を参照します。クイックスタートのスクリプトは、オーナーでの実行だけを確認しています |
+| 自社環境向けの汎用 240 件カタログと既存手順書の取り込み | [第 2 章](02-bigquery-vector-kb.md) の第 4 節を参照します |
 | 本番へ向けた強化 | [第 6 章](06-optional-hardening-and-cleanup.md) を参照します |
 
 ---

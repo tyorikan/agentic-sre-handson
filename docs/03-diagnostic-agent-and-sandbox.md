@@ -21,7 +21,7 @@ flowchart TD
         Dedup["dedup_store.py<br/>Firestore 15分排他リース共有"]
         Enrich["telemetry_enrichment.py<br/>直近90秒エラー率 & 30分内デプロイ履歴"]
         Vec["vector_kb.py<br/>BigQuery AI.SEARCH 類似照合・鮮度算出"]
-        Sandbox["sandbox_runner / mcp_tools<br/>sandbox do 隔離解析(上限2) & 公式読取MCP 10種"]
+        Sandbox["sandbox_runner / mcp_tools<br/>sandbox do 隔離解析(上限2) & 公式読取MCP 10種 + 文書MCP 2種"]
         Dedup --> Enrich --> Sandbox
         Dedup -.-> Vec
     end
@@ -62,16 +62,19 @@ flowchart TD
 
 ## 3. Google Cloud 公式リモート MCP サーバーの厳選接続
 
-[sre-agent/agent_app/mcp_tools.py](../sre-agent/agent_app/mcp_tools.py) では、自前の MCP コンテナを運用する代わりに、Google Cloud が標準提供する 3 つのリモート MCP エンドポイントへ接続します。
+[sre-agent/agent_app/mcp_tools.py](../sre-agent/agent_app/mcp_tools.py) では、自前の MCP コンテナを運用する代わりに、Google が提供するリモート MCP エンドポイントへ接続します。用途に応じて「環境の観測（必須 3 エンドポイント・10 ツール）」と「公式ドキュメント検索（補助 1 エンドポイント・2 ツール）」に分けています。
 
-| 接続先サービス | エンドポイント URL | `tool_filter` で公開する厳選 10 ツール |
-|---|---|---|
-| **Cloud Monitoring** | `https://monitoring.googleapis.com/mcp` | `list_timeseries`, `query_range`, `list_alerts` |
-| **Cloud Logging** | `https://logging.googleapis.com/mcp` | `list_log_entries` |
-| **GKE (Read-Only)** | `https://container.googleapis.com/mcp/read-only` | `get_cluster`, `get_k8s_resource`, `describe_k8s_resource`, `list_k8s_events`, `get_k8s_rollout_status`, `get_k8s_logs` |
+| 区分 | 接続先サービス | エンドポイント URL | `tool_filter` で公開するツール |
+|---|---|---|---|
+| **環境の観測（必須）** | **Cloud Monitoring** | `https://monitoring.googleapis.com/mcp` | `list_timeseries`, `query_range`, `list_alerts` |
+| **環境の観測（必須）** | **Cloud Logging** | `https://logging.googleapis.com/mcp` | `list_log_entries` |
+| **環境の観測（必須）** | **GKE (Read-Only)** | `https://container.googleapis.com/mcp/read-only` | `get_cluster`, `get_k8s_resource`, `describe_k8s_resource`, `list_k8s_events`, `get_k8s_rollout_status`, `get_k8s_logs` |
+| **公式文書検索（補助）** | **Developer Knowledge** | `https://developerknowledge.googleapis.com/mcp` | `search_documents`, `get_documents` |
 
 * **GKE は `/mcp/read-only` を指定**: 変更系ツール（リソース削除・パッチ等）がエンドポイント自体に存在しないため、調査フェーズでの誤変更を構造的に遮断できます。
-* **`tool_filter` で 10 ツールに限定**: 不要な汎用ツールを隠すことで、モデルのツール選択迷いとレイテンシを抑えます。
+* **`tool_filter` で公開ツールを厳選**: 不要な汎用ツールや日次割り当ての小さい `answer_query` を隠すことで、モデルのツール選択迷いとトークン消費を抑えます。
+* **初見エラー時のみ・固有情報を含めずに検索**: 公式ドキュメント検索は類似度 `0.85` 未満の初見エラーに限り、一般的な英語技術キーワード 2〜5 語で最大 2 回まで呼び出すようプロンプトで制約しています（ログ本文・ホスト名・ID は検索語に含めません）。
+* **補助接続の Fail-Open 設計**: Developer Knowledge は `OptionalMcpToolset`（接続・読み取りタイムアウト 10 秒）で包んでおり、API 未有効やネットワーク制約で到達できない場合も警告ログを 1 行出して観測 10 ツールのみでトリアージを継続します。環境変数 `ENABLE_DEVELOPER_KNOWLEDGE_MCP="false"` で明示的に無効化することも可能です。VPC Service Controls 環境での注意点は [第 6 章](06-optional-hardening-and-cleanup.md) を参照してください。
 
 ---
 
@@ -152,5 +155,6 @@ tests/test_sandbox_runner.py::test_100_runbooks_dataset_integrity_and_retrieval 
 * [Code execution in Cloud Run](https://docs.cloud.google.com/run/docs/code-execution) — Cloud Run sandboxes のセキュリティ境界と `sandbox do` の仕様
 * [Cloud Run sandbox CLI reference](https://docs.cloud.google.com/run/docs/reference/sandbox-cli) — `sandbox do` / `delete --force` のフラグ仕様
 * [GKE MCP server reference](https://docs.cloud.google.com/kubernetes-engine/docs/reference/mcp) — `/mcp/read-only` ツールセットの仕様
+* [Developer Knowledge MCP server](https://developers.google.com/knowledge/mcp) — Google 公式ドキュメント検索 MCP の仕様・割り当て・ネットワーク要件
 
 次へ進む 👉 [第 4 章：ADK 2.x ワークフロー・型付き自動復旧・Slack 連携・Error Budget 効果計測](04-auto-remediation-and-slack-hitl.md)

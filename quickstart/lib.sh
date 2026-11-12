@@ -20,6 +20,7 @@ REQUIRED_APIS=(
   monitoring.googleapis.com
   logging.googleapis.com
   aiplatform.googleapis.com
+  developerknowledge.googleapis.com
   artifactregistry.googleapis.com
   cloudbuild.googleapis.com
   secretmanager.googleapis.com

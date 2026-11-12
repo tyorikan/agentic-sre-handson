@@ -99,6 +99,7 @@ flowchart LR
 </details>
 
 * 日本語の通常ログの誤検知を防ぐため、`enable_multi_language_detection = True` とリージョン固有エンドポイント（`modelarmor.<LOCATION>.rep.googleapis.com`）を設定します。
+* 組織のフロア設定で Google リモート MCP サーバー（`GOOGLE_MCP_SERVER`）へプロンプトインジェクション検査を適用している場合、エラー文言を含む検索クエリや抜粋応答が誤検知（`403`）されることがあります。公式ドキュメント検索は `OptionalMcpToolset` により失敗時も自動でスキップされますが、恒常的に遮断される環境では `ENABLE_DEVELOPER_KNOWLEDGE_MCP="false"` を指定してください。
 
 ---
 
@@ -136,7 +137,9 @@ python3 ./appendix/production-hardening/calc_pass_hat_k.py \
 | **STEP 2: 人間承認＋自律学習**［2〜4 週間］ | `ALLOWED_K8S_NAMESPACES="対象NS"` / `MAX_AUTO_ACTIONS_PER_HOUR="0"` / `ALLOW_DRILL_COOLDOWN_RESET="false"` / `SLACK_ALLOWED_APPROVER_IDS` 指定 | すべての復旧候補が決定論的ガードレールで承認待ちへ移行。人間が承認して回復実証された手順だけが `AI.EMBED` 知識ベースへ自動蓄積 |
 | **STEP 3: 限定自動復旧**［定着後］ | `ALLOWED_K8S_NAMESPACES="対象NS"` / `MAX_AUTO_ACTIONS_PER_HOUR="1"` / `ALLOW_DRILL_COOLDOWN_RESET="false"` / `RUNBOOK_FRESHNESS_TTL_DAYS="90"` | 類似度 `0.85` 以上かつ直近 90 日以内に実証済みの既知障害のみ 1 時間 1 回まで即時自動復旧。DB・未知・90 日超過手順は承認を維持 |
 
+* **初期知識ベースの入れ替え**: 自社環境への導入時はハンズオン用 100 件ではなく、導入用の汎用 240 件（`seed_runbooks_production_starter.jsonl`）または既存手順書の変換データを投入します。投入手順と自動復旧への明示昇格 SQL は [第 2 章](02-bigquery-vector-kb.md) の第 4 節を参照してください。
 * **閉域 GKE コントロールプレーンへ接続する場合**: 本ハンズオンの GKE はプライベートノード構成（コントロールプレーン外部到達有効）ですが、本番でコントロールプレーンの外部エンドポイントも閉じている場合は、Cloud Run instance に Direct VPC Egress（`--network` / `--subnet`）を設定するか GKE の DNS ベースエンドポイントを使用してください。
+* **VPC Service Controls 環境での Developer Knowledge MCP**: `developerknowledge.googleapis.com` は Restricted VIP（`restricted.googleapis.com`）に対応していません。VPC 内で `*.googleapis.com` を Restricted VIP へ向けている場合は、`developerknowledge.googleapis.com` のみ Private Google Access（`private.googleapis.com` / `199.36.153.8/30`）へ解決させるか、`ENABLE_DEVELOPER_KNOWLEDGE_MCP="false"` で無効化してください。
 
 ---
 
@@ -299,4 +302,5 @@ done
 * [GKE Sandbox overview (microVMs vs gVisor)](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/sandbox-pods) — GKE Sandbox の隔離方式比較と制限事項
 * [Model Armor overview](https://docs.cloud.google.com/model-armor/overview) — プロンプトインジェクションおよび機密データ保護機能の概要
 * [ADK Evaluation guide](https://adk.dev/evaluate/) — エージェントの軌跡と最終応答品質の自動評価ガイド
+* [Developer Knowledge MCP server](https://developers.google.com/knowledge/mcp) — 公式ドキュメント検索 MCP の VPC Service Controls 制約と接続仕様
 * [Application Integration pricing](https://cloud.google.com/application-integration/pricing) — 連携の実行回数に応じた従量課金と無料枠
