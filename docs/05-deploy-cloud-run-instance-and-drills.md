@@ -16,28 +16,29 @@
 
 ```mermaid
 flowchart LR
-    Internet["外部インターネット<br/>未認証アクセス / Webhook 偽装攻撃"] -.->|"完全遮断: ingress=internal & default-url-disabled"| Daemon
+    Internet["外部インターネット<br/>未認証アクセス / Webhook 偽装攻撃"]
 
     subgraph Instance["本章でデプロイ: Cloud Run instance / asia-northeast1"]
-        direction TB
-        Daemon["agent_app.main 常駐プロセス<br/>restartPolicy: always"] <--> SubSB["Cloud Run sandbox<br/>sandboxLauncher: true"]
+        Guard["着信境界ガード<br/>ingress: internal / default-url 無効化"]
+        SubSB["Cloud Run sandbox<br/>sandboxLauncher: true"]
+        Daemon["agent_app.main 常駐プロセス<br/>restartPolicy: always"]
     end
 
-    subgraph Outbound["すべて外向き TLS / WSS 通信のみで接続"]
-        direction TB
-        PS["1. Cloud Pub/Sub<br/>StreamingPull: アラート用 + 承認専用"]
-        GCP["2. 公式 MCP / BigQuery / Firestore<br/>Gemini 3.8 Flash"]
-        GKE["3. 監視対象 GKE<br/>sre-demo-app/order-service"]
-        Slack["4. Slack ワークスペース<br/>Socket Mode 外向き WSS"]
-        Mail["5. Application Integration<br/>通知メール送信: Slack を使えない場合の代替"]
-    end
+    PS["1. Cloud Pub/Sub<br/>StreamingPull: アラート用 + 承認専用"]
+    GCP["2. 公式 MCP / BigQuery / Firestore<br/>Gemini 3.8 Flash"]
+    GKE["3. 監視対象 GKE<br/>sre-demo-app/order-service"]
+    Slack["4. Slack ワークスペース<br/>Socket Mode 外向き WSS"]
+    Mail["5. Application Integration<br/>通知メール送信: Slack を使えない場合の代替"]
 
+    Internet -.->|"着信完全遮断"| Guard
+    Guard -.->|"外部ポート非公開"| Daemon
+    SubSB <-->|"stdout JSON 返却"| Daemon
     Daemon --> PS & GCP & GKE & Mail
     Daemon <--> Slack
 
     classDef block fill:#fce8e6,stroke:#c5221f,stroke-width:2px,color:#202124;
     classDef core fill:#ffffff,stroke:#1a73e8,stroke-width:2px,color:#202124;
-    class Internet block;
+    class Internet,Guard block;
     class SubSB,Daemon,PS,GCP,GKE,Slack,Mail core;
 ```
 
