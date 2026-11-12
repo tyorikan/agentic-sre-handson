@@ -15,36 +15,35 @@
 <summary>詳細: Mermaid ソースを表示</summary>
 
 ```mermaid
-flowchart LR
-    subgraph Prev["第 1〜2 章で構築済み"]
-        direction TB
-        PS["Cloud Pub/Sub ストリーム"]
-        BQ["BigQuery 100件知識ベース"]
+flowchart TD
+    subgraph Now["本章の対象: Phase 1 読取・補完・隔離診断モジュール"]
+        direction LR
+        Dedup["dedup_store.py<br/>Firestore 15分排他リース共有"]
+        Enrich["telemetry_enrichment.py<br/>直近90秒エラー率 & 30分内デプロイ履歴"]
+        Vec["vector_kb.py<br/>BigQuery AI.SEARCH 類似照合・鮮度算出"]
+        Sandbox["sandbox_runner / mcp_tools<br/>sandbox do 隔離解析(上限2) & 公式読取MCP 10種"]
+        Dedup --> Enrich --> Sandbox
+        Dedup -.-> Vec
     end
 
-    subgraph Now["本章の対象: Phase 1 読み取り・補完・隔離診断"]
-        direction LR
-        Dedup["dedup_store.py<br/>Fingerprint 15分重複排除"]
-        Enrich["telemetry_enrichment.py<br/>ログ時系列エラー率・デプロイ履歴補完"]
-        Sandbox["sandbox_runner.py<br/>/usr/local/gcp/bin/sandbox do<br/>外向き通信遮断・減衰傾き計算"]
-        Vec["vector_kb.py<br/>AI.SEARCH 類似照合 & 自律ナレッジ登録"]
-        MCP["mcp_tools.py<br/>公式リモート MCP 読取専用 10 ツール"]
-        Dedup --> Enrich --> Sandbox & Vec
+    subgraph Prev["第 1〜2 章で構築済み"]
+        PS["Cloud Pub/Sub<br/>ERROR ログ & SLO 急燃焼"]
+        BQ["BigQuery & Firestore<br/>過去100件 KB & 15分排他状態"]
     end
 
     subgraph Next["第 4〜5 章で結合"]
-        WF["workflow.py<br/>ADK 2.x 相関推論・型付き復旧・Slack HITL"]
+        WF["workflow.py<br/>ADK 2.x 相関推論・多層ガード・復旧・通知"]
     end
 
-    PS --> Dedup
-    BQ <--> Vec
-    Sandbox & Vec & MCP --> WF
+    PS -->|"イベント受信"| Dedup
+    BQ <-->|"照会・排他"| Vec
+    Sandbox -->|"診断結果合流"| WF
 
     classDef done fill:#e6f4ea,stroke:#137333,stroke-width:2px,color:#202124;
     classDef cur fill:#ffffff,stroke:#1a73e8,stroke-width:2px,color:#202124;
     classDef fut fill:#f8f9fa,stroke:#9aa0a6,stroke-width:1.5px,color:#202124;
     class PS,BQ done;
-    class Dedup,Enrich,Sandbox,Vec,MCP cur;
+    class Dedup,Enrich,Sandbox,Vec cur;
     class WF fut;
 ```
 
@@ -89,12 +88,12 @@ flowchart LR
 flowchart LR
     subgraph HostContainer["親コンテナ: SRE エージェント本体 / Cloud Run instance"]
         Env["保持している秘密情報・権限<br/>・SLACK_BOT_TOKEN / APP_TOKEN<br/>・GCP メタデータサーバー SA トークン<br/>・外向き HTTPS / WSS 通信権限"]
-        Runner["SandboxRunner<br/>sandbox_runner.py"]
-        Env --- Runner
+        Runner["SandboxRunner (sandbox_runner.py)<br/>同時実行上限セマフォ (上限 2 並列)"]
+        Env -.->|"トークン非公開"| Runner
     end
 
     subgraph IsolatedSandbox["隔離空間: /usr/local/gcp/bin/sandbox do --stdin=false"]
-        Calc["python3 -I -c 統計回帰スクリプト<br/>・外向きネットワーク完全遮断: --allow-egress 無し<br/>・親の環境変数・トークン非継承: -e 無し<br/>・GCP メタデータサーバー到達不可<br/>・ルート FS 読取専用: /tmp のみメモリ書込可"]
+        Calc["python3 -I -c 統計回帰スクリプト<br/>・外向き通信を完全遮断: --allow-egress 無し<br/>・親の環境変数・トークン非継承: -e 無し<br/>・GCP メタデータサーバー到達不可<br/>・ルート FS 読取専用: /tmp のみメモリ書込可"]
     end
 
     Runner -->|"引数で数値配列のみ渡す"| Calc

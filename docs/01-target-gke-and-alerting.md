@@ -20,34 +20,36 @@ flowchart LR
         direction TB
         Traffic["定常トラフィック Pod<br/>5秒に1回 POST /orders"]
         App["注文 API: order-service<br/>Namespace: sre-demo-app"]
-        RBAC["Role / RoleBinding<br/>sre-demo-app 内の Deployment 更新・参照のみ許可"]
+        RBAC["Namespace 限定 RBAC<br/>Deployment 参照・更新のみ許可<br/>email + 21桁 uniqueId 固定"]
         Traffic -->|"毎分12件"| App
     end
 
-    subgraph Now2["本章で構築 2: 高速検知ストリーム & 公式 SLO"]
+    subgraph Now2["本章で構築 2: 高速検知・SLO・死活監視"]
         direction TB
-        Sink["Cloud Logging シンク<br/>severity >= ERROR のみ抽出"]
+        Sink["エラーシンク<br/>severity >= ERROR 即時抽出"]
         Topic["Cloud Pub/Sub<br/>sre-alert-stream-sub"]
-        SLO["Service Monitoring SLO<br/>order_requests_count カウンタ<br/>日次 99.0% & 月次 99.9%"]
-        Sink -->|"異常時のみ"| Topic
+        SLO["Service Monitoring SLO<br/>order_requests_count 集計<br/>日次 99.0% / 月次 99.9%"]
+        HB["エージェント死活監視<br/>Heartbeat 5分間不在時にメール発報"]
+        Sink --> Topic
+        SLO -->|"10分急燃焼"| Topic
     end
 
     subgraph Later["第 2〜5 章で構築・接続"]
         direction TB
         Agent["Cloud Run instance<br/>常駐 SRE エージェント"]
         BQ["BigQuery 100件知識ベース"]
-        Agent <-.->|"類似検索"| BQ
+        Agent <-.->|"AI.SEARCH 照合"| BQ
     end
 
-    App -->|"異常ログ"| Sink
+    App -->|"ERROR ログ"| Sink
     App -->|"全注文ログ"| SLO
     Topic -.->|"StreamingPull"| Agent
-    SLO -.->|"バジェット残量読取"| Agent
-    RBAC <-.->|"型付き復旧 API"| Agent
+    Agent -.->|"60秒 Heartbeat"| HB
+    Agent -.->|"AppsV1 最小権限ロールバック・再起動"| RBAC
 
     classDef active fill:#ffffff,stroke:#1a73e8,stroke-width:2px,color:#202124;
     classDef future fill:#f8f9fa,stroke:#9aa0a6,stroke-width:1.5px,color:#202124;
-    class Traffic,App,RBAC,Sink,Topic,SLO active;
+    class Traffic,App,RBAC,Sink,Topic,SLO,HB active;
     class Agent,BQ future;
 ```
 

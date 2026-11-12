@@ -15,30 +15,26 @@
 <summary>詳細: Mermaid ソースを表示</summary>
 
 ```mermaid
-flowchart LR
-    Alert["アラート・異常ログ検知<br/>Pub/Sub ストリーム受信"] --> Dedup{"クールダウン判定<br/>直近15分以内か?"}
-    Dedup -->|"はい"| Skip["重複排除スキップ<br/>LLM 呼び出し 0 回"]
-    Dedup -->|"いいえ"| Parallel["テレメトリ補完 & 並列診断<br/>1. ログ時系列エラー率・デプロイ履歴補完<br/>2. 隔離 sandbox 減衰傾き計算<br/>3. BigQuery 過去障害100件照合 + 公式 MCP"]
-    Parallel --> Guard{"安全ガードレール検証<br/>許可NS・類似度・鮮度90日・回数上限"}
+flowchart TD
+    Alert["1. 異常・SLO急燃焼検知<br/>Pub/Sub ストリーム受信 / CLOSED 除外"] --> Dedup{"2. 15分排他リース判定<br/>Firestore トランザクション共有"}
+    Dedup -->|"15分以内"| Skip["重複排除スキップ<br/>LLM 呼び出し 0 回"]
+    Dedup -->|"新規障害のみ"| Parallel["3. 補完 & 並列相関診断<br/>直近エラー率 + sandbox 傾き解析<br/>BQ 100件照合 + 公式読取 MCP"]
+    Parallel --> Guard{"4. 多層安全ガードレール<br/>許可NS・類似度0.85・推奨一致<br/>デプロイ相関・鮮度90日・1回/h"}
 
-    Guard -->|"一過性エラー・自然減衰中"| S1["シナリオ 1: 静観 OBSERVE<br/>操作せず Slack へ根拠通知"]
-    Guard -->|"既知バグ 類似度>=0.85<br/>鮮度90日内 & 1時間初回"| S2["シナリオ 2: 自動復旧 AUTO_REMEDIATE<br/>Deployment ロールバック実行<br/>+ 回復確認 < 1.0%・鮮度更新"]
-    Guard -->|"未知の障害 / 鮮度90日超過<br/>または回数上限到達"| S3["シナリオ 3・4: 人間承認待ち REQUIRE_APPROVAL<br/>Firestore 保存・ADK 一時停止<br/>Slack Approve / Reject ボタン送信"]
-    S3 -->|"Approve 押下"| Resume["ADK 再開・処置実行<br/>初見は自動ナレッジ昇格 / 既知は鮮度復活"]
-    S3 -->|"Reject 押下"| Manual["手動調査へ引継 & 承認制へ自動降格"]
+    Guard -->|"自然減衰中"| S1["シナリオ 1: 静観 OBSERVE<br/>操作ゼロ・根拠通知 / 継続中は静観誘導棄却"]
+    Guard -->|"既知 >=0.85・鮮度内"| S2["シナリオ 2: 自動復旧 AUTO_REMEDIATE<br/>健全版 Rollback / Restart + エラー率 < 1% 検証"]
+    Guard -->|"未知 / 90日超 / 上限"| S3["シナリオ 3・4: 人間承認待ち REQUIRE_APPROVAL<br/>Approve: 処置＋KB登録・鮮度更新 / Reject: 手動引継・凍結"]
 
     classDef base fill:#ffffff,stroke:#4285F4,stroke-width:1.5px,color:#202124;
     classDef mute fill:#f8f9fa,stroke:#9aa0a6,stroke-width:1.5px,color:#202124;
     classDef ok fill:#e6f4ea,stroke:#137333,stroke-width:2px,color:#202124;
     classDef auto fill:#e8f0fe,stroke:#1967d2,stroke-width:2px,color:#202124;
     classDef hitl fill:#fef7e0,stroke:#b06000,stroke-width:2px,color:#202124;
-    classDef warn fill:#fce8e6,stroke:#c5221f,stroke-width:2px,color:#202124;
     class Alert,Dedup,Parallel,Guard base;
     class Skip mute;
-    class S1,Resume ok;
+    class S1 ok;
     class S2 auto;
     class S3 hitl;
-    class Manual warn;
 ```
 
 </details>

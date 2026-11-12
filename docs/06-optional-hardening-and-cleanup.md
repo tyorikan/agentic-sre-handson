@@ -15,21 +15,25 @@
 <summary>詳細: Mermaid ソースを表示</summary>
 
 ```mermaid
-flowchart LR
-    subgraph SysPool["管理用 GKE Standard: default-pool / 通常 COS ノード"]
-        KubeSys["kube-system 等の管理 Pod<br/>監視対象クラスタとも分離運用"]
+flowchart TD
+    subgraph PodVM["管理用 GKE Standard: sandbox-microvm-class — Pod 単位の専用軽量 VM (GA)"]
+        direction LR
+        GuestKernel["専用ゲスト Linux カーネル<br/>runtimeClassName: microvm"]
+        AgentProc["SRE エージェント本体<br/>n4 / n2 専用 vCPU・フル Linux 互換"]
+        NetPol["NetworkPolicy 強制境界<br/>・Ingress 着信を全面拒否<br/>・メタデータ到達先を最小制限"]
+        GuestKernel --- AgentProc --> NetPol
     end
 
-    subgraph PodVM["ComputeClass: sandbox-microvm-class / runtimeClassName: microvm"]
-        direction TB
-        GuestKernel["専用ゲスト Linux カーネル<br/>Cloud Hypervisor + Kata Containers"]
-        AgentProc["SRE エージェント コンテナ<br/>フル Linux システムコール互換"]
-        NetPol["NetworkPolicy<br/>・Ingress 全面拒否<br/>・169.254.169.254 メタデータ遮断"]
-        GuestKernel --- AgentProc --- NetPol
+    subgraph SysPool["管理用 GKE: default-pool — 通常 COS ノード"]
+        KubeSys["クラスタ管理 Pod 群<br/>kube-system 等を別プールへ分離稼働"]
+    end
+
+    subgraph EgPool["許可された外向き通信先"]
+        External["外向き TLS 443 / WSS のみ<br/>Pub/Sub・BigQuery・Firestore・MCP・Slack・GKE API"]
     end
 
     KubeSys -.->|"ノードプール分離"| AgentProc
-    AgentProc -->|"外向き TLS のみ"| External["Pub/Sub / BigQuery / Firestore / Slack / 監視対象 GKE"]
+    NetPol -->|"最小 Egress 通信"| External
 
     classDef sys fill:#f8f9fa,stroke:#9aa0a6,stroke-width:1.5px,color:#202124;
     classDef vm fill:#ffffff,stroke:#1967d2,stroke-width:2px,color:#202124;
@@ -78,9 +82,9 @@ kubectl apply -f ./appendix/gke-microvm/network-policy-metadata-deny.yaml
 
 ```mermaid
 flowchart LR
-    LogTool["Cloud Logging MCP<br/>外部入力を含むエラーログ"] -->|"ツール出力"| Plugin["ADK ModelArmorPlugin<br/>tool_output_template_name / 多言語検出 = True"]
-    Plugin -->|"悪意ある命令を検知"| Block["フェイルクローズ遮断<br/>モデルへ渡さずオンコール担当者へ通知"]
-    Plugin -->|"安全性確認 OK"| Model["gemini-3.8-flash<br/>インシデント相関分析を継続"]
+    LogTool["監視対象ログ & MCP 応答<br/>untrusted_log_summary 境界タグ付与"] -->|"未信頼データ検査"| Plugin["Model Armor 多言語検査<br/>MODEL_ARMOR_TEMPLATE_ID / ModelArmorPlugin"]
+    Plugin -->|"攻撃検知"| Block["脅威検知時: 安全退避・遮断<br/>LLM 判断を飛ばし REQUIRE_APPROVAL 通知"]
+    Plugin -->|"確認 OK"| Model["安全性確認 OK: Gemini 3.8 Flash<br/>相関推論 / 継続中の静観誤誘導も後段で棄却"]
 
     classDef base fill:#ffffff,stroke:#4285F4,stroke-width:1.5px,color:#202124;
     classDef guard fill:#f3e8fd,stroke:#A142F4,stroke-width:2px,color:#202124;

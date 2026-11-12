@@ -229,21 +229,20 @@ source ./quickstart/env.sh
 <summary>詳細: Mermaid ソースを表示</summary>
 
 ```mermaid
-flowchart LR
-    Inject["1. 障害を注入<br/>訓練用のスクリプトをターミナルで実行"]
-    App["監視対象アプリ<br/>GKE 上の order-service"]
-    Agent["2. SRE エージェント<br/>Cloud Run instance に常駐<br/>原因を調べて対応を決める"]
-    Mail["3. 通知メール<br/>判断と根拠が届く<br/>静観と自動復旧は読むだけ"]
-    Approve["4. 承認コマンド<br/>承認待ちのときだけ実行<br/>approve か reject を入力"]
+flowchart TD
+    Inject["1. 障害を注入・異常発火<br/>訓練スクリプト実行 → GKE order-service 異常発火"]
+    Agent["2. 常駐 SRE エージェント<br/>Cloud Run instance で隔離解析・過去100件照合"]
+    Mail["3. 通知メールを受信<br/>判断と根拠が届く / 静観と自動復旧は読むだけで完了"]
+    Approve["4. 承認コマンドを実行<br/>承認待ち時のみ approve または reject を送信"]
 
-    Inject --> App -->|"エラーログ"| Agent -->|"判断のたびに送信"| Mail
-    Mail -.->|"承認待ちの場合"| Approve
-    Approve -->|"承認または却下"| Agent
+    Inject -->|"異常通知"| Agent -->|"判断のたび送信"| Mail
+    Mail -.->|"承認待ち時"| Approve
+    Approve -->|"承認・却下"| Agent
 
     classDef base fill:#ffffff,stroke:#4285F4,stroke-width:1.5px,color:#202124;
     classDef agent fill:#e8f0fe,stroke:#1a73e8,stroke-width:2px,color:#202124;
     classDef human fill:#fef7e0,stroke:#b06000,stroke-width:2px,color:#202124;
-    class Inject,App base;
+    class Inject base;
     class Agent agent;
     class Mail,Approve human;
 ```
