@@ -25,7 +25,7 @@ flowchart LR
     end
 
     PS["1. Cloud Pub/Sub<br/>StreamingPull: アラート用 + 承認専用"]
-    GCP["2. 公式 MCP / BigQuery / Firestore<br/>Gemini 3.8 Flash"]
+    GCP["2. 公式 MCP / BigQuery / Firestore<br/>Gemini 4 Hydrogen"]
     GKE["3. 監視対象 GKE<br/>sre-demo-app/order-service"]
     Slack["4. Slack ワークスペース<br/>Socket Mode 外向き WSS"]
     Mail["5. Application Integration<br/>通知メール送信: Slack を使えない場合の代替"]
@@ -397,7 +397,7 @@ sequenceDiagram
 
     rect rgb(243, 232, 253)
         Note over Agent,BQ: 自律ナレッジ昇格: 実証された解決策を構造化し BigQuery が自動でベクトル化
-        Agent->>BQ: Gemini 3.8 Flash で AUTO-* Runbook を合成し MERGE 登録 — 次回推奨 AUTO_REMEDIATE
+        Agent->>BQ: Gemini 4 Hydrogen で AUTO-* Runbook を合成し MERGE 登録 — 次回推奨 AUTO_REMEDIATE
         Note over BQ: GENERATED ALWAYS AS AI.EMBED により gemini-embedding-2 ベクトルを自動生成
         Agent->>Slack: 処置完了 + 新規 Runbook AUTO-* 自動登録を通知
     end

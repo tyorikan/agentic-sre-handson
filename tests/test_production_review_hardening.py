@@ -514,3 +514,20 @@ async def test_heartbeat_loop_ci_workflow_and_estimated_budget_wording(capsys: p
     )
     assert "仮定" in impact.impact_summary
     assert "推定" in impact.impact_summary
+
+
+def test_default_model_is_gemini_4_hydrogen_with_medium_thinking(monkeypatch: pytest.MonkeyPatch) -> None:
+    """既定推論モデルが gemini-4-hydrogen かつ思考レベル MEDIUM で初期化されること。"""
+    monkeypatch.delenv("SRE_TRIAGE_MODEL", raising=False)
+    monkeypatch.delenv("SRE_THINKING_LEVEL", raising=False)
+    settings = AgentSettings()
+    assert settings.triage_model == "gemini-4-hydrogen"
+    assert settings.triage_thinking_level == "MEDIUM"
+
+    from agent_app.vector_kb import build_llm_runbook_synthesizer
+    from agent_app.workflow import build_llm_decision_analyzer
+
+    analyzer = build_llm_decision_analyzer(settings, enable_remote_mcp=False)
+    synthesizer = build_llm_runbook_synthesizer(settings)
+    assert callable(analyzer)
+    assert callable(synthesizer)

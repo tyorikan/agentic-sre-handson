@@ -26,7 +26,7 @@
 ## 2. アーキテクチャと実装の原則
 
 1. **モデル名とリージョンの外部化**:
-   - 推論モデル（既定: `gemini-3.8-flash`）および埋め込みモデル（既定: `gemini-embedding-2`）は `sre-agent/agent_app/config.py` 経由で環境変数から取得し、旧世代モデル名をコードへ直書きしないでください。
+   - 推論モデル（既定: `gemini-4-hydrogen`）および埋め込みモデル（既定: `gemini-embedding-2`）は `sre-agent/agent_app/config.py` 経由で環境変数から取得し、旧世代モデル名をコードへ直書きしないでください。
    - Cloud Run instances は `us-central1`・`us-east1`・`europe-west1` では利用できないため、既定リージョンは `asia-northeast1`（東京）を使用します。
 2. **調査と変更の厳格な分離（Two-Phase Execution Boundary）**:
    - **Phase 1（読み取り調査）**: Google 公式リモート MCP（Monitoring / Logging / GKE `read-only` の観測 10 ツール＋Developer Knowledge の公式ドキュメント検索 2 ツール）および隔離サンドボックス（`/usr/local/gcp/bin/sandbox do`）のみを使用し、対象クラスタの状態を変更しません。
@@ -37,4 +37,4 @@
 4. **SLO・Error Budget 効果の誠実な計測**:
    - `sre-agent/agent_app/slo_metrics.py` において、実測 MTTR と温存 Error Budget 分数（Saved Error Budget）は型付き復旧を実行し事後回復が確認されたケースのみ計上し、静観や手動調査引き継ぎ時に架空の短縮時間を計上しないでください。
 5. **仮想環境での検証**:
-   - コード変更後は必ず `.venv` 仮想環境上で `pytest -v` を実行し、全テスト（111 件）が通過することを確認してください。クイックスタートのスクリプトやフル版のコマンドを変更した場合は、両者の食い違いを `tests/test_quickstart_consistency.py` が検出します。片方だけでなく両方を合わせて変更してください。
+   - コード変更後は必ず `.venv` 仮想環境上で `pytest -v` を実行し、全テスト（112 件）が通過することを確認してください。クイックスタートのスクリプトやフル版のコマンドを変更した場合は、両者の食い違いを `tests/test_quickstart_consistency.py` が検出します。片方だけでなく両方を合わせて変更してください。

@@ -140,13 +140,22 @@ def synthesize_runbook_deterministic(
 
 
 def build_llm_runbook_synthesizer(settings: AgentSettings) -> RunbookSynthesizerFn:
-    """Gemini 3.8 Flash を用いて解決済みインシデントから高品質な構造化 Runbook を生成する関数を返す。"""
+    """Gemini 4 Hydrogen を用いて解決済みインシデントから高品質な構造化 Runbook を生成する関数を返す。"""
+    thinking_level = settings.triage_thinking_level.strip().upper()
+    gen_config = (
+        types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_level=thinking_level)
+        )
+        if thinking_level
+        else None
+    )
     synth_agent = Agent(
         name="sre_runbook_synthesizer",
         model=Gemini(
             model=settings.triage_model,
             retry_options=types.HttpRetryOptions(attempts=2),
         ),
+        generate_content_config=gen_config,
         instruction=(
             "あなたは本番 SRE チームのナレッジベース管理者です。\n"
             "人間の承認を経て解決・確認された初見インシデントの情報を受け取り、\n"

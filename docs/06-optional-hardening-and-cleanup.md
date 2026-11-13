@@ -86,7 +86,7 @@ kubectl apply -f ./appendix/gke-microvm/network-policy-metadata-deny.yaml
 flowchart LR
     LogTool["監視対象ログ & MCP 応答<br/>untrusted_log_summary 境界タグ付与"] -->|"未信頼データ検査"| Plugin["Model Armor 多言語検査<br/>MODEL_ARMOR_TEMPLATE_ID / ModelArmorPlugin"]
     Plugin -->|"攻撃検知"| Block["脅威検知時: 安全退避・遮断<br/>LLM 判断を飛ばし REQUIRE_APPROVAL 通知"]
-    Plugin -->|"確認 OK"| Model["安全性確認 OK: Gemini 3.8 Flash<br/>相関推論 / 継続中の静観誤誘導も後段で棄却"]
+    Plugin -->|"確認 OK"| Model["安全性確認 OK: Gemini 4 Hydrogen<br/>相関推論 / 継続中の静観誤誘導も後段で棄却"]
 
     classDef base fill:#ffffff,stroke:#4285F4,stroke-width:1.5px,color:#202124;
     classDef guard fill:#f3e8fd,stroke:#A142F4,stroke-width:2px,color:#202124;

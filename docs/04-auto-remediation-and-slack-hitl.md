@@ -64,7 +64,7 @@ flowchart TD
     S --> P1["@node: analyze_metrics_in_sandbox<br/>隔離空間でスロープ計算"]
     S --> P2["@node: search_similar_incidents<br/>BigQuery AI.SEARCH 上位3件照合"]
     P1 & P2 --> J["JoinNode: join_diagnostics<br/>両方の診断完了を待機・合流"]
-    J --> LLM["@node: correlate_and_decide<br/>gemini-3.8-flash + 公式リモート MCP<br/>TriageDecision 構造化出力"]
+    J --> LLM["@node: correlate_and_decide<br/>gemini-4-hydrogen + 公式リモート MCP<br/>TriageDecision 構造化出力"]
     LLM --> Router["@node: enforce_guardrails_and_route<br/>許可NS・類似度・鮮度90日・1回/h検査"]
 
     Router -->|"route = OBSERVE"| N1["@node: observe_node<br/>変更操作なし・静観記録"]

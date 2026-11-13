@@ -173,7 +173,7 @@ def extract_with_gemini(md_text: str, fallback_title: str, model_name: str) -> E
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=ExtractedRunbookRecord,
-            temperature=0.0,
+            thinking_config=types.ThinkingConfig(thinking_level="MEDIUM"),
         ),
     )
     if not response.text:
@@ -219,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prefix", default="CUST", help="runbook_id の接頭辞（既定: CUST）")
     parser.add_argument(
         "--model",
-        default=os.getenv("SRE_TRIAGE_MODEL", "gemini-3.8-flash"),
+        default=os.getenv("SRE_TRIAGE_MODEL", "gemini-4-hydrogen"),
         help="項目の抽出に使う Gemini モデル（既定は環境変数 SRE_TRIAGE_MODEL）",
     )
     parser.add_argument("--offline", action="store_true", help="API を呼ばず、見出しの語から項目を拾う")

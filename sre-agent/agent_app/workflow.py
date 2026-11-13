@@ -12,7 +12,7 @@ ADK 2.x の `Workflow` / `JoinNode` / `@node(require_confirmation=True)` で制�
        [JoinNode: join_diagnostics]
             │
             ▼
-       [correlate_and_decide]          (Gemini 3.8 Flash + 公式リモート MCP で根本原因と方針を推論)
+       [correlate_and_decide]          (Gemini 4 Hydrogen + 公式リモート MCP で根本原因と方針を推論)
             │
             ▼
        [enforce_guardrails_and_route]  (Namespace 制限・類似度下限・1時間1回上限を適用し3分岐)
@@ -121,8 +121,16 @@ def build_llm_decision_analyzer(
     *,
     enable_remote_mcp: bool = True,
 ) -> DecisionAnalyzerFn:
-    """Gemini 3.8 Flash と公式リモート MCP 読み取りツール群を用いた本番用トリアージ推論器を構築する。"""
+    """Gemini 4 Hydrogen と公式リモート MCP 読み取りツール群を用いた本番用トリアージ推論器を構築する。"""
     tools: list[Any] = build_observability_mcp_toolsets(settings) if enable_remote_mcp else []
+    thinking_level = settings.triage_thinking_level.strip().upper()
+    gen_config = (
+        types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_level=thinking_level)
+        )
+        if thinking_level
+        else None
+    )
 
     triage_agent = Agent(
         name="sre_correlation_analyst",
@@ -130,6 +138,7 @@ def build_llm_decision_analyzer(
             model=settings.triage_model,
             retry_options=types.HttpRetryOptions(attempts=3),
         ),
+        generate_content_config=gen_config,
         instruction=(
             "あなたは本番 GKE システムを担当するシニア SRE エージェントです。\n"
             "与えられたアラート情報、隔離サンドボックスで計算したエラー率の減衰傾き、"

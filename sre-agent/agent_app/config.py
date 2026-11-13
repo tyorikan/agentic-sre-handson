@@ -29,8 +29,9 @@ class AgentSettings:
     region: str = field(default_factory=lambda: os.getenv("GOOGLE_CLOUD_REGION", "asia-northeast1"))
     genai_location: str = field(default_factory=lambda: os.getenv("GOOGLE_CLOUD_LOCATION", "global"))
 
-    # Gemini モデル設定（既定は現行 GA の gemini-3.8-flash / gemini-embedding-2）
-    triage_model: str = field(default_factory=lambda: os.getenv("SRE_TRIAGE_MODEL", "gemini-3.8-flash"))
+    # Gemini モデル設定（既定は現行 GA の gemini-4-hydrogen / gemini-embedding-2）
+    triage_model: str = field(default_factory=lambda: os.getenv("SRE_TRIAGE_MODEL", "gemini-4-hydrogen"))
+    triage_thinking_level: str = field(default_factory=lambda: os.getenv("SRE_THINKING_LEVEL", "MEDIUM"))
     embedding_model: str = field(default_factory=lambda: os.getenv("SRE_EMBEDDING_MODEL", "gemini-embedding-2"))
 
     # Pub/Sub 常時購読設定
